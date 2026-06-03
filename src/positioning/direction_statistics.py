@@ -57,6 +57,11 @@ class DirectionStatistics:
             self._enu3_east = list(e3)
             self._enu3_north = list(n3)
             self._enu3_up = list(u3)
+        else:
+            self._enu3_times = []
+            self._enu3_east = []
+            self._enu3_north = []
+            self._enu3_up = []
         self._enu_saved = True
 
     def clear_enu(self):
@@ -93,7 +98,7 @@ class DirectionStatistics:
 
     # [新增] 检查是否有ENU3数据
     def has_enu3_data(self):
-        return self._enu_saved and len(self._enu3_times) > 0
+        return self._enu_saved and len(self._enu1_times) > 0 and len(self._enu3_times) > 0
 
     def reset(self):
         self.total_epochs = 0

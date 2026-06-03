@@ -1968,9 +1968,10 @@ class NMEADataAnalyzer(QMainWindow):
         north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
         up    =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
 
-        self._latest_enu2_east = east
-        self._latest_enu2_north = north
-        self._latest_enu2_up = up
+        if name != "ENU3":
+            self._latest_enu2_east = east
+            self._latest_enu2_north = north
+            self._latest_enu2_up = up
         # [新增] ENU3最新值跟踪
         if name == "ENU3":
             self._latest_enu3_east = east
@@ -1985,16 +1986,7 @@ class NMEADataAnalyzer(QMainWindow):
         north_bad = self._is_enu_outlier(std_north, north)
         up_bad = self._is_enu_outlier(std_up, up)
 
-        if east_bad:
-            self._enu2_outlier_count += 1
-            self.log_info(f"{name} 东向异常值已剔除: {east:+.3f}m (σ: {std_east.std:.3f}m)")
-        if north_bad:
-            self._enu2_outlier_count += 1
-            self.log_info(f"{name} 北向异常值已剔除: {north:+.3f}m (σ: {std_north.std:.3f}m)")
-        if up_bad:
-            self._enu2_outlier_count += 1
-            self.log_info(f"{name} 天向异常值已剔除: {up:+.3f}m (σ: {std_up.std:.3f}m)")
-        # [新增] ENU3异常值计数
+        # [新增] ENU3异常值计数（同时避免双重计入_enu2_outlier_count）
         if name == "ENU3":
             if east_bad:
                 self._enu3_outlier_count += 1
@@ -2002,6 +1994,16 @@ class NMEADataAnalyzer(QMainWindow):
                 self._enu3_outlier_count += 1
             if up_bad:
                 self._enu3_outlier_count += 1
+        else:
+            if east_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 东向异常值已剔除: {east:+.3f}m (σ: {std_east.std:.3f}m)")
+            if north_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 北向异常值已剔除: {north:+.3f}m (σ: {std_north.std:.3f}m)")
+            if up_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 天向异常值已剔除: {up:+.3f}m (σ: {std_up.std:.3f}m)")
 
         if east_bad or north_bad or up_bad:
             return
@@ -2385,8 +2387,11 @@ class NMEADataAnalyzer(QMainWindow):
         if dir_stat_boxes is None:
             dir_stat_boxes = self.dir_stat_boxes
         ds = direction_stats[direction_index]
-        n = len(self.enu2_times)
         is_com3 = (direction_stats is self.direction_stats3)
+        if is_com3:
+            n = len(self.enu3_times)
+        else:
+            n = len(self.enu2_times)
         if n > 0:
             n1_total = len(self.enu1_times)
             enu1_t = self.enu1_times[-n:] if n1_total >= n else list(self.enu1_times)
@@ -2394,11 +2399,10 @@ class NMEADataAnalyzer(QMainWindow):
             enu1_n = self.enu1_north_data[-n:] if n1_total >= n else list(self.enu1_north_data)
             enu1_u = self.enu1_up_data[-n:] if n1_total >= n else list(self.enu1_up_data)
             if is_com3:
-                n3_total = len(self.enu3_times)
-                enu3_t = self.enu3_times[-n:] if n3_total >= n else list(self.enu3_times)
-                enu3_e = self.enu3_east_data[-n:] if n3_total >= n else list(self.enu3_east_data)
-                enu3_n = self.enu3_north_data[-n:] if n3_total >= n else list(self.enu3_north_data)
-                enu3_u = self.enu3_up_data[-n:] if n3_total >= n else list(self.enu3_up_data)
+                enu3_t = self.enu3_times[-n:] if len(self.enu3_times) >= n else list(self.enu3_times)
+                enu3_e = self.enu3_east_data[-n:] if len(self.enu3_east_data) >= n else list(self.enu3_east_data)
+                enu3_n = self.enu3_north_data[-n:] if len(self.enu3_north_data) >= n else list(self.enu3_north_data)
+                enu3_u = self.enu3_up_data[-n:] if len(self.enu3_up_data) >= n else list(self.enu3_up_data)
                 ds.save_enu_snapshot(
                     enu1_t, enu1_e, enu1_n, enu1_u,
                     [], [], [], [],
@@ -2840,6 +2844,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 重置方向统计
         self._reset_direction_stats()
+        self._reset_direction_stats3()
         self._latest_enu2_east = 0.0
         self._latest_enu2_north = 0.0
         self._latest_enu2_up = 0.0
@@ -2929,6 +2934,7 @@ class NMEADataAnalyzer(QMainWindow):
         """
         if direction_stats is None:
             direction_stats = self.direction_stats
+        is_com3_report = (direction_stats is self.direction_stats3)
         lines = []
 
         def w(line=""):
@@ -3006,7 +3012,6 @@ class NMEADataAnalyzer(QMainWindow):
         system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3"}
 
         section_names = ["二", "三", "四", "五"]
-        is_com3_report = (direction_stats is self.direction_stats3)
         tested = [(i, direction_stats[i]) for i in range(4) if direction_stats[i].total_epochs > 0]
         for idx, (i, ds) in enumerate(tested):
             sec_name = section_names[idx]
