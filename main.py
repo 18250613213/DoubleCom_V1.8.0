@@ -128,14 +128,14 @@ class NMEADataAnalyzer(QMainWindow):
         self.direction_stats = [DirectionStatistics() for _ in range(4)]
         self._dir_enu_active_index = -1
         self._dir_auto_stop_enabled = False
-        self._dir_auto_stop_sec = 60
-        self._dir_auto_stop_epochs = 0
+        self._dir_auto_stop_sec = 300
+        self._dir_auto_stop_epochs = 300
         # [新增] 串口3方向测试统计
         self.direction_stats3 = [DirectionStatistics() for _ in range(4)]
         self._dir3_enu_active_index = -1
         self._dir3_auto_stop_enabled = False
-        self._dir3_auto_stop_sec = 60
-        self._dir3_auto_stop_epochs = 0
+        self._dir3_auto_stop_sec = 300
+        self._dir3_auto_stop_epochs = 300
         self._latest_enu2_east = 0.0
         self._latest_enu2_north = 0.0
         self._latest_enu2_up = 0.0
@@ -2641,16 +2641,18 @@ class NMEADataAnalyzer(QMainWindow):
                 p.showGrid(x=True, y=True)
                 p.addLegend()
                 p.plot(t1, d1, pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
-                p.plot(t1 if direction_stats is self.direction_stats else t1, d2,
-                       pen={'color': '#2980b9', 'width': 2}, name=label2)
+                p.plot(t1, d2, pen={'color': '#2980b9', 'width': 2}, name=label2)
                 if label3 is not None:
                     p.plot(t3, components3[r], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name=label3)
             grid.show()
-            QApplication.processEvents()
+            # 多次 processEvents 确保 pyqtgraph GraphicsLayout 完成布局
+            for _ in range(5):
+                QApplication.processEvents()
 
             prefix = 'com2' if direction_stats is self.direction_stats else 'com3'
             png_name = f'dir{i + 1}_{prefix}_enu_{ts_str}.png' if ts_str else f'dir{i + 1}_{prefix}_enu.png'
             png_path = os.path.join(report_dir, png_name)
+            grid.scene().setSceneRect(0, 0, 1000, 650)
             exporter = ImageExporter(grid.scene())
             exporter.parameters()['width'] = 1000
             exporter.parameters()['height'] = 650
@@ -2946,9 +2948,13 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _get_device_sn(self, direction_stats=None):
         """根据方向统计列表获取对应端口的设备序号"""
-        if direction_stats and direction_stats is self.direction_stats3:
-            return self.device_sn3_input.text().strip() or "test"
-        return self.device_sn2_input.text().strip() or "test"
+        if direction_stats is self.direction_stats3:
+            if hasattr(self, 'device_sn3_input'):
+                return self.device_sn3_input.text().strip() or "test"
+        else:
+            if hasattr(self, 'device_sn2_input'):
+                return self.device_sn2_input.text().strip() or "test"
+        return "test"
 
     def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
         """生成报告文本行
