@@ -531,7 +531,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.p1_lon_label = QLabel("-")
         self.p1_lon_label.setStyleSheet("font-weight: bold;")
         p1_grid.addWidget(self.p1_lon_label, 2, 1)
-        p1_grid.addWidget(QLabel("高程 (m):"), 3, 0)
+        p1_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
         self.p1_alt_label = QLabel("-")
         self.p1_alt_label.setStyleSheet("font-weight: bold;")
         p1_grid.addWidget(self.p1_alt_label, 3, 1)
@@ -563,7 +563,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.p2_lon_label = QLabel("-")
         self.p2_lon_label.setStyleSheet("font-weight: bold;")
         p2_grid.addWidget(self.p2_lon_label, 2, 1)
-        p2_grid.addWidget(QLabel("高程 (m):"), 3, 0)
+        p2_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
         self.p2_alt_label = QLabel("-")
         self.p2_alt_label.setStyleSheet("font-weight: bold;")
         p2_grid.addWidget(self.p2_alt_label, 3, 1)
@@ -596,7 +596,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.p3_lon_label = QLabel("-")
         self.p3_lon_label.setStyleSheet("font-weight: bold;")
         p3_grid.addWidget(self.p3_lon_label, 2, 1)
-        p3_grid.addWidget(QLabel("高程 (m):"), 3, 0)
+        p3_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
         self.p3_alt_label = QLabel("-")
         self.p3_alt_label.setStyleSheet("font-weight: bold;")
         p3_grid.addWidget(self.p3_alt_label, 3, 1)
@@ -734,7 +734,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         info_layout.addWidget(QLabel("待测设备型号:"), 0, 2)
         self.dut_model_input = QLineEdit()
-        self.dut_model_input.setPlaceholderText("例如: 4 阵元 GNSS 抗干扰天线")
+        self.dut_model_input.setPlaceholderText("例如: 双频八通道抗干扰天线")
         info_layout.addWidget(self.dut_model_input, 0, 3)
 
         info_layout.addWidget(QLabel("阵列形式:"), 1, 0)
@@ -2908,23 +2908,6 @@ class NMEADataAnalyzer(QMainWindow):
                 self.log_error(f"保存串口{port_id}日志失败: {str(e)}")
                 QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
 
-    def apply_device_sn(self):
-        sn = self.device_sn_input.text().strip()
-        if not sn:
-            QMessageBox.warning(self, "警告", "请输入设备序号")
-            return
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_msg = f"{sn} 设备序号开始测试"
-        self.log_info(f"[所有端口] {log_msg}")
-        # [修改] 写入所有已开启的日志文件
-        for f in (self._log_file1, self._log_file2, self._log_file3):
-            if f and not f.closed:
-                try:
-                    f.write(f"[{ts}] {log_msg}\n")
-                    f.flush()
-                except Exception:
-                    pass
-
     def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
         """生成报告文本行
         Args:
@@ -3201,217 +3184,101 @@ class NMEADataAnalyzer(QMainWindow):
         html.append('</body></html>')
         return '\n'.join(html)
 
+    # ========== 统一报告导出（合并原12个重复函数） ==========
+    def _do_export_report(self, ext="md", direction_stats=None, port_label="串口2", enu_label="ENU2",
+                          chart_label2="ENU2 (干扰测试)", file_prefix="抗干扰天线测试报告",
+                          dialog_title="导出测试报告"):
+        """统一报告导出核心实现"""
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self.device_sn_input.text().strip() or "test"
+        default_name = f"{file_prefix}_{sn}_{ts_str}.{ext}"
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+
+        from PyQt5.QtWidgets import QFileDialog
+        filt = "Markdown 文件 (*.md);;所有文件 (*.*)" if ext == "md" else "PDF 文件 (*.pdf);;所有文件 (*.*)"
+        file_path, _ = QFileDialog.getSaveFileName(self, dialog_title, default_path, filt)
+        if not file_path:
+            return
+
+        report_dir = os.path.dirname(file_path)
+        if not report_dir:
+            report_dir = os.path.dirname(os.path.abspath(__file__))
+
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, direction_stats, chart_label2)
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+
+        lines, _ = self._build_report_lines(png_map, direction_stats, port_label, enu_label)
+
+        if ext == "md":
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+        else:
+            html_text = self._md_lines_to_html(lines, report_dir)
+            doc = QTextDocument()
+            doc.setHtml(html_text)
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(file_path)
+            printer.setPageSize(QPrinter.A4)
+            printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+            doc.print_(printer)
+
+        self.log_info(f"{dialog_title}已导出: {file_path}")
+        if png_paths:
+            self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
+        QMessageBox.information(self, "导出成功", f"{dialog_title}已保存到:\n{file_path}")
+
     def export_test_report(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_test_report(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report()
         except Exception as e:
-            self.log_error(f"导出报告失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            self.log_error(f"导出报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成报告:\n{str(e)}")
 
-    def _do_export_test_report(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"抗干扰天线测试报告_{sn}_{ts_str}.md"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出测试报告", default_path,
-            "Markdown 文件 (*.md);;所有文件 (*.*)")
-        if not file_path:
-            return
-
-        report_dir = os.path.dirname(file_path)
-        if not report_dir:
-            report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str)
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-
-        lines, _ = self._build_report_lines(png_map)
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
-        self.log_info(f"测试报告已导出到: {file_path}")
-        if png_paths:
-            self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
-        QMessageBox.information(self, "导出成功", f"测试报告已保存到:\n{file_path}")
-
     def export_pdf_report(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_pdf_report(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report(ext="pdf", dialog_title="导出PDF报告")
         except Exception as e:
-            self.log_error(f"导出PDF报告失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            self.log_error(f"导出PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成PDF报告:\n{str(e)}")
-
-    def _do_export_pdf_report(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"抗干扰天线测试报告_{sn}_{ts_str}.pdf"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出PDF报告", default_path,
-            "PDF 文件 (*.pdf);;所有文件 (*.*)")
-        if not file_path:
-            return
-
-        report_dir = os.path.dirname(file_path)
-        if not report_dir:
-            report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str)
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-
-        lines, _ = self._build_report_lines(png_map)
-
-        html_text = self._md_lines_to_html(lines, report_dir)
-
-        doc = QTextDocument()
-        doc.setHtml(html_text)
-
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setOutputFormat(QPrinter.PdfFormat)
-        printer.setOutputFileName(file_path)
-        printer.setPageSize(QPrinter.A4)
-        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
-
-        doc.print_(printer)
-
-        self.log_info(f"PDF报告已导出到: {file_path}")
-        if png_paths:
-            self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
-        QMessageBox.information(self, "导出成功", f"PDF报告已保存到:\n{file_path}")
 
     # ========== 串口2独立报告导出 ==========
     def export_test_report2(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_test_report2(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report(direction_stats=self.direction_stats, file_prefix="串口2测试报告",
+                                   dialog_title="导出串口2测试报告")
         except Exception as e:
-            self.log_error(f"导出串口2报告失败: {str(e)}")
-            import traceback; traceback.print_exc()
+            self.log_error(f"导出串口2报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口2报告:\n{str(e)}")
 
-    def _do_export_test_report2(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"串口2测试报告_{sn}_{ts_str}.md"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口2测试报告", default_path, "Markdown 文件 (*.md);;所有文件 (*.*)")
-        if not file_path: return
-        report_dir = os.path.dirname(file_path)
-        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats, "ENU2 (干扰测试)")
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-        lines, _ = self._build_report_lines(png_map, self.direction_stats, "串口2", "ENU2")
-        with open(file_path, 'w', encoding='utf-8') as f: f.write('\n'.join(lines))
-        self.log_info(f"串口2测试报告已导出: {file_path}")
-        QMessageBox.information(self, "导出成功", f"串口2测试报告已保存到:\n{file_path}")
-
     def export_pdf_report2(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_pdf_report2(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report(ext="pdf", direction_stats=self.direction_stats, file_prefix="串口2测试报告",
+                                   dialog_title="导出串口2PDF报告")
         except Exception as e:
-            self.log_error(f"导出串口2PDF报告失败: {str(e)}")
-            import traceback; traceback.print_exc()
+            self.log_error(f"导出串口2PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口2PDF报告:\n{str(e)}")
-
-    def _do_export_pdf_report2(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"串口2测试报告_{sn}_{ts_str}.pdf"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口2PDF报告", default_path, "PDF 文件 (*.pdf);;所有文件 (*.*)")
-        if not file_path: return
-        report_dir = os.path.dirname(file_path)
-        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats, "ENU2 (干扰测试)")
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-        lines, _ = self._build_report_lines(png_map, self.direction_stats, "串口2", "ENU2")
-        html_text = self._md_lines_to_html(lines, report_dir)
-        doc = QTextDocument(); doc.setHtml(html_text)
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setOutputFormat(QPrinter.PdfFormat)
-        printer.setOutputFileName(file_path)
-        printer.setPageSize(QPrinter.A4)
-        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
-        doc.print_(printer)
-        self.log_info(f"串口2PDF报告已导出: {file_path}")
-        QMessageBox.information(self, "导出成功", f"串口2PDF报告已保存到:\n{file_path}")
 
     # ========== 串口3独立报告导出 ==========
     def export_test_report3(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_test_report3(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report(ext="md", direction_stats=self.direction_stats3, port_label="串口3",
+                                   enu_label="ENU3", chart_label2="ENU3 (干扰测试2)",
+                                   file_prefix="串口3测试报告", dialog_title="导出串口3测试报告")
         except Exception as e:
-            self.log_error(f"导出串口3报告失败: {str(e)}")
-            import traceback; traceback.print_exc()
+            self.log_error(f"导出串口3报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口3报告:\n{str(e)}")
 
-    def _do_export_test_report3(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"串口3测试报告_{sn}_{ts_str}.md"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口3测试报告", default_path, "Markdown 文件 (*.md);;所有文件 (*.*)")
-        if not file_path: return
-        report_dir = os.path.dirname(file_path)
-        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats3, "ENU3 (干扰测试2)")
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-        lines, _ = self._build_report_lines(png_map, self.direction_stats3, "串口3", "ENU3")
-        with open(file_path, 'w', encoding='utf-8') as f: f.write('\n'.join(lines))
-        self.log_info(f"串口3测试报告已导出: {file_path}")
-        QMessageBox.information(self, "导出成功", f"串口3测试报告已保存到:\n{file_path}")
-
     def export_pdf_report3(self):
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
         try:
-            return self._do_export_pdf_report3(QFileDialog, QMessageBox, QApplication)
+            self._do_export_report(ext="pdf", direction_stats=self.direction_stats3, port_label="串口3",
+                                   enu_label="ENU3", chart_label2="ENU3 (干扰测试2)",
+                                   file_prefix="串口3测试报告", dialog_title="导出串口3PDF报告")
         except Exception as e:
-            self.log_error(f"导出串口3PDF报告失败: {str(e)}")
-            import traceback; traceback.print_exc()
+            self.log_error(f"导出串口3PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口3PDF报告:\n{str(e)}")
-
-    def _do_export_pdf_report3(self, QFileDialog, QMessageBox, QApplication):
-        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
-        default_name = f"串口3测试报告_{sn}_{ts_str}.pdf"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        default_path = os.path.join(reports_dir, default_name)
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口3PDF报告", default_path, "PDF 文件 (*.pdf);;所有文件 (*.*)")
-        if not file_path: return
-        report_dir = os.path.dirname(file_path)
-        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
-        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats3, "ENU3 (干扰测试2)")
-        png_map = {di: name for di, name in png_paths} if png_paths else None
-        lines, _ = self._build_report_lines(png_map, self.direction_stats3, "串口3", "ENU3")
-        html_text = self._md_lines_to_html(lines, report_dir)
-        doc = QTextDocument(); doc.setHtml(html_text)
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setOutputFormat(QPrinter.PdfFormat)
-        printer.setOutputFileName(file_path)
-        printer.setPageSize(QPrinter.A4)
-        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
-        doc.print_(printer)
-        self.log_info(f"串口3PDF报告已导出: {file_path}")
-        QMessageBox.information(self, "导出成功", f"串口3PDF报告已保存到:\n{file_path}")
 
     def _open_auto_log_files(self):
         self._close_auto_log_files()
