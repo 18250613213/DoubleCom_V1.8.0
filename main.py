@@ -130,6 +130,12 @@ class NMEADataAnalyzer(QMainWindow):
         self._dir_auto_stop_enabled = False
         self._dir_auto_stop_sec = 60
         self._dir_auto_stop_epochs = 0
+        # [新增] 串口3方向测试统计
+        self.direction_stats3 = [DirectionStatistics() for _ in range(4)]
+        self._dir3_enu_active_index = -1
+        self._dir3_auto_stop_enabled = False
+        self._dir3_auto_stop_sec = 60
+        self._dir3_auto_stop_epochs = 0
         self._latest_enu2_east = 0.0
         self._latest_enu2_north = 0.0
         self._latest_enu2_up = 0.0
@@ -789,6 +795,20 @@ class NMEADataAnalyzer(QMainWindow):
         self.export_pdf_btn = QPushButton("导出PDF报告")
         self.export_pdf_btn.setMinimumWidth(120)
         self.export_pdf_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
+        # [新增] 串口2独立报告按钮
+        self.export_report2_btn = QPushButton("导出串口2测试报告")
+        self.export_report2_btn.setMinimumWidth(140)
+        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_pdf2_btn = QPushButton("导出串口2PDF报告")
+        self.export_pdf2_btn.setMinimumWidth(140)
+        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
+        # [新增] 串口3独立报告按钮
+        self.export_report3_btn = QPushButton("导出串口3测试报告")
+        self.export_report3_btn.setMinimumWidth(140)
+        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_pdf3_btn = QPushButton("导出串口3PDF报告")
+        self.export_pdf3_btn.setMinimumWidth(140)
+        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
 
         bottom_layout.addWidget(self.clear_data_btn)
         bottom_layout.addWidget(self.reset_stats_btn)
@@ -798,6 +818,10 @@ class NMEADataAnalyzer(QMainWindow):
         bottom_layout.addWidget(self.save_log3_btn)  # [新增]
         bottom_layout.addWidget(self.export_report_btn)
         bottom_layout.addWidget(self.export_pdf_btn)
+        bottom_layout.addWidget(self.export_report2_btn)
+        bottom_layout.addWidget(self.export_pdf2_btn)
+        bottom_layout.addWidget(self.export_report3_btn)
+        bottom_layout.addWidget(self.export_pdf3_btn)
 
         self.auto_log_cb = QCheckBox("自动保存日志")
         self.auto_log_cb.setChecked(True)
@@ -808,40 +832,94 @@ class NMEADataAnalyzer(QMainWindow):
         
         self.tab_widget.addTab(control_tab, "功能与控制面板")
         
-        # ========== 标签4：ENU 误差对比 (无干扰 vs 干扰测试) ==========
+        # ========== 标签4：ENU 误差对比 ==========
         enu_comp_tab = QWidget()
         enu_comp_layout = QVBoxLayout(enu_comp_tab)
-        
-        self.enu_comp_east_plot = pg.PlotWidget()
-        self.enu_comp_east_plot.setBackground('w')
-        self.enu_comp_east_plot.setLabel('left', '东向', units='m')
-        self.enu_comp_east_plot.showGrid(x=True, y=True)
-        self.enu_comp_east_plot.addLegend()
-        self.enu1_east_curve = self.enu_comp_east_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
-        self.enu2_east_curve = self.enu_comp_east_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
-        self.enu3_east_curve = self.enu_comp_east_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')  # [新增]
-        enu_comp_layout.addWidget(self.enu_comp_east_plot)
-        
-        self.enu_comp_north_plot = pg.PlotWidget()
-        self.enu_comp_north_plot.setBackground('w')
-        self.enu_comp_north_plot.setLabel('left', '北向', units='m')
-        self.enu_comp_north_plot.showGrid(x=True, y=True)
-        self.enu_comp_north_plot.addLegend()
-        self.enu1_north_curve = self.enu_comp_north_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
-        self.enu2_north_curve = self.enu_comp_north_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
-        self.enu3_north_curve = self.enu_comp_north_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')  # [新增]
-        enu_comp_layout.addWidget(self.enu_comp_north_plot)
-        
-        self.enu_comp_up_plot = pg.PlotWidget()
-        self.enu_comp_up_plot.setBackground('w')
-        self.enu_comp_up_plot.setLabel('left', '天向', units='m')
-        self.enu_comp_up_plot.setLabel('bottom', '时间', units='s')
-        self.enu_comp_up_plot.showGrid(x=True, y=True)
-        self.enu_comp_up_plot.addLegend()
-        self.enu1_up_curve = self.enu_comp_up_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
-        self.enu2_up_curve = self.enu_comp_up_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
-        self.enu3_up_curve = self.enu_comp_up_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')  # [新增]
-        enu_comp_layout.addWidget(self.enu_comp_up_plot)
+
+        # 标题行
+        title_row = QHBoxLayout()
+        title_label12 = QLabel("ENU1 (无干扰) vs ENU2 (干扰测试)")
+        title_label12.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_label13 = QLabel("ENU1 (无干扰) vs ENU3 (干扰测试2)")
+        title_label13.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_row.addWidget(title_label12)
+        title_row.addSpacing(40)
+        title_row.addWidget(title_label13)
+        title_row.addStretch()
+        enu_comp_layout.addLayout(title_row)
+
+        # 双列布局
+        enu_comp_cols = QHBoxLayout()
+
+        # --- 左列: ENU1 vs ENU2 ---
+        left_col = QVBoxLayout()
+        left_col.setSpacing(2)
+
+        self.enu_comp12_east_plot = pg.PlotWidget()
+        self.enu_comp12_east_plot.setBackground('w')
+        self.enu_comp12_east_plot.setLabel('left', '东向', units='m')
+        self.enu_comp12_east_plot.showGrid(x=True, y=True)
+        self.enu_comp12_east_plot.addLegend()
+        self.enu1_east_curve = self.enu_comp12_east_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_east_curve = self.enu_comp12_east_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_east_plot)
+
+        self.enu_comp12_north_plot = pg.PlotWidget()
+        self.enu_comp12_north_plot.setBackground('w')
+        self.enu_comp12_north_plot.setLabel('left', '北向', units='m')
+        self.enu_comp12_north_plot.showGrid(x=True, y=True)
+        self.enu_comp12_north_plot.addLegend()
+        self.enu1_north_curve = self.enu_comp12_north_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_north_curve = self.enu_comp12_north_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_north_plot)
+
+        self.enu_comp12_up_plot = pg.PlotWidget()
+        self.enu_comp12_up_plot.setBackground('w')
+        self.enu_comp12_up_plot.setLabel('left', '天向', units='m')
+        self.enu_comp12_up_plot.setLabel('bottom', '时间', units='s')
+        self.enu_comp12_up_plot.showGrid(x=True, y=True)
+        self.enu_comp12_up_plot.addLegend()
+        self.enu1_up_curve = self.enu_comp12_up_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_up_curve = self.enu_comp12_up_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_up_plot)
+
+        enu_comp_cols.addLayout(left_col)
+
+        # --- 右列: ENU1 vs ENU3 ---
+        right_col = QVBoxLayout()
+        right_col.setSpacing(2)
+
+        self.enu_comp13_east_plot = pg.PlotWidget()
+        self.enu_comp13_east_plot.setBackground('w')
+        self.enu_comp13_east_plot.setLabel('left', '东向', units='m')
+        self.enu_comp13_east_plot.showGrid(x=True, y=True)
+        self.enu_comp13_east_plot.addLegend()
+        self.enu1_13_east_curve = self.enu_comp13_east_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_east_curve = self.enu_comp13_east_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_east_plot)
+
+        self.enu_comp13_north_plot = pg.PlotWidget()
+        self.enu_comp13_north_plot.setBackground('w')
+        self.enu_comp13_north_plot.setLabel('left', '北向', units='m')
+        self.enu_comp13_north_plot.showGrid(x=True, y=True)
+        self.enu_comp13_north_plot.addLegend()
+        self.enu1_13_north_curve = self.enu_comp13_north_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_north_curve = self.enu_comp13_north_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_north_plot)
+
+        self.enu_comp13_up_plot = pg.PlotWidget()
+        self.enu_comp13_up_plot.setBackground('w')
+        self.enu_comp13_up_plot.setLabel('left', '天向', units='m')
+        self.enu_comp13_up_plot.setLabel('bottom', '时间', units='s')
+        self.enu_comp13_up_plot.showGrid(x=True, y=True)
+        self.enu_comp13_up_plot.addLegend()
+        self.enu1_13_up_curve = self.enu_comp13_up_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_up_curve = self.enu_comp13_up_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_up_plot)
+
+        enu_comp_cols.addLayout(right_col)
+
+        enu_comp_layout.addLayout(enu_comp_cols)
         self.tab_widget.addTab(enu_comp_tab, "ENU 误差对比")
         
         # ========== 标签5：方向测试 ==========
@@ -910,6 +988,10 @@ class NMEADataAnalyzer(QMainWindow):
 
         self.export_report_btn.clicked.connect(self.export_test_report)
         self.export_pdf_btn.clicked.connect(self.export_pdf_report)
+        self.export_report2_btn.clicked.connect(self.export_test_report2)
+        self.export_pdf2_btn.clicked.connect(self.export_pdf_report2)
+        self.export_report3_btn.clicked.connect(self.export_test_report3)
+        self.export_pdf3_btn.clicked.connect(self.export_pdf_report3)
 
         self.auto_log_cb.stateChanged.connect(self._on_auto_log_toggled)
 
@@ -1648,6 +1730,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_east_curve.setData([], [])
         self.enu1_north_curve.setData([], [])
         self.enu1_up_curve.setData([], [])
+        self.enu1_13_east_curve.setData([], [])
+        self.enu1_13_north_curve.setData([], [])
+        self.enu1_13_up_curve.setData([], [])
         self.enu2_ref_point = None
         self.enu2_ref_ready = False
         self.enu2_buffer = []
@@ -1717,9 +1802,11 @@ class NMEADataAnalyzer(QMainWindow):
     def _update_enu_display(self):
         self._refresh_enu_charts()
         self._feed_direction_stats()
+        self._feed_direction_stats3()
         self._update_enu_std()
 
     def _refresh_enu_charts(self):
+        # 左列: ENU1 vs ENU2
         if self.enu1_times:
             self.enu1_east_curve.setData(self.enu1_times, self.enu1_east_data)
             self.enu1_north_curve.setData(self.enu1_times, self.enu1_north_data)
@@ -1733,6 +1820,11 @@ class NMEADataAnalyzer(QMainWindow):
             self.enu3_east_curve.setData(self.enu3_times, self.enu3_east_data)
             self.enu3_north_curve.setData(self.enu3_times, self.enu3_north_data)
             self.enu3_up_curve.setData(self.enu3_times, self.enu3_up_data)
+        # 右列: ENU1 vs ENU3
+        if self.enu1_times:
+            self.enu1_13_east_curve.setData(self.enu1_times, self.enu1_east_data)
+            self.enu1_13_north_curve.setData(self.enu1_times, self.enu1_north_data)
+            self.enu1_13_up_curve.setData(self.enu1_times, self.enu1_up_data)
 
     def _update_enu_std(self):
         e1_std = self._std_enu1_east.std
@@ -1931,8 +2023,8 @@ class NMEADataAnalyzer(QMainWindow):
             del up_data[:len(up_data) - self.ENU_MAX_POINTS]
 
     def _create_direction_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+        main_tab = QWidget()
+        layout = QVBoxLayout(main_tab)
 
         # ENU基准值设置（共享一组控制）
         enu_ref_box = QGroupBox("ENU 基准值设置（启动时自动应用）")
@@ -1998,8 +2090,24 @@ class NMEADataAnalyzer(QMainWindow):
         enu_ref_layout.addLayout(enu_ref_labels)
         layout.addWidget(enu_ref_box)
 
+        # 方向测试子标签：串口2和串口3分开
+        dir_sub_tabs = QTabWidget()
+        self._create_dir_port_widget(dir_sub_tabs, port_id=2)
+        self._create_dir_port_widget(dir_sub_tabs, port_id=3)
+        layout.addWidget(dir_sub_tabs)
+
+        return main_tab
+
+    def _create_dir_port_widget(self, parent_tab, port_id):
+        """为指定串口创建方向测试UI"""
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        is_com3 = (port_id == 3)
+
         stats_grid = QGridLayout()
-        self.dir_stat_boxes = []
+        stat_boxes = []
+
         for i in range(4):
             box = QGroupBox(f"方向{i + 1}")
             box.setStyleSheet("QGroupBox { font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 14px; } QGroupBox::title { background-color: #ecf0f1; padding: 2px 10px; border-radius: 3px; }")
@@ -2025,10 +2133,13 @@ class NMEADataAnalyzer(QMainWindow):
             start_btn.setMinimumWidth(100)
             start_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
             idx = i
-            start_btn.clicked.connect(lambda checked, d=idx: self._toggle_single_direction(d))
+            if is_com3:
+                start_btn.clicked.connect(lambda checked, d=idx: self._toggle_single_direction3(d))
+            else:
+                start_btn.clicked.connect(lambda checked, d=idx: self._toggle_single_direction(d))
             box_layout.addWidget(start_btn)
 
-            self.dir_stat_boxes.append({
+            stat_boxes.append({
                 'box': box,
                 'duration': duration_label,
                 'epoch': epoch_label,
@@ -2038,60 +2149,91 @@ class NMEADataAnalyzer(QMainWindow):
             })
             stats_grid.addWidget(box, i // 2, i % 2)
 
-        layout.addLayout(stats_grid)
+        tab_layout.addLayout(stats_grid)
 
+        # 自动停止控制
         auto_stop_row = QHBoxLayout()
-        self.dir_auto_stop_cb = QCheckBox("启用自动停止")
-        self.dir_auto_stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
-        self.dir_auto_stop_cb.stateChanged.connect(self._on_auto_stop_toggled)
-        auto_stop_row.addWidget(self.dir_auto_stop_cb)
-        auto_stop_row.addWidget(QLabel("最大时长(秒):"))
-        self.dir_auto_stop_sec_spin = QSpinBox()
-        self.dir_auto_stop_sec_spin.setRange(0, 7200)
-        self.dir_auto_stop_sec_spin.setValue(self._dir_auto_stop_sec)
-        self.dir_auto_stop_sec_spin.setSuffix(" s")
-        self.dir_auto_stop_sec_spin.setToolTip("0 表示不限时长")
-        self.dir_auto_stop_sec_spin.valueChanged.connect(self._on_auto_stop_sec_changed)
-        auto_stop_row.addWidget(self.dir_auto_stop_sec_spin)
-        auto_stop_row.addWidget(QLabel("最大历元数:"))
-        self.dir_auto_stop_epoch_spin = QSpinBox()
-        self.dir_auto_stop_epoch_spin.setRange(0, 100000)
-        self.dir_auto_stop_epoch_spin.setValue(self._dir_auto_stop_epochs)
-        self.dir_auto_stop_epoch_spin.setToolTip("0 表示不限历元数")
-        self.dir_auto_stop_epoch_spin.valueChanged.connect(self._on_auto_stop_epoch_changed)
-        auto_stop_row.addWidget(self.dir_auto_stop_epoch_spin)
+        if is_com3:
+            stop_cb = QCheckBox("启用自动停止")
+            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.stateChanged.connect(lambda state: setattr(self, '_dir3_auto_stop_enabled', state == Qt.Checked))
+            auto_stop_row.addWidget(stop_cb)
+            auto_stop_row.addWidget(QLabel("最大时长(秒):"))
+            sec_spin = QSpinBox()
+            sec_spin.setRange(0, 7200)
+            sec_spin.setValue(self._dir3_auto_stop_sec)
+            sec_spin.setSuffix(" s")
+            sec_spin.valueChanged.connect(lambda v: setattr(self, '_dir3_auto_stop_sec', v))
+            auto_stop_row.addWidget(sec_spin)
+            auto_stop_row.addWidget(QLabel("最大历元数:"))
+            epoch_spin = QSpinBox()
+            epoch_spin.setRange(0, 100000)
+            epoch_spin.setValue(self._dir3_auto_stop_epochs)
+            epoch_spin.valueChanged.connect(lambda v: setattr(self, '_dir3_auto_stop_epochs', v))
+            auto_stop_row.addWidget(epoch_spin)
+        else:
+            stop_cb = QCheckBox("启用自动停止")
+            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.stateChanged.connect(self._on_auto_stop_toggled)
+            auto_stop_row.addWidget(stop_cb)
+            auto_stop_row.addWidget(QLabel("最大时长(秒):"))
+            sec_spin = QSpinBox()
+            sec_spin.setRange(0, 7200)
+            sec_spin.setValue(self._dir_auto_stop_sec)
+            sec_spin.setSuffix(" s")
+            sec_spin.valueChanged.connect(self._on_auto_stop_sec_changed)
+            auto_stop_row.addWidget(sec_spin)
+            auto_stop_row.addWidget(QLabel("最大历元数:"))
+            epoch_spin = QSpinBox()
+            epoch_spin.setRange(0, 100000)
+            epoch_spin.setValue(self._dir_auto_stop_epochs)
+            epoch_spin.valueChanged.connect(self._on_auto_stop_epoch_changed)
+            auto_stop_row.addWidget(epoch_spin)
         auto_stop_row.addStretch()
-        layout.addLayout(auto_stop_row)
+        tab_layout.addLayout(auto_stop_row)
 
+        # 统计柱状图
         charts_layout = QVBoxLayout()
-        self.dir_h_chart = pg.PlotWidget()
-        self.dir_h_chart.setBackground('w')
-        self.dir_h_chart.setLabel('left', '水平误差', units='m')
-        self.dir_h_chart.setLabel('bottom', '方向')
-        self.dir_h_chart.showGrid(y=True)
-        self.dir_h_chart.setMaximumHeight(220)
-        charts_layout.addWidget(self.dir_h_chart)
+        h_chart = pg.PlotWidget()
+        h_chart.setBackground('w')
+        h_chart.setLabel('left', '水平误差', units='m')
+        h_chart.setLabel('bottom', '方向')
+        h_chart.showGrid(y=True)
+        h_chart.setMaximumHeight(220)
+        charts_layout.addWidget(h_chart)
 
-        self.dir_v_chart = pg.PlotWidget()
-        self.dir_v_chart.setBackground('w')
-        self.dir_v_chart.setLabel('left', '垂直误差', units='m')
-        self.dir_v_chart.setLabel('bottom', '方向')
-        self.dir_v_chart.showGrid(y=True)
-        self.dir_v_chart.setMaximumHeight(220)
-        charts_layout.addWidget(self.dir_v_chart)
-
-        layout.addLayout(charts_layout)
+        v_chart = pg.PlotWidget()
+        v_chart.setBackground('w')
+        v_chart.setLabel('left', '垂直误差', units='m')
+        v_chart.setLabel('bottom', '方向')
+        v_chart.showGrid(y=True)
+        v_chart.setMaximumHeight(220)
+        charts_layout.addWidget(v_chart)
+        tab_layout.addLayout(charts_layout)
 
         btn_row = QHBoxLayout()
-        self.dir_reset_btn = QPushButton("重置方向统计")
-        self.dir_reset_btn.setMinimumWidth(120)
-        self.dir_reset_btn.clicked.connect(self._reset_direction_stats)
-        btn_row.addWidget(self.dir_reset_btn)
+        reset_btn = QPushButton("重置方向统计")
+        reset_btn.setMinimumWidth(120)
+        if is_com3:
+            reset_btn.clicked.connect(self._reset_direction_stats3)
+        else:
+            reset_btn.clicked.connect(self._reset_direction_stats)
+        btn_row.addWidget(reset_btn)
         btn_row.addStretch()
-        layout.addLayout(btn_row)
+        tab_layout.addLayout(btn_row)
 
-        self._update_direction_charts()
-        return tab
+        # 保存引用
+        if is_com3:
+            self.dir_stat_boxes3 = stat_boxes
+            self.dir_h_chart3 = h_chart
+            self.dir_v_chart3 = v_chart
+        else:
+            self.dir_stat_boxes = stat_boxes
+            self.dir_h_chart = h_chart
+            self.dir_v_chart = v_chart
+
+        title = f"串口3 (干扰测试2)" if is_com3 else f"串口2 (干扰测试)"
+        parent_tab.addTab(tab, title)
 
     def _create_dir_enu_tab(self):
         tab = QWidget()
@@ -2099,6 +2241,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         sub_tabs = QTabWidget()
         self._dir_enu_curves = []
+        self._dir_enu_curves3 = []
         self._dir_enu_plots = []
 
         comp_names = ['东向', '北向', '天向']
@@ -2108,9 +2251,14 @@ class NMEADataAnalyzer(QMainWindow):
             dir_tab = QWidget()
             dir_layout = QVBoxLayout(dir_tab)
 
+            # 每个方向有两个子标签：ENU1vsENU2 和 ENU1vsENU3
+            dir_comp_tabs = QTabWidget()
+
+            # --- 子标签1: ENU1 vs ENU2 ---
+            tab12 = QWidget()
+            lay12 = QVBoxLayout(tab12)
             curves_for_dir = {}
             plots_for_dir = []
-
             for ci, (cname, cunit) in enumerate(zip(comp_names, comp_units)):
                 plot = pg.PlotWidget()
                 plot.setBackground('w')
@@ -2121,15 +2269,35 @@ class NMEADataAnalyzer(QMainWindow):
                 plot.addLegend()
                 c1 = plot.plot([], [], pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
                 c2 = plot.plot([], [], pen={'color': '#2980b9', 'width': 2}, name='ENU2 (干扰测试)')
-                c3 = plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')  # [新增]
                 curves_for_dir[f'{["east","north","up"][ci]}1'] = c1
                 curves_for_dir[f'{["east","north","up"][ci]}2'] = c2
-                curves_for_dir[f'{["east","north","up"][ci]}3'] = c3  # [新增]
                 plots_for_dir.append(plot)
-                dir_layout.addWidget(plot)
-
+                lay12.addWidget(plot)
+            dir_comp_tabs.addTab(tab12, "ENU1 vs ENU2")
             self._dir_enu_curves.append(curves_for_dir)
             self._dir_enu_plots.append(plots_for_dir)
+
+            # --- 子标签2: ENU1 vs ENU3 ---
+            tab13 = QWidget()
+            lay13 = QVBoxLayout(tab13)
+            curves_for_dir3 = {}
+            for ci, (cname, cunit) in enumerate(zip(comp_names, comp_units)):
+                plot = pg.PlotWidget()
+                plot.setBackground('w')
+                plot.setLabel('left', cname, units=cunit)
+                if ci == 2:
+                    plot.setLabel('bottom', '时间', units='历元')
+                plot.showGrid(x=True, y=True)
+                plot.addLegend()
+                c1 = plot.plot([], [], pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
+                c3 = plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+                curves_for_dir3[f'{["east","north","up"][ci]}1'] = c1
+                curves_for_dir3[f'{["east","north","up"][ci]}3'] = c3
+                lay13.addWidget(plot)
+            dir_comp_tabs.addTab(tab13, "ENU1 vs ENU3")
+            self._dir_enu_curves3.append(curves_for_dir3)
+
+            dir_layout.addWidget(dir_comp_tabs)
             sub_tabs.addTab(dir_tab, f"方向{di + 1}")
 
         layout.addWidget(sub_tabs)
@@ -2137,24 +2305,47 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _toggle_single_direction(self, direction_index):
         ds = self.direction_stats[direction_index]
+        boxes = self.dir_stat_boxes
         if ds._active:
-            self._save_enu_for_direction(direction_index)
+            self._save_enu_for_direction(direction_index, self.direction_stats, boxes)
             ds.stop()
-            self.dir_stat_boxes[direction_index]['btn'].setText("启动方向测试")
-            self.dir_stat_boxes[direction_index]['btn'].setStyleSheet(
+            boxes[direction_index]['btn'].setText("启动方向测试")
+            boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
             self._dir_enu_active_index = -1
-            self.log_info(f"方向{direction_index + 1} 测试已停止")
+            self.log_info(f"方向{direction_index + 1} 测试已停止 (串口2)")
         else:
             self._save_enu_for_active_direction()
             self._reset_enu_chart_data()
             ds.start()
             ds.clear_enu()
             self._dir_enu_active_index = direction_index
-            self.dir_stat_boxes[direction_index]['btn'].setText("停止方向测试")
-            self.dir_stat_boxes[direction_index]['btn'].setStyleSheet(
+            boxes[direction_index]['btn'].setText("停止方向测试")
+            boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
-            self.log_info(f"方向{direction_index + 1} 测试已启动")
+            self.log_info(f"方向{direction_index + 1} 测试已启动 (串口2)")
+
+    def _toggle_single_direction3(self, direction_index):
+        ds = self.direction_stats3[direction_index]
+        boxes = self.dir_stat_boxes3
+        if ds._active:
+            self._save_enu_for_direction(direction_index, self.direction_stats3, boxes)
+            ds.stop()
+            boxes[direction_index]['btn'].setText("启动方向测试")
+            boxes[direction_index]['btn'].setStyleSheet(
+                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
+            self._dir3_enu_active_index = -1
+            self.log_info(f"方向{direction_index + 1} 测试已停止 (串口3)")
+        else:
+            self._save_enu_for_active_direction3()
+            self._reset_enu_chart_data()
+            ds.start()
+            ds.clear_enu()
+            self._dir3_enu_active_index = direction_index
+            boxes[direction_index]['btn'].setText("停止方向测试")
+            boxes[direction_index]['btn'].setStyleSheet(
+                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
+            self.log_info(f"方向{direction_index + 1} 测试已启动 (串口3)")
 
     def _on_auto_stop_toggled(self, state):
         self._dir_auto_stop_enabled = (state == Qt.Checked)
@@ -2170,33 +2361,54 @@ class NMEADataAnalyzer(QMainWindow):
         for i in range(4):
             ds = self.direction_stats[i]
             if ds._active:
-                self._save_enu_for_direction(i)
+                self._save_enu_for_direction(i, self.direction_stats, self.dir_stat_boxes)
                 ds.stop()
                 self.dir_stat_boxes[i]['btn'].setText("启动方向测试")
                 self.dir_stat_boxes[i]['btn'].setStyleSheet(
                     "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-                self.log_info(f"方向{i + 1} 测试已停止")
+                self.log_info(f"方向{i + 1} 测试已停止 (串口2)")
 
-    def _save_enu_for_direction(self, direction_index):
-        ds = self.direction_stats[direction_index]
+    def _save_enu_for_active_direction3(self):
+        for i in range(4):
+            ds = self.direction_stats3[i]
+            if ds._active:
+                self._save_enu_for_direction(i, self.direction_stats3, self.dir_stat_boxes3)
+                ds.stop()
+                self.dir_stat_boxes3[i]['btn'].setText("启动方向测试")
+                self.dir_stat_boxes3[i]['btn'].setStyleSheet(
+                    "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
+                self.log_info(f"方向{i + 1} 测试已停止 (串口3)")
+
+    def _save_enu_for_direction(self, direction_index, direction_stats=None, dir_stat_boxes=None):
+        if direction_stats is None:
+            direction_stats = self.direction_stats
+        if dir_stat_boxes is None:
+            dir_stat_boxes = self.dir_stat_boxes
+        ds = direction_stats[direction_index]
         n = len(self.enu2_times)
+        is_com3 = (direction_stats is self.direction_stats3)
         if n > 0:
             n1_total = len(self.enu1_times)
-            n3_total = len(self.enu3_times)  # [新增]
             enu1_t = self.enu1_times[-n:] if n1_total >= n else list(self.enu1_times)
             enu1_e = self.enu1_east_data[-n:] if n1_total >= n else list(self.enu1_east_data)
             enu1_n = self.enu1_north_data[-n:] if n1_total >= n else list(self.enu1_north_data)
             enu1_u = self.enu1_up_data[-n:] if n1_total >= n else list(self.enu1_up_data)
-            # [新增] ENU3数据
-            enu3_t = self.enu3_times[-n:] if n3_total >= n else list(self.enu3_times)
-            enu3_e = self.enu3_east_data[-n:] if n3_total >= n else list(self.enu3_east_data)
-            enu3_n = self.enu3_north_data[-n:] if n3_total >= n else list(self.enu3_north_data)
-            enu3_u = self.enu3_up_data[-n:] if n3_total >= n else list(self.enu3_up_data)
-            ds.save_enu_snapshot(
-                enu1_t, enu1_e, enu1_n, enu1_u,
-                self.enu2_times, self.enu2_east_data, self.enu2_north_data, self.enu2_up_data,
-                enu3_t, enu3_e, enu3_n, enu3_u)  # [新增] ENU3快照
-            self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {n}点, ENU3: {len(enu3_e)}点)")
+            if is_com3:
+                n3_total = len(self.enu3_times)
+                enu3_t = self.enu3_times[-n:] if n3_total >= n else list(self.enu3_times)
+                enu3_e = self.enu3_east_data[-n:] if n3_total >= n else list(self.enu3_east_data)
+                enu3_n = self.enu3_north_data[-n:] if n3_total >= n else list(self.enu3_north_data)
+                enu3_u = self.enu3_up_data[-n:] if n3_total >= n else list(self.enu3_up_data)
+                ds.save_enu_snapshot(
+                    enu1_t, enu1_e, enu1_n, enu1_u,
+                    [], [], [], [],
+                    enu3_t, enu3_e, enu3_n, enu3_u)
+                self.log_info(f"方向{direction_index + 1} ENU3数据已保存 (ENU1: {len(enu1_e)}点, ENU3: {len(enu3_e)}点)")
+            else:
+                ds.save_enu_snapshot(
+                    enu1_t, enu1_e, enu1_n, enu1_u,
+                    self.enu2_times, self.enu2_east_data, self.enu2_north_data, self.enu2_up_data)
+                self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {n}点)")
 
     def _reset_enu_chart_data(self):
         self.enu1_times = []
@@ -2209,6 +2421,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_east_curve.setData([], [])
         self.enu1_north_curve.setData([], [])
         self.enu1_up_curve.setData([], [])
+        self.enu1_13_east_curve.setData([], [])
+        self.enu1_13_north_curve.setData([], [])
+        self.enu1_13_up_curve.setData([], [])
 
         self.enu2_times = []
         self.enu2_east_data = []
@@ -2234,40 +2449,44 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu3_up_curve.setData([], [])
 
     def _feed_direction_stats(self):
-        # 优先使用ENU2数据（主干扰测试口）
+        # 串口2方向测试数据馈入
         if self._p2_gga_new_epoch:
             if self.enu2_ref_ready:
                 self._p2_gga_new_epoch = False
-                self._do_feed_direction_stats(self._latest_enu2_east, self._latest_enu2_north, self._latest_enu2_up, self._latest_p2_quality)
-        # [新增] 也使用ENU3数据（第二干扰测试口）
+                self._do_feed_direction_stats(self._latest_enu2_east, self._latest_enu2_north, self._latest_enu2_up, self._latest_p2_quality,
+                    self.direction_stats, self.dir_stat_boxes, self._dir_auto_stop_enabled, self._dir_auto_stop_sec, self._dir_auto_stop_epochs)
+
+    def _feed_direction_stats3(self):
+        # 串口3方向测试数据馈入
         if self._p3_gga_new_epoch:
             if self.enu3_ref_ready:
                 self._p3_gga_new_epoch = False
-                self._do_feed_direction_stats(self._latest_enu3_east, self._latest_enu3_north, self._latest_enu3_up, self._latest_p3_quality)
+                self._do_feed_direction_stats(self._latest_enu3_east, self._latest_enu3_north, self._latest_enu3_up, self._latest_p3_quality,
+                    self.direction_stats3, self.dir_stat_boxes3, self._dir3_auto_stop_enabled, self._dir3_auto_stop_sec, self._dir3_auto_stop_epochs)
 
-    def _do_feed_direction_stats(self, east, north, up, quality):
+    def _do_feed_direction_stats(self, east, north, up, quality, direction_stats, dir_stat_boxes, auto_stop_enabled, auto_stop_sec, auto_stop_epochs):
         for i in range(4):
-            ds = self.direction_stats[i]
+            ds = direction_stats[i]
             if ds._active:
                 ds.add_epoch(east, north, up, quality)
-                if self._dir_auto_stop_enabled:
+                if auto_stop_enabled:
                     stopped = False
-                    if self._dir_auto_stop_sec > 0 and ds.duration >= self._dir_auto_stop_sec:
+                    if auto_stop_sec > 0 and ds.duration >= auto_stop_sec:
                         stopped = True
-                        reason = f"达到设定时长 {self._dir_auto_stop_sec} 秒"
-                    if not stopped and self._dir_auto_stop_epochs > 0 and ds.total_epochs >= self._dir_auto_stop_epochs:
+                        reason = f"达到设定时长 {auto_stop_sec} 秒"
+                    if not stopped and auto_stop_epochs > 0 and ds.total_epochs >= auto_stop_epochs:
                         stopped = True
-                        reason = f"达到设定历元数 {self._dir_auto_stop_epochs}"
+                        reason = f"达到设定历元数 {auto_stop_epochs}"
                     if stopped:
-                        self._save_enu_for_direction(i)
+                        self._save_enu_for_direction(i, direction_stats, dir_stat_boxes)
                         ds.stop()
-                        self._dir_enu_active_index = -1
-                        self.dir_stat_boxes[i]['btn'].setText("启动方向测试")
-                        self.dir_stat_boxes[i]['btn'].setStyleSheet(
+                        dir_stat_boxes[i]['btn'].setText("启动方向测试")
+                        dir_stat_boxes[i]['btn'].setStyleSheet(
                             "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
                         self.log_info(f"方向{i + 1} 自动停止 ({reason})")
 
     def _update_direction_stats_display(self):
+        # 串口2方向测试显示
         for i in range(4):
             ds = self.direction_stats[i]
             if ds._active:
@@ -2282,6 +2501,21 @@ class NMEADataAnalyzer(QMainWindow):
             labels['v'].setText(
                 f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
         self._update_direction_charts()
+        # 串口3方向测试显示
+        for i in range(4):
+            ds = self.direction_stats3[i]
+            if ds._active:
+                ds.update_duration()
+            stats = ds.get_stats()
+            labels = self.dir_stat_boxes3[i]
+            labels['duration'].setText(f"测试时长: {stats['duration']}")
+            labels['epoch'].setText(
+                f"总历元: {stats['total_epochs']} | 成功: {stats['successful_epochs']} | 成功率: {stats['success_rate']:.1f}%")
+            labels['h'].setText(
+                f"水平误差 均值: {stats['h_mean']:.3f} m | 最大: {stats['h_max']:.3f} m")
+            labels['v'].setText(
+                f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
+        self._update_direction_charts3()
         self._update_direction_enu_charts()
 
     def _update_direction_charts(self):
@@ -2309,7 +2543,33 @@ class NMEADataAnalyzer(QMainWindow):
         ax_v = self.dir_v_chart.getAxis('bottom')
         ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
 
+    def _update_direction_charts3(self):
+        x = [1, 2, 3, 4]
+        h_means = [self.direction_stats3[i].h_mean for i in range(4)]
+        h_maxs = [self.direction_stats3[i].h_max for i in range(4)]
+        v_means = [self.direction_stats3[i].v_mean for i in range(4)]
+        v_maxs = [self.direction_stats3[i].v_max for i in range(4)]
+
+        self.dir_h_chart3.clear()
+        bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
+        bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
+        self.dir_h_chart3.addItem(bar_mean)
+        self.dir_h_chart3.addItem(bar_max)
+        self.dir_h_chart3.addLegend()
+        ax_h = self.dir_h_chart3.getAxis('bottom')
+        ax_h.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
+        self.dir_v_chart3.clear()
+        bar_mean_v = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
+        bar_max_v = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
+        self.dir_v_chart3.addItem(bar_mean_v)
+        self.dir_v_chart3.addItem(bar_max_v)
+        self.dir_v_chart3.addLegend()
+        ax_v = self.dir_v_chart3.getAxis('bottom')
+        ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
     def _update_direction_enu_charts(self):
+        # 串口2方向ENU对比 (ENU1 vs ENU2)
         for i in range(4):
             ds = self.direction_stats[i]
             curves = self._dir_enu_curves[i]
@@ -2322,42 +2582,57 @@ class NMEADataAnalyzer(QMainWindow):
                 curves['north2'].setData(t2, n2)
                 curves['up1'].setData(t1, u1)
                 curves['up2'].setData(t2, u2)
-                # [新增] ENU3曲线
-                if ds.has_enu3_data():
-                    t3, e3, n3, u3 = ds.get_enu3_snapshot()
-                    curves['east3'].setData(t3, e3)
-                    curves['north3'].setData(t3, n3)
-                    curves['up3'].setData(t3, u3)
-                else:
-                    curves['east3'].setData([], [])
-                    curves['north3'].setData([], [])
-                    curves['up3'].setData([], [])
             else:
-                curves['east1'].setData([], [])
-                curves['east2'].setData([], [])
-                curves['east3'].setData([], [])  # [新增]
-                curves['north1'].setData([], [])
-                curves['north2'].setData([], [])
-                curves['north3'].setData([], [])  # [新增]
-                curves['up1'].setData([], [])
-                curves['up2'].setData([], [])
-                curves['up3'].setData([], [])  # [新增]
+                for k in ('east1','east2','north1','north2','up1','up2'):
+                    if k in curves:
+                        curves[k].setData([], [])
 
-    def _render_dir_enu_charts_for_report(self, report_dir, ts_str=""):
+        # 串口3方向ENU对比 (ENU1 vs ENU3)
+        for i in range(4):
+            ds = self.direction_stats3[i]
+            curves = self._dir_enu_curves3[i]
+            if ds.has_enu_data():
+                t1, e1, n1, u1 = ds.get_enu1_snapshot()
+                t3, e3, n3, u3 = ds.get_enu3_snapshot()
+                curves['east1'].setData(t1, e1)
+                curves['east3'].setData(t3, e3)
+                curves['north1'].setData(t1, n1)
+                curves['north3'].setData(t3, n3)
+                curves['up1'].setData(t1, u1)
+                curves['up3'].setData(t3, u3)
+            else:
+                for k in ('east1','east3','north1','north3','up1','up3'):
+                    if k in curves:
+                        curves[k].setData([], [])
+
+    def _render_dir_enu_charts_for_report(self, report_dir, ts_str="", direction_stats=None, label2="ENU2 (干扰测试)", label3=None):
+        """为报告渲染方向ENU对比图
+        Args:
+            direction_stats: 方向统计列表(COM2用self.direction_stats, COM3用self.direction_stats3)
+            label2: 第二条曲线的标签(COM2用"ENU2 (干扰测试)", COM3用"ENU3 (干扰测试2)")
+            label3: 第三条曲线标签(为None则只画两条曲线)
+        """
+        if direction_stats is None:
+            direction_stats = self.direction_stats
         QApplication.processEvents()
         png_paths = []
         for i in range(4):
-            ds = self.direction_stats[i]
+            ds = direction_stats[i]
             if not ds.has_enu_data():
                 continue
             t1, e1, n1, u1 = ds.get_enu1_snapshot()
-            t2, e2, n2, u2 = ds.get_enu2_snapshot()
-            has3 = ds.has_enu3_data()
-            if has3:
+            if label3 is None:
+                # 双曲线模式: ENU1 vs ENU2 或 ENU1 vs ENU3
+                if direction_stats is self.direction_stats:
+                    _, d2e, d2n, d2u = ds.get_enu2_snapshot()
+                else:
+                    _, d2e, d2n, d2u = ds.get_enu3_snapshot()
+                components = [('东向 E', e1, d2e), ('北向 N', n1, d2n), ('天向 U', u1, d2u)]
+            else:
+                # 三曲线模式(保留兼容)
+                t2, e2, n2, u2 = ds.get_enu2_snapshot()
                 t3, e3, n3, u3 = ds.get_enu3_snapshot()
-
-            components = [('东向 E', e1, e2), ('北向 N', n1, n2), ('天向 U', u1, u2)]
-            if has3:
+                components = [('东向 E', e1, e2), ('北向 N', n1, n2), ('天向 U', u1, u2)]
                 components3 = [e3, n3, u3]
 
             grid = pg.GraphicsLayoutWidget()
@@ -2371,14 +2646,15 @@ class NMEADataAnalyzer(QMainWindow):
                 p.showGrid(x=True, y=True)
                 p.addLegend()
                 p.plot(t1, d1, pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
-                p.plot(t2, d2, pen={'color': '#2980b9', 'width': 2}, name='ENU2 (干扰测试)')
-                # [新增] ENU3曲线
-                if has3:
-                    p.plot(t3, components3[r], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+                p.plot(t1 if direction_stats is self.direction_stats else t1, d2,
+                       pen={'color': '#2980b9', 'width': 2}, name=label2)
+                if label3 is not None:
+                    p.plot(t3, components3[r], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name=label3)
             grid.show()
             QApplication.processEvents()
 
-            png_name = f'dir{i + 1}_enu_comparison_{ts_str}.png' if ts_str else f'dir{i + 1}_enu_comparison.png'
+            prefix = 'com2' if direction_stats is self.direction_stats else 'com3'
+            png_name = f'dir{i + 1}_{prefix}_enu_{ts_str}.png' if ts_str else f'dir{i + 1}_{prefix}_enu.png'
             png_path = os.path.join(report_dir, png_name)
             exporter = ImageExporter(grid.scene())
             exporter.parameters()['width'] = 1000
@@ -2393,7 +2669,6 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _reset_direction_stats(self):
         previously_active = [i for i in range(4) if self.direction_stats[i]._active]
-        self._dir_enu_active_index = -1
         for i in range(4):
             self.direction_stats[i].reset()
             btn = self.dir_stat_boxes[i]['btn']
@@ -2406,9 +2681,27 @@ class NMEADataAnalyzer(QMainWindow):
             self.dir_stat_boxes[i]['btn'].setText("停止方向测试")
             self.dir_stat_boxes[i]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
-        self._update_direction_enu_charts()
+        self._update_direction_charts()
         self._update_direction_stats_display()
-        self.log_info("方向统计已重置")
+        self.log_info("串口2方向统计已重置")
+
+    def _reset_direction_stats3(self):
+        previously_active = [i for i in range(4) if self.direction_stats3[i]._active]
+        for i in range(4):
+            self.direction_stats3[i].reset()
+            btn = self.dir_stat_boxes3[i]['btn']
+            btn.setText("启动方向测试")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
+        for i in previously_active:
+            self.direction_stats3[i].start()
+            self._dir3_enu_active_index = i
+            self.dir_stat_boxes3[i]['btn'].setText("停止方向测试")
+            self.dir_stat_boxes3[i]['btn'].setStyleSheet(
+                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
+        self._update_direction_charts3()
+        self._update_direction_stats_display()
+        self.log_info("串口3方向统计已重置")
 
     def reset_all_stats(self):
         """重置所有统计"""
@@ -2440,6 +2733,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_east_curve.setData([], [])
         self.enu1_north_curve.setData([], [])
         self.enu1_up_curve.setData([], [])
+        self.enu1_13_east_curve.setData([], [])
+        self.enu1_13_north_curve.setData([], [])
+        self.enu1_13_up_curve.setData([], [])
         self.enu1_east_label.setText("东: -- m")
         self.enu1_north_label.setText("北: -- m")
         self.enu1_up_label.setText("天: -- m")
@@ -2624,7 +2920,15 @@ class NMEADataAnalyzer(QMainWindow):
                 except Exception:
                     pass
 
-    def _build_report_lines(self, png_map=None):
+    def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
+        """生成报告文本行
+        Args:
+            direction_stats: 方向统计列表(None=默认COM2, self.direction_stats3=COM3)
+            port_label: 串口标签
+            enu_label: ENU标签
+        """
+        if direction_stats is None:
+            direction_stats = self.direction_stats
         lines = []
 
         def w(line=""):
@@ -2647,7 +2951,10 @@ class NMEADataAnalyzer(QMainWindow):
         p1_baud = self.port1_baud.currentText() if port1_connected else "-"
         p2_baud = self.port2_baud.currentText() if port2_connected else "-"
         p3_baud = self.port3_baud.currentText() if port3_connected else "-"  # [新增]
-        w(f"**串口1 (无干扰):** {p1_port_name} @ {p1_baud} bps | **串口2 (干扰测试):** {p2_port_name} @ {p2_baud} bps | **串口3 (干扰测试2):** {p3_port_name} @ {p3_baud} bps")
+        if is_com3_report:
+            w(f"**串口1 (无干扰):** {p1_port_name} @ {p1_baud} bps | **串口3 (干扰测试2):** {p3_port_name} @ {p3_baud} bps")
+        else:
+            w(f"**串口1 (无干扰):** {p1_port_name} @ {p1_baud} bps | **串口2 (干扰测试):** {p2_port_name} @ {p2_baud} bps")
         w()
 
         w("## 一、实验配置")
@@ -2699,7 +3006,8 @@ class NMEADataAnalyzer(QMainWindow):
         system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3"}
 
         section_names = ["二", "三", "四", "五"]
-        tested = [(i, self.direction_stats[i]) for i in range(4) if self.direction_stats[i].total_epochs > 0]
+        is_com3_report = (direction_stats is self.direction_stats3)
+        tested = [(i, direction_stats[i]) for i in range(4) if direction_stats[i].total_epochs > 0]
         for idx, (i, ds) in enumerate(tested):
             sec_name = section_names[idx]
             sec_num = idx + 2
@@ -2719,7 +3027,10 @@ class NMEADataAnalyzer(QMainWindow):
 
             if ds.has_enu_data():
                 _, e1, n1, u1 = ds.get_enu1_snapshot()
-                _, e2, n2, u2 = ds.get_enu2_snapshot()
+                if is_com3_report:
+                    _, e2, n2, u2 = ds.get_enu3_snapshot()
+                else:
+                    _, e2, n2, u2 = ds.get_enu2_snapshot()
                 es = calc_std(e2); ns = calc_std(n2); us = calc_std(u2)
                 e_max = max(abs(v) for v in e2) if e2 else 0.0
                 n_max = max(abs(v) for v in n2) if n2 else 0.0
@@ -2972,6 +3283,130 @@ class NMEADataAnalyzer(QMainWindow):
         if png_paths:
             self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
         QMessageBox.information(self, "导出成功", f"PDF报告已保存到:\n{file_path}")
+
+    # ========== 串口2独立报告导出 ==========
+    def export_test_report2(self):
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
+        try:
+            return self._do_export_test_report2(QFileDialog, QMessageBox, QApplication)
+        except Exception as e:
+            self.log_error(f"导出串口2报告失败: {str(e)}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口2报告:\n{str(e)}")
+
+    def _do_export_test_report2(self, QFileDialog, QMessageBox, QApplication):
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self.device_sn_input.text().strip() or "test"
+        default_name = f"串口2测试报告_{sn}_{ts_str}.md"
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口2测试报告", default_path, "Markdown 文件 (*.md);;所有文件 (*.*)")
+        if not file_path: return
+        report_dir = os.path.dirname(file_path)
+        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats, "ENU2 (干扰测试)")
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+        lines, _ = self._build_report_lines(png_map, self.direction_stats, "串口2", "ENU2")
+        with open(file_path, 'w', encoding='utf-8') as f: f.write('\n'.join(lines))
+        self.log_info(f"串口2测试报告已导出: {file_path}")
+        QMessageBox.information(self, "导出成功", f"串口2测试报告已保存到:\n{file_path}")
+
+    def export_pdf_report2(self):
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
+        try:
+            return self._do_export_pdf_report2(QFileDialog, QMessageBox, QApplication)
+        except Exception as e:
+            self.log_error(f"导出串口2PDF报告失败: {str(e)}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口2PDF报告:\n{str(e)}")
+
+    def _do_export_pdf_report2(self, QFileDialog, QMessageBox, QApplication):
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self.device_sn_input.text().strip() or "test"
+        default_name = f"串口2测试报告_{sn}_{ts_str}.pdf"
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口2PDF报告", default_path, "PDF 文件 (*.pdf);;所有文件 (*.*)")
+        if not file_path: return
+        report_dir = os.path.dirname(file_path)
+        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats, "ENU2 (干扰测试)")
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+        lines, _ = self._build_report_lines(png_map, self.direction_stats, "串口2", "ENU2")
+        html_text = self._md_lines_to_html(lines, report_dir)
+        doc = QTextDocument(); doc.setHtml(html_text)
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(file_path)
+        printer.setPageSize(QPrinter.A4)
+        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+        doc.print_(printer)
+        self.log_info(f"串口2PDF报告已导出: {file_path}")
+        QMessageBox.information(self, "导出成功", f"串口2PDF报告已保存到:\n{file_path}")
+
+    # ========== 串口3独立报告导出 ==========
+    def export_test_report3(self):
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
+        try:
+            return self._do_export_test_report3(QFileDialog, QMessageBox, QApplication)
+        except Exception as e:
+            self.log_error(f"导出串口3报告失败: {str(e)}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口3报告:\n{str(e)}")
+
+    def _do_export_test_report3(self, QFileDialog, QMessageBox, QApplication):
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self.device_sn_input.text().strip() or "test"
+        default_name = f"串口3测试报告_{sn}_{ts_str}.md"
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口3测试报告", default_path, "Markdown 文件 (*.md);;所有文件 (*.*)")
+        if not file_path: return
+        report_dir = os.path.dirname(file_path)
+        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats3, "ENU3 (干扰测试2)")
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+        lines, _ = self._build_report_lines(png_map, self.direction_stats3, "串口3", "ENU3")
+        with open(file_path, 'w', encoding='utf-8') as f: f.write('\n'.join(lines))
+        self.log_info(f"串口3测试报告已导出: {file_path}")
+        QMessageBox.information(self, "导出成功", f"串口3测试报告已保存到:\n{file_path}")
+
+    def export_pdf_report3(self):
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox, QApplication
+        try:
+            return self._do_export_pdf_report3(QFileDialog, QMessageBox, QApplication)
+        except Exception as e:
+            self.log_error(f"导出串口3PDF报告失败: {str(e)}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口3PDF报告:\n{str(e)}")
+
+    def _do_export_pdf_report3(self, QFileDialog, QMessageBox, QApplication):
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self.device_sn_input.text().strip() or "test"
+        default_name = f"串口3测试报告_{sn}_{ts_str}.pdf"
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出串口3PDF报告", default_path, "PDF 文件 (*.pdf);;所有文件 (*.*)")
+        if not file_path: return
+        report_dir = os.path.dirname(file_path)
+        if not report_dir: report_dir = os.path.dirname(os.path.abspath(__file__))
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, self.direction_stats3, "ENU3 (干扰测试2)")
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+        lines, _ = self._build_report_lines(png_map, self.direction_stats3, "串口3", "ENU3")
+        html_text = self._md_lines_to_html(lines, report_dir)
+        doc = QTextDocument(); doc.setHtml(html_text)
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(file_path)
+        printer.setPageSize(QPrinter.A4)
+        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+        doc.print_(printer)
+        self.log_info(f"串口3PDF报告已导出: {file_path}")
+        QMessageBox.information(self, "导出成功", f"串口3PDF报告已保存到:\n{file_path}")
 
     def _open_auto_log_files(self):
         self._close_auto_log_files()
