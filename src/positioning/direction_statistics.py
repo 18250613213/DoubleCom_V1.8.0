@@ -22,6 +22,11 @@ class DirectionStatistics:
         self._enu2_east = []
         self._enu2_north = []
         self._enu2_up = []
+        # [新增] 串口3 ENU数据快照
+        self._enu3_times = []
+        self._enu3_east = []
+        self._enu3_north = []
+        self._enu3_up = []
 
     def add_epoch(self, east, north, up, quality):
         self.total_epochs += 1
@@ -37,7 +42,7 @@ class DirectionStatistics:
             self.h_mean = self.h_mean + (h_error - self.h_mean) / n
             self.v_mean = self.v_mean + (v_error - self.v_mean) / n
 
-    def save_enu_snapshot(self, t1, e1, n1, u1, t2, e2, n2, u2):
+    def save_enu_snapshot(self, t1, e1, n1, u1, t2, e2, n2, u2, t3=None, e3=None, n3=None, u3=None):
         self._enu1_times = list(t1)
         self._enu1_east = list(e1)
         self._enu1_north = list(n1)
@@ -46,6 +51,12 @@ class DirectionStatistics:
         self._enu2_east = list(e2)
         self._enu2_north = list(n2)
         self._enu2_up = list(u2)
+        # [新增] 串口3 ENU快照
+        if t3 is not None:
+            self._enu3_times = list(t3)
+            self._enu3_east = list(e3)
+            self._enu3_north = list(n3)
+            self._enu3_up = list(u3)
         self._enu_saved = True
 
     def clear_enu(self):
@@ -57,6 +68,11 @@ class DirectionStatistics:
         self._enu2_east = []
         self._enu2_north = []
         self._enu2_up = []
+        # [新增] 清空串口3 ENU数据
+        self._enu3_times = []
+        self._enu3_east = []
+        self._enu3_north = []
+        self._enu3_up = []
         self._enu_saved = False
 
     def get_enu1_snapshot(self):
@@ -65,11 +81,19 @@ class DirectionStatistics:
     def get_enu2_snapshot(self):
         return self._enu2_times, self._enu2_east, self._enu2_north, self._enu2_up
 
+    # [新增] 获取串口3 ENU快照
+    def get_enu3_snapshot(self):
+        return self._enu3_times, self._enu3_east, self._enu3_north, self._enu3_up
+
     def has_enu_data(self):
         """Check both ENU1 and ENU2 snapshots are available."""
         return (self._enu_saved
                 and len(self._enu1_times) > 0
                 and len(self._enu2_times) > 0)
+
+    # [新增] 检查是否有ENU3数据
+    def has_enu3_data(self):
+        return self._enu_saved and len(self._enu3_times) > 0
 
     def reset(self):
         self.total_epochs = 0
