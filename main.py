@@ -713,16 +713,6 @@ class NMEADataAnalyzer(QMainWindow):
         self.log_window.setMaximumHeight(150)
         control_layout.addWidget(self.log_window)
 
-        # 设备序号输入行
-        sn_row = QHBoxLayout()
-        sn_row.addWidget(QLabel("设备序号:"))
-        self.device_sn_input = QLineEdit()
-        self.device_sn_input.setPlaceholderText("请输入测试设备序号")
-        self.device_sn_input.setMinimumWidth(200)
-        sn_row.addWidget(self.device_sn_input)
-        sn_row.addStretch()
-        control_layout.addLayout(sn_row)
-
         # 测试基本信息
         info_group = QGroupBox("测试基本信息")
         info_layout = QGridLayout(info_group)
@@ -2088,6 +2078,26 @@ class NMEADataAnalyzer(QMainWindow):
 
         is_com3 = (port_id == 3)
 
+        # 设备序号输入行
+        sn_row = QHBoxLayout()
+        sn_row.addWidget(QLabel("设备序号:"))
+        sn_input = QLineEdit()
+        sn_input.setPlaceholderText("请输入设备序号")
+        sn_input.setMinimumWidth(150)
+        sn_row.addWidget(sn_input)
+        sn_apply_btn = QPushButton("应用")
+        sn_apply_btn.setMinimumWidth(60)
+        sn_apply_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
+        if is_com3:
+            self.device_sn3_input = sn_input
+            sn_apply_btn.clicked.connect(lambda: self._apply_device_sn(3))
+        else:
+            self.device_sn2_input = sn_input
+            sn_apply_btn.clicked.connect(lambda: self._apply_device_sn(2))
+        sn_row.addWidget(sn_apply_btn)
+        sn_row.addStretch()
+        tab_layout.addLayout(sn_row)
+
         stats_grid = QGridLayout()
         stat_boxes = []
 
@@ -2915,6 +2925,31 @@ class NMEADataAnalyzer(QMainWindow):
             self.log_error(f"保存全部日志失败: {str(e)}")
             QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
 
+    def _apply_device_sn(self, port_id):
+        """应用设备序号并写入日志"""
+        sn_input = self.device_sn3_input if port_id == 3 else self.device_sn2_input
+        sn = sn_input.text().strip()
+        if not sn:
+            QMessageBox.warning(self, "警告", "请输入设备序号")
+            return
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"{sn} 设备序号开始测试"
+        self.log_info(f"[串口{port_id}] {log_msg}")
+        # 写入所有已开启的日志文件
+        for f in (self._log_file1, self._log_file2, self._log_file3):
+            if f and not f.closed:
+                try:
+                    f.write(f"[{ts}] {log_msg}\n")
+                    f.flush()
+                except Exception:
+                    pass
+
+    def _get_device_sn(self, direction_stats=None):
+        """根据方向统计列表获取对应端口的设备序号"""
+        if direction_stats and direction_stats is self.direction_stats3:
+            return self.device_sn3_input.text().strip() or "test"
+        return self.device_sn2_input.text().strip() or "test"
+
     def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
         """生成报告文本行
         Args:
@@ -3076,7 +3111,7 @@ class NMEADataAnalyzer(QMainWindow):
         w()
         w("| 项目 | 说明 |")
         w("|------|------|")
-        sn = self.device_sn_input.text().strip()
+        sn = self._get_device_sn(direction_stats)
         w(f"| 设备序号 | {sn if sn else ''} |")
         w("| 备注 | |")
         w()
@@ -3197,7 +3232,7 @@ class NMEADataAnalyzer(QMainWindow):
                           dialog_title="导出测试报告"):
         """统一报告导出核心实现"""
         ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        sn = self.device_sn_input.text().strip() or "test"
+        sn = self._get_device_sn(direction_stats)
         default_name = f"{file_prefix}_{sn}_{ts_str}.{ext}"
         reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
         os.makedirs(reports_dir, exist_ok=True)
