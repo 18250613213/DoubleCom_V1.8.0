@@ -782,19 +782,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.reset_stats_btn.setMinimumWidth(100)
         self.clear_log_btn = QPushButton("清除日志")
         self.clear_log_btn.setMinimumWidth(100)
-        self.save_log1_btn = QPushButton("保存串口1日志")
-        self.save_log1_btn.setMinimumWidth(110)
-        self.save_log2_btn = QPushButton("保存串口2日志")
-        self.save_log2_btn.setMinimumWidth(110)
-        # [新增] 保存串口3日志按钮
-        self.save_log3_btn = QPushButton("保存串口3日志")
-        self.save_log3_btn.setMinimumWidth(110)
-        self.export_report_btn = QPushButton("导出测试报告")
-        self.export_report_btn.setMinimumWidth(120)
-        self.export_report_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
-        self.export_pdf_btn = QPushButton("导出PDF报告")
-        self.export_pdf_btn.setMinimumWidth(120)
-        self.export_pdf_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
+        self.save_all_log_btn = QPushButton("保存全部日志")
+        self.save_all_log_btn.setMinimumWidth(110)
         # [新增] 串口2独立报告按钮
         self.export_report2_btn = QPushButton("导出串口2测试报告")
         self.export_report2_btn.setMinimumWidth(140)
@@ -813,11 +802,7 @@ class NMEADataAnalyzer(QMainWindow):
         bottom_layout.addWidget(self.clear_data_btn)
         bottom_layout.addWidget(self.reset_stats_btn)
         bottom_layout.addWidget(self.clear_log_btn)
-        bottom_layout.addWidget(self.save_log1_btn)
-        bottom_layout.addWidget(self.save_log2_btn)
-        bottom_layout.addWidget(self.save_log3_btn)  # [新增]
-        bottom_layout.addWidget(self.export_report_btn)
-        bottom_layout.addWidget(self.export_pdf_btn)
+        bottom_layout.addWidget(self.save_all_log_btn)
         bottom_layout.addWidget(self.export_report2_btn)
         bottom_layout.addWidget(self.export_pdf2_btn)
         bottom_layout.addWidget(self.export_report3_btn)
@@ -982,12 +967,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.port3_disconnect_btn.clicked.connect(lambda: self.disconnect_serial(3))
 
         self.clear_log_btn.clicked.connect(self.clear_log)
-        self.save_log1_btn.clicked.connect(lambda: self.save_serial_log(1))
-        self.save_log2_btn.clicked.connect(lambda: self.save_serial_log(2))
-        self.save_log3_btn.clicked.connect(lambda: self.save_serial_log(3))  # [新增]
+        self.save_all_log_btn.clicked.connect(self._save_all_serial_logs)
 
-        self.export_report_btn.clicked.connect(self.export_test_report)
-        self.export_pdf_btn.clicked.connect(self.export_pdf_report)
         self.export_report2_btn.clicked.connect(self.export_test_report2)
         self.export_pdf2_btn.clicked.connect(self.export_pdf_report2)
         self.export_report3_btn.clicked.connect(self.export_test_report3)
@@ -2908,6 +2889,32 @@ class NMEADataAnalyzer(QMainWindow):
                 self.log_error(f"保存串口{port_id}日志失败: {str(e)}")
                 QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
 
+    def _save_all_serial_logs(self):
+        """保存所有串口的日志"""
+        from PyQt5.QtWidgets import QFileDialog
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存全部日志",
+            f"all_serial_logs_{ts}.txt",
+            "文本文件 (*.txt);;所有文件 (*.*)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                for port_id, buf in [(1, self.serial_save_buffer), (2, self.serial2_save_buffer), (3, self.serial3_save_buffer)]:
+                    if buf:
+                        f.write(f"=== 串口{port_id} 日志 ({len(buf)} 条) ===\n")
+                        for data in buf:
+                            f.write(data.decode('utf-8', errors='replace') if isinstance(data, bytes) else str(data))
+                        f.write("\n")
+                    else:
+                        f.write(f"=== 串口{port_id} 日志: 无数据 ===\n\n")
+            self.log_info(f"全部日志已保存到: {file_path}")
+            QMessageBox.information(self, "成功", f"全部日志已保存到:\n{file_path}")
+        except Exception as e:
+            self.log_error(f"保存全部日志失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
+
     def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
         """生成报告文本行
         Args:
@@ -3229,20 +3236,6 @@ class NMEADataAnalyzer(QMainWindow):
         if png_paths:
             self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
         QMessageBox.information(self, "导出成功", f"{dialog_title}已保存到:\n{file_path}")
-
-    def export_test_report(self):
-        try:
-            self._do_export_report()
-        except Exception as e:
-            self.log_error(f"导出报告失败: {str(e)}"); import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "导出失败", f"无法生成报告:\n{str(e)}")
-
-    def export_pdf_report(self):
-        try:
-            self._do_export_report(ext="pdf", dialog_title="导出PDF报告")
-        except Exception as e:
-            self.log_error(f"导出PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "导出失败", f"无法生成PDF报告:\n{str(e)}")
 
     # ========== 串口2独立报告导出 ==========
     def export_test_report2(self):
