@@ -224,8 +224,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.serial_port2 = SerialManager(port_id=2)
 
         # 串口数据缓存（设上限防止内存无限增长）
-        self.serial_save_buffer = deque(maxlen=MAX_SERIAL_BUFFER)
-        self.serial2_save_buffer = deque(maxlen=MAX_SERIAL_BUFFER)
+        self.serial_save_buffer = deque(maxlen=40000)
+        self.serial2_save_buffer = deque(maxlen=40000)
         self.MAX_SERIAL_BUFFER = 40000
         
         # 自动日志保存
@@ -2055,8 +2055,8 @@ class NMEADataAnalyzer(QMainWindow):
         """清空所有数据"""
         self.data_preview.clear()
         self.log_window.clear()
-        self.serial_save_buffer = deque(maxlen=MAX_SERIAL_BUFFER)
-        self.serial2_save_buffer = deque(maxlen=MAX_SERIAL_BUFFER)
+        self.serial_save_buffer = deque(maxlen=40000)
+        self.serial2_save_buffer = deque(maxlen=40000)
         self.data_count_label.setText("已读取: 0 行")
         self.reset_all_stats()
         if self.auto_log_enabled:
