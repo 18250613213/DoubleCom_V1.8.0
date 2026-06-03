@@ -2380,11 +2380,12 @@ class NMEADataAnalyzer(QMainWindow):
         ds = direction_stats[direction_index]
         is_com3 = (direction_stats is self.direction_stats3)
         if is_com3:
-            n = len(self.enu3_times)
+            n_raw = len(self.enu3_times)
         else:
-            n = len(self.enu2_times)
-        if n > 0:
+            n_raw = len(self.enu2_times)
+        if n_raw > 0:
             n1_total = len(self.enu1_times)
+            n = min(n_raw, n1_total)  # 取最小值确保 ENU1 和 ENU2/ENU3 长度一致
             enu1_t = self.enu1_times[-n:] if n1_total >= n else list(self.enu1_times)
             enu1_e = self.enu1_east_data[-n:] if n1_total >= n else list(self.enu1_east_data)
             enu1_n = self.enu1_north_data[-n:] if n1_total >= n else list(self.enu1_north_data)
@@ -2400,10 +2401,14 @@ class NMEADataAnalyzer(QMainWindow):
                     enu3_t, enu3_e, enu3_n, enu3_u)
                 self.log_info(f"方向{direction_index + 1} ENU3数据已保存 (ENU1: {len(enu1_e)}点, ENU3: {len(enu3_e)}点)")
             else:
+                enu2_t = self.enu2_times[-n:] if len(self.enu2_times) >= n else list(self.enu2_times)
+                enu2_e = self.enu2_east_data[-n:] if len(self.enu2_east_data) >= n else list(self.enu2_east_data)
+                enu2_n = self.enu2_north_data[-n:] if len(self.enu2_north_data) >= n else list(self.enu2_north_data)
+                enu2_u = self.enu2_up_data[-n:] if len(self.enu2_up_data) >= n else list(self.enu2_up_data)
                 ds.save_enu_snapshot(
                     enu1_t, enu1_e, enu1_n, enu1_u,
-                    self.enu2_times, self.enu2_east_data, self.enu2_north_data, self.enu2_up_data)
-                self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {n}点)")
+                    enu2_t, enu2_e, enu2_n, enu2_u)
+                self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {len(enu2_e)}点)")
 
     def _reset_enu_chart_data(self):
         self.enu1_times = []
