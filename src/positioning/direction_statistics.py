@@ -86,10 +86,10 @@ class DirectionStatistics:
         return self._enu3_times, self._enu3_east, self._enu3_north, self._enu3_up
 
     def has_enu_data(self):
-        """Check both ENU1 and ENU2 snapshots are available."""
-        return (self._enu_saved
-                and len(self._enu1_times) > 0
-                and len(self._enu2_times) > 0)
+        """Check both ENU1 and ENU2/ENU3 snapshots are available."""
+        if not self._enu_saved or len(self._enu1_times) == 0:
+            return False
+        return len(self._enu2_times) > 0 or len(self._enu3_times) > 0
 
     # [新增] 检查是否有ENU3数据
     def has_enu3_data(self):
