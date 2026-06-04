@@ -1457,14 +1457,7 @@ class NMEADataAnalyzer(QMainWindow):
                     )
 
                 if gga_data:
-                    self._feed_enu1_buffer(gga_data['lat'], gga_data['lon'], gga_data['alt'])
-                    self._calc_and_update_enu(gga_data['lat'], gga_data['lon'], gga_data['alt'],
-                        self.enu1_ref_point, self.enu1_ref_ready,
-                        self.enu1_east_label, self.enu1_north_label, self.enu1_up_label,
-                        self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data,
-                        self._std_enu1_east, self._std_enu1_north, self._std_enu1_up, "ENU1",
-                        self.enu1_3_times, self.enu1_3_east_data, self.enu1_3_north_data, self.enu1_3_up_data,
-                        self._std_enu1_3_east, self._std_enu1_3_north, self._std_enu1_3_up)
+                    self._feed_fixed_enu1()
                     self._update_enu_std()
 
                 if self.data_preview.document().blockCount() > 500:
@@ -1643,6 +1636,51 @@ class NMEADataAnalyzer(QMainWindow):
             self.enu1_ref_label.setText(f"ENU1 基准: {self.enu1_ref_point[0]:.8f}, {self.enu1_ref_point[1]:.8f}, {self.enu1_ref_point[2]:.3f}m")
             self.enu1_points_label.setText("(已锁定)")
             self.log_info(f"ENU1基准点已锁定 (前{self.enu1_buffer_size}点均值)")
+
+    def _feed_fixed_enu1(self):
+        """注入固定 ENU1 值 (0, 0, 0)，跳过 GGA→ENU 转换"""
+        east, north, up = 0.0, 0.0, 0.0
+
+        # 更新界面 Label
+        self.enu1_east_label.setText(f"东: {east:+.3f} m")
+        self.enu1_north_label.setText(f"北: {north:+.3f} m")
+        self.enu1_up_label.setText(f"天: {up:+.3f} m")
+
+        # 馈入滑动窗口标准差（固定值无需异常值剔除）
+        self._std_enu1_east.add(east)
+        self._std_enu1_north.add(north)
+        self._std_enu1_up.add(up)
+        self._std_enu1_3_east.add(east)
+        self._std_enu1_3_north.add(north)
+        self._std_enu1_3_up.add(up)
+
+        # 时间戳递增，写入 ENU1 数据数组
+        t = self.enu1_times[-1] + 1.0 if self.enu1_times else 0.0
+        self.enu1_times.append(t)
+        self.enu1_east_data.append(east)
+        self.enu1_north_data.append(north)
+        self.enu1_up_data.append(up)
+
+        # 同步馈入 ENU1_3（COM3对比用）
+        t3 = self.enu1_3_times[-1] + 1.0 if self.enu1_3_times else 0.0
+        self.enu1_3_times.append(t3)
+        self.enu1_3_east_data.append(east)
+        self.enu1_3_north_data.append(north)
+        self.enu1_3_up_data.append(up)
+
+        # 限制数组不超过 ENU_MAX_POINTS
+        if len(self.enu1_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_times) - self.ENU_MAX_POINTS
+            del self.enu1_times[:excess]
+            del self.enu1_east_data[:excess]
+            del self.enu1_north_data[:excess]
+            del self.enu1_up_data[:excess]
+        if len(self.enu1_3_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_3_times) - self.ENU_MAX_POINTS
+            del self.enu1_3_times[:excess]
+            del self.enu1_3_east_data[:excess]
+            del self.enu1_3_north_data[:excess]
+            del self.enu1_3_up_data[:excess]
 
     def _feed_enu2_buffer(self, lat, lon, alt):
         if self.enu_instant_mode:
