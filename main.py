@@ -2309,7 +2309,7 @@ class NMEADataAnalyzer(QMainWindow):
             self.log_info(f"方向{direction_index + 1} 测试已停止 (串口2)")
         else:
             self._save_enu_for_active_direction()
-            self._reset_enu_chart_data()
+            self._reset_enu_chart_data(2)
             ds.start()
             ds.clear_enu()
             self._dir_enu_active_index = direction_index
@@ -2331,7 +2331,7 @@ class NMEADataAnalyzer(QMainWindow):
             self.log_info(f"方向{direction_index + 1} 测试已停止 (串口3)")
         else:
             self._save_enu_for_active_direction3()
-            self._reset_enu_chart_data()
+            self._reset_enu_chart_data(3)
             ds.start()
             ds.clear_enu()
             self._dir3_enu_active_index = direction_index
@@ -2410,43 +2410,47 @@ class NMEADataAnalyzer(QMainWindow):
                     enu2_t, enu2_e, enu2_n, enu2_u)
                 self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {len(enu2_e)}点)")
 
-    def _reset_enu_chart_data(self):
-        self.enu1_times = []
-        self.enu1_east_data = []
-        self.enu1_north_data = []
-        self.enu1_up_data = []
-        self._std_enu1_east.reset()
-        self._std_enu1_north.reset()
-        self._std_enu1_up.reset()
-        self.enu1_east_curve.setData([], [])
-        self.enu1_north_curve.setData([], [])
-        self.enu1_up_curve.setData([], [])
-        self.enu1_13_east_curve.setData([], [])
-        self.enu1_13_north_curve.setData([], [])
-        self.enu1_13_up_curve.setData([], [])
+    def _reset_enu_chart_data(self, port=0):
+        """重置ENU图表数据。port: 1=ENU1参考, 2=ENU2(串口2), 3=ENU3(串口3), 0=全部"""
+        # ENU1 是共用参考天线，始终重置
+        if port in (0, 1, 2, 3):
+            self.enu1_times = []
+            self.enu1_east_data = []
+            self.enu1_north_data = []
+            self.enu1_up_data = []
+            self._std_enu1_east.reset()
+            self._std_enu1_north.reset()
+            self._std_enu1_up.reset()
+            self.enu1_east_curve.setData([], [])
+            self.enu1_north_curve.setData([], [])
+            self.enu1_up_curve.setData([], [])
+            self.enu1_13_east_curve.setData([], [])
+            self.enu1_13_north_curve.setData([], [])
+            self.enu1_13_up_curve.setData([], [])
 
-        self.enu2_times = []
-        self.enu2_east_data = []
-        self.enu2_north_data = []
-        self.enu2_up_data = []
-        self._std_enu2_east.reset()
-        self._std_enu2_north.reset()
-        self._std_enu2_up.reset()
-        self.enu2_east_curve.setData([], [])
-        self.enu2_north_curve.setData([], [])
-        self.enu2_up_curve.setData([], [])
+        if port in (0, 2):
+            self.enu2_times = []
+            self.enu2_east_data = []
+            self.enu2_north_data = []
+            self.enu2_up_data = []
+            self._std_enu2_east.reset()
+            self._std_enu2_north.reset()
+            self._std_enu2_up.reset()
+            self.enu2_east_curve.setData([], [])
+            self.enu2_north_curve.setData([], [])
+            self.enu2_up_curve.setData([], [])
 
-        # [新增] ENU3图表数据重置
-        self.enu3_times = []
-        self.enu3_east_data = []
-        self.enu3_north_data = []
-        self.enu3_up_data = []
-        self._std_enu3_east.reset()
-        self._std_enu3_north.reset()
-        self._std_enu3_up.reset()
-        self.enu3_east_curve.setData([], [])
-        self.enu3_north_curve.setData([], [])
-        self.enu3_up_curve.setData([], [])
+        if port in (0, 3):
+            self.enu3_times = []
+            self.enu3_east_data = []
+            self.enu3_north_data = []
+            self.enu3_up_data = []
+            self._std_enu3_east.reset()
+            self._std_enu3_north.reset()
+            self._std_enu3_up.reset()
+            self.enu3_east_curve.setData([], [])
+            self.enu3_north_curve.setData([], [])
+            self.enu3_up_curve.setData([], [])
 
     def _feed_direction_stats(self):
         # 串口2方向测试数据馈入
@@ -3090,7 +3094,7 @@ class NMEADataAnalyzer(QMainWindow):
 
             w(f"### {sec_num}.2 GSV 卫星信噪比分析")
             w()
-            w("| 星座 | PRN | 信号 | 串口1载噪比均值 | 串口2载噪比均值 | 恶化均值1-2 | 串口3载噪比均值 | 恶化均值1-3 |")
+            w("| 星座 | PRN | 信号 | 串口1载噪比均值 | 串口2载噪比均值 | 恶化值1-2 | 串口3载噪比均值 | 恶化值1-3 |")
             w("|------|-----|------|---------------|---------------|-----------|---------------|-----------|")
             for key in all_snr_keys:
                 sys = key[:2]
@@ -3401,9 +3405,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.log_window.append(f"[{timestamp}] ERROR: {message}")
         self.log_window.moveCursor(QTextCursor.End)
         self._write_info_to_logs("ERROR", message)
-    
-
-    
+        
     def closeEvent(self, event):
         self.serial_port1.disconnect()
         self.serial_port2.disconnect()
