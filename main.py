@@ -1922,9 +1922,10 @@ class NMEADataAnalyzer(QMainWindow):
         east_data.append(east)
         north_data.append(north)
         up_data.append(up)
-        # [新增] 同步馈入 COM3 的独立 ENU1 副本
+        # [新增] 同步馈入 COM3 的独立 ENU1 副本（时间从各自的数组独立计算）
         if times3 is not None:
-            times3.append(t)
+            t3 = times3[-1] + 1.0 if times3 else 0.0
+            times3.append(t3)
             east_data3.append(east)
             north_data3.append(north)
             up_data3.append(up)
