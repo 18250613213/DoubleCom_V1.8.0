@@ -178,6 +178,12 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_north_data = []
         self.enu1_up_data = []
 
+        # [新增] COM3 独立的 ENU1 副本（串口3 VS 串口1对比用）
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
+
         # ENU 误差基准点 - 串口2 (干扰测试)
         self.enu2_ref_point = None
         self.enu2_buffer = []
@@ -222,6 +228,11 @@ class NMEADataAnalyzer(QMainWindow):
         # [新增] 串口3滑动窗口标准差
         self._std_enu3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+
+        # [新增] COM3 独立 ENU1 滑动标准差
+        self._std_enu1_3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
 
         # 卫星信噪比递推平均值跟踪
@@ -1451,7 +1462,9 @@ class NMEADataAnalyzer(QMainWindow):
                         self.enu1_ref_point, self.enu1_ref_ready,
                         self.enu1_east_label, self.enu1_north_label, self.enu1_up_label,
                         self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data,
-                        self._std_enu1_east, self._std_enu1_north, self._std_enu1_up, "ENU1")
+                        self._std_enu1_east, self._std_enu1_north, self._std_enu1_up, "ENU1",
+                        self.enu1_3_times, self.enu1_3_east_data, self.enu1_3_north_data, self.enu1_3_up_data,
+                        self._std_enu1_3_east, self._std_enu1_3_north, self._std_enu1_3_up)
                     self._update_enu_std()
 
                 if self.data_preview.document().blockCount() > 500:
@@ -1695,9 +1708,16 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_east_data = []
         self.enu1_north_data = []
         self.enu1_up_data = []
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
         self._std_enu1_east.reset()
         self._std_enu1_north.reset()
         self._std_enu1_up.reset()
+        self._std_enu1_3_east.reset()
+        self._std_enu1_3_north.reset()
+        self._std_enu1_3_up.reset()
         self.enu1_east_curve.setData([], [])
         self.enu1_north_curve.setData([], [])
         self.enu1_up_curve.setData([], [])
@@ -1777,7 +1797,7 @@ class NMEADataAnalyzer(QMainWindow):
         self._update_enu_std()
 
     def _refresh_enu_charts(self):
-        # 左列: ENU1 vs ENU2
+        # 左列: ENU1 vs ENU2 (COM2)
         if self.enu1_times:
             self.enu1_east_curve.setData(self.enu1_times, self.enu1_east_data)
             self.enu1_north_curve.setData(self.enu1_times, self.enu1_north_data)
@@ -1786,16 +1806,16 @@ class NMEADataAnalyzer(QMainWindow):
             self.enu2_east_curve.setData(self.enu2_times, self.enu2_east_data)
             self.enu2_north_curve.setData(self.enu2_times, self.enu2_north_data)
             self.enu2_up_curve.setData(self.enu2_times, self.enu2_up_data)
-        # [新增] ENU3曲线刷新
+        # ENU3曲线刷新
         if self.enu3_times:
             self.enu3_east_curve.setData(self.enu3_times, self.enu3_east_data)
             self.enu3_north_curve.setData(self.enu3_times, self.enu3_north_data)
             self.enu3_up_curve.setData(self.enu3_times, self.enu3_up_data)
-        # 右列: ENU1 vs ENU3
-        if self.enu1_times:
-            self.enu1_13_east_curve.setData(self.enu1_times, self.enu1_east_data)
-            self.enu1_13_north_curve.setData(self.enu1_times, self.enu1_north_data)
-            self.enu1_13_up_curve.setData(self.enu1_times, self.enu1_up_data)
+        # 右列: ENU1 vs ENU3 (COM3，使用独立的 ENU1_3 副本)
+        if self.enu1_3_times:
+            self.enu1_13_east_curve.setData(self.enu1_3_times, self.enu1_3_east_data)
+            self.enu1_13_north_curve.setData(self.enu1_3_times, self.enu1_3_north_data)
+            self.enu1_13_up_curve.setData(self.enu1_3_times, self.enu1_3_up_data)
 
     def _update_enu_std(self):
         e1_std = self._std_enu1_east.std
@@ -1833,7 +1853,9 @@ class NMEADataAnalyzer(QMainWindow):
     def _calc_and_update_enu(self, lat, lon, alt, ref_point, ref_ready,
             east_label, north_label, up_label,
             times, east_data, north_data, up_data,
-            std_east, std_north, std_up, name):
+            std_east, std_north, std_up, name,
+            times3=None, east_data3=None, north_data3=None, up_data3=None,
+            std_east3=None, std_north3=None, std_up3=None):
         if not ref_ready:
             return
         if lat == 0 and lon == 0:
@@ -1890,18 +1912,34 @@ class NMEADataAnalyzer(QMainWindow):
         std_east.add(east)
         std_north.add(north)
         std_up.add(up)
+        if std_east3 is not None:
+            std_east3.add(east)
+            std_north3.add(north)
+            std_up3.add(up)
 
         t = times[-1] + 1.0 if times else 0.0
         times.append(t)
         east_data.append(east)
         north_data.append(north)
         up_data.append(up)
+        # [新增] 同步馈入 COM3 的独立 ENU1 副本
+        if times3 is not None:
+            times3.append(t)
+            east_data3.append(east)
+            north_data3.append(north)
+            up_data3.append(up)
 
         if len(times) > self.ENU_MAX_POINTS:
-            del times[:len(times) - self.ENU_MAX_POINTS]
-            del east_data[:len(east_data) - self.ENU_MAX_POINTS]
-            del north_data[:len(north_data) - self.ENU_MAX_POINTS]
-            del up_data[:len(up_data) - self.ENU_MAX_POINTS]
+            excess = len(times) - self.ENU_MAX_POINTS
+            del times[:excess]
+            del east_data[:excess]
+            del north_data[:excess]
+            del up_data[:excess]
+            if times3 is not None:
+                del times3[:excess]
+                del east_data3[:excess]
+                del north_data3[:excess]
+                del up_data3[:excess]
 
     def _calc_and_update_enu2(self, lat, lon, alt, ref_point, ref_ready,
             east_label, north_label, up_label,
@@ -2381,15 +2419,18 @@ class NMEADataAnalyzer(QMainWindow):
         is_com3 = (direction_stats is self.direction_stats3)
         if is_com3:
             n_raw = len(self.enu3_times)
+            n1_total = len(self.enu1_3_times)
+            enu1_src = (self.enu1_3_times, self.enu1_3_east_data, self.enu1_3_north_data, self.enu1_3_up_data)
         else:
             n_raw = len(self.enu2_times)
-        if n_raw > 0:
             n1_total = len(self.enu1_times)
-            n = min(n_raw, n1_total)  # 取最小值确保 ENU1 和 ENU2/ENU3 长度一致
-            enu1_t = self.enu1_times[-n:] if n1_total >= n else list(self.enu1_times)
-            enu1_e = self.enu1_east_data[-n:] if n1_total >= n else list(self.enu1_east_data)
-            enu1_n = self.enu1_north_data[-n:] if n1_total >= n else list(self.enu1_north_data)
-            enu1_u = self.enu1_up_data[-n:] if n1_total >= n else list(self.enu1_up_data)
+            enu1_src = (self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data)
+        if n_raw > 0:
+            n = min(n_raw, n1_total)
+            enu1_t = enu1_src[0][-n:] if n1_total >= n else list(enu1_src[0])
+            enu1_e = enu1_src[1][-n:] if n1_total >= n else list(enu1_src[1])
+            enu1_n = enu1_src[2][-n:] if n1_total >= n else list(enu1_src[2])
+            enu1_u = enu1_src[3][-n:] if n1_total >= n else list(enu1_src[3])
             if is_com3:
                 enu3_t = self.enu3_times[-n:] if len(self.enu3_times) >= n else list(self.enu3_times)
                 enu3_e = self.enu3_east_data[-n:] if len(self.enu3_east_data) >= n else list(self.enu3_east_data)
@@ -2412,8 +2453,8 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _reset_enu_chart_data(self, port=0):
         """重置ENU图表数据。port: 1=ENU1参考, 2=ENU2(串口2), 3=ENU3(串口3), 0=全部"""
-        # ENU1 是共用参考天线，始终重置
-        if port in (0, 1, 2, 3):
+        # ENU1 串口2侧（左列图表）
+        if port in (0, 2):
             self.enu1_times = []
             self.enu1_east_data = []
             self.enu1_north_data = []
@@ -2424,6 +2465,16 @@ class NMEADataAnalyzer(QMainWindow):
             self.enu1_east_curve.setData([], [])
             self.enu1_north_curve.setData([], [])
             self.enu1_up_curve.setData([], [])
+
+        # ENU1 串口3侧（右列图表，独立副本）
+        if port in (0, 3):
+            self.enu1_3_times = []
+            self.enu1_3_east_data = []
+            self.enu1_3_north_data = []
+            self.enu1_3_up_data = []
+            self._std_enu1_3_east.reset()
+            self._std_enu1_3_north.reset()
+            self._std_enu1_3_up.reset()
             self.enu1_13_east_curve.setData([], [])
             self.enu1_13_north_curve.setData([], [])
             self.enu1_13_up_curve.setData([], [])
@@ -2736,6 +2787,10 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu1_east_data = []
         self.enu1_north_data = []
         self.enu1_up_data = []
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
         self.enu1_east_curve.setData([], [])
         self.enu1_north_curve.setData([], [])
         self.enu1_up_curve.setData([], [])
