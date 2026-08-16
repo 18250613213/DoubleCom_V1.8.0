@@ -40,7 +40,7 @@ SIGNAL_NAMES = {
 }
 
 TALKER_TO_SYSTEM = {
-    'GP': 'G', 'GL': 'R', 'GA': 'E', 'GB': 'B', 'BD': 'B',
+    'GP': 'G', 'GL': 'R', 'GA': 'E', 'GB': 'B', 'BD': 'B', 'GN': 'G',
 }
 
 
@@ -1181,6 +1181,9 @@ class NMEADataAnalyzer(QMainWindow):
                 elif decoded.startswith('$GB') and 'GSV' in decoded[3:6]:
                     self.nmea_parser2.parse(decoded)
                     is_gsv = True
+                elif decoded.startswith('$GN') and 'GSV' in decoded[3:6]:
+                    self.nmea_parser2.parse(decoded)
+                    is_gsv = True
 
                 if is_gsv:
                     entry = self.nmea_parser2.gpgsv_data[-1]
@@ -1249,7 +1252,7 @@ class NMEADataAnalyzer(QMainWindow):
                             self._std_enu2_east, self._std_enu2_north, self._std_enu2_up, "ENU2")
                         self._update_enu_std()
 
-            if decoded.startswith('$BDRMC') or decoded.startswith('$GPRMC'):
+            if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                 self.nmea_parser2.parse(decoded)
             if decoded.startswith('#OBSV'):
                 self.nmea_parser2.parse(decoded)
@@ -1292,6 +1295,9 @@ class NMEADataAnalyzer(QMainWindow):
                     self.nmea_parser3.parse(decoded)
                     is_gsv = True
                 elif decoded.startswith('$GB') and 'GSV' in decoded[3:6]:
+                    self.nmea_parser3.parse(decoded)
+                    is_gsv = True
+                elif decoded.startswith('$GN') and 'GSV' in decoded[3:6]:
                     self.nmea_parser3.parse(decoded)
                     is_gsv = True
 
@@ -1362,7 +1368,7 @@ class NMEADataAnalyzer(QMainWindow):
                             self._std_enu3_east, self._std_enu3_north, self._std_enu3_up, "ENU3")
                         self._update_enu_std()
 
-            if decoded.startswith('$BDRMC') or decoded.startswith('$GPRMC'):
+            if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                 self.nmea_parser3.parse(decoded)
             if decoded.startswith('#OBSV'):
                 self.nmea_parser3.parse(decoded)
@@ -1385,7 +1391,7 @@ class NMEADataAnalyzer(QMainWindow):
                 self.data_preview.append(decoded.strip())
 
                 # 解析标准NMEA语句（提取GPS时间）
-                if decoded.startswith('$BDRMC') or decoded.startswith('$GPRMC'):
+                if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                     self.nmea_parser.parse(decoded)
                     if self.nmea_parser.last_gps_time_valid:
                         self.gps_sow = self.nmea_parser.last_gps_tow
@@ -1405,7 +1411,7 @@ class NMEADataAnalyzer(QMainWindow):
                         self.gps_week = obsv_data.get('rcv_wkn', self.gps_week)
 
                 # 解析GSV获取卫星信噪比
-                if any(decoded.startswith(p) for p in ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV')):
+                if any(decoded.startswith(p) for p in ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
                     self.nmea_parser.parse(decoded)
 
                 # GGA 解析
@@ -3143,7 +3149,7 @@ class NMEADataAnalyzer(QMainWindow):
         all_snr_keys = sorted(
             set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
             key=lambda x: (x[:2], int(x[2:])))
-        system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3"}
+        system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3", "GN": "GNSS"}
 
         section_names = ["二", "三", "四", "五"]
         tested = [(i, direction_stats[i]) for i in range(4) if direction_stats[i].total_epochs > 0]

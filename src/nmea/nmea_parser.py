@@ -72,14 +72,16 @@ class NMEAParser:
                     data_part.startswith("$GAGGA") or data_part.startswith("$GBGGA")):
                 self.parse_gpgga(data_part)
             elif (data_part.startswith("$GPRMC") or data_part.startswith("$BDRMC") or
-                    data_part.startswith("$GLRMC") or data_part.startswith("$GNRMC")):
+                    data_part.startswith("$GLRMC") or data_part.startswith("$GNRMC") or
+                    data_part.startswith("$GARMC") or data_part.startswith("$GBRMC")):
                 self.parse_gprmc(data_part)
             elif (data_part.startswith("$GPGSV") or data_part.startswith("$BDGSV") or
                     data_part.startswith("$GLGSV") or data_part.startswith("$GAGSV") or
-                    data_part.startswith("$GBGSV")):
+                    data_part.startswith("$GBGSV") or data_part.startswith("$GNGSV")):
                 self.parse_gpgsv(data_part)
             elif (data_part.startswith("$GPGSA") or data_part.startswith("$BDGSA") or
-                    data_part.startswith("$GLGSA") or data_part.startswith("$GNGSA")):
+                    data_part.startswith("$GLGSA") or data_part.startswith("$GNGSA") or
+                    data_part.startswith("$GAGSA") or data_part.startswith("$GBGSA")):
                 self.parse_gpgsa(data_part)
             elif data_part.startswith("#OBSVHA"):
                 self.parse_obsvha(data_part)
