@@ -208,7 +208,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # ENU异常值剔除参数
         self.ENU_OUTLIER_SIGMA = 8.0
-        self.ENU_OUTLIER_MIN_DELTA = 10000.0
+        self.ENU_OUTLIER_MIN_DELTA = 5.0
         self.ENU_OUTLIER_MIN_SAMPLES = 30
         self._enu1_outlier_count = 0
         self._enu2_outlier_count = 0
