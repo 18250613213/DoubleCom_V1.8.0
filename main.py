@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QComboBox, QPushButton, QLabel, QTextEdit,
     QMessageBox, QDoubleSpinBox, QSpinBox, QStatusBar,
     QGridLayout, QRadioButton, QButtonGroup, QCheckBox, QTabWidget,
-    QLineEdit,
+    QLineEdit, QDialog, QFormLayout,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QTextCursor
@@ -104,6 +104,9 @@ class RunningAverage:
         if key in self._data:
             return self._data[key]['avg']
         return None
+
+    def values(self):
+        return {key: d['avg'] for key, d in self._data.items()}
 
     def reset(self):
         self._data.clear()
@@ -271,6 +274,7 @@ class NMEADataAnalyzer(QMainWindow):
         # 其他组件
         self.current_parser = None
         self.current_data_source = None
+        self._selftest_runner = None
         self.serial_port1 = SerialManager(port_id=1)
         self.serial_port2 = SerialManager(port_id=2)
         # [新增] 串口3管理器
@@ -793,6 +797,10 @@ class NMEADataAnalyzer(QMainWindow):
         self.export_pdf3_btn = QPushButton("导出串口3PDF报告")
         self.export_pdf3_btn.setMinimumWidth(140)
         self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
+        # 一键自检按钮（无真实串口, 模拟数据全链路测试）
+        self.selftest_btn = QPushButton("一键自检(无串口)")
+        self.selftest_btn.setMinimumWidth(130)
+        self.selftest_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
 
         bottom_layout.addWidget(self.clear_data_btn)
         bottom_layout.addWidget(self.reset_stats_btn)
@@ -802,6 +810,7 @@ class NMEADataAnalyzer(QMainWindow):
         bottom_layout.addWidget(self.export_pdf2_btn)
         bottom_layout.addWidget(self.export_report3_btn)
         bottom_layout.addWidget(self.export_pdf3_btn)
+        bottom_layout.addWidget(self.selftest_btn)
 
         self.auto_log_cb = QCheckBox("自动保存日志")
         self.auto_log_cb.setChecked(True)
@@ -968,6 +977,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.export_pdf2_btn.clicked.connect(self.export_pdf_report2)
         self.export_report3_btn.clicked.connect(self.export_test_report3)
         self.export_pdf3_btn.clicked.connect(self.export_pdf_report3)
+        self.selftest_btn.clicked.connect(self._open_selftest_dialog)
 
         self.auto_log_cb.stateChanged.connect(self._on_auto_log_toggled)
 
@@ -3314,6 +3324,89 @@ class NMEADataAnalyzer(QMainWindow):
         except Exception as e:
             self.log_error(f"导出串口3PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口3PDF报告:\n{str(e)}")
+
+    def _open_selftest_dialog(self):
+        """一键自检参数对话框（无真实串口, 模拟数据全链路测试）"""
+        from src.simulation.selftest import SelfTestRunner
+
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is not None and runner.is_running():
+            QMessageBox.warning(self, "提示", "自检正在进行中，请等待完成")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("一键自检（无串口模拟测试）")
+        layout = QFormLayout(dlg)
+
+        minutes_spin = QSpinBox()
+        minutes_spin.setRange(5, 180)
+        minutes_spin.setValue(60)
+        minutes_spin.setSuffix(" 分钟")
+        layout.addRow("模拟时长:", minutes_spin)
+
+        speed_combo = QComboBox()
+        speed_combo.addItems(["2", "5", "10", "20", "50", "100"])
+        speed_combo.setCurrentText("10")
+        layout.addRow("加速倍率:", speed_combo)
+
+        seed_spin = QSpinBox()
+        seed_spin.setRange(0, 999999)
+        seed_spin.setValue(42)
+        layout.addRow("随机种子:", seed_spin)
+
+        direction_cb = QCheckBox("自动启停一轮方向测试（方向1）")
+        direction_cb.setChecked(True)
+        layout.addRow("", direction_cb)
+
+        est_label = QLabel()
+        est_label.setStyleSheet("color: #666;")
+        layout.addRow(est_label)
+
+        def update_est():
+            est = minutes_spin.value() * 60 / int(speed_combo.currentText())
+            est_label.setText(f"预计耗时约 {est:.0f} 秒（模拟 {minutes_spin.value()} 分钟 @ {speed_combo.currentText()}x）")
+
+        minutes_spin.valueChanged.connect(update_est)
+        speed_combo.currentTextChanged.connect(update_est)
+        update_est()
+
+        btn_row = QHBoxLayout()
+        start_btn = QPushButton("开始自检")
+        start_btn.setMinimumWidth(100)
+        start_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(start_btn)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        layout.addRow(btn_row)
+
+        start_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        runner = SelfTestRunner(self)
+        self._selftest_runner = runner
+        runner.finished.connect(self._on_selftest_finished)
+        if runner.start(minutes_spin.value(), int(speed_combo.currentText()),
+                        seed_spin.value(), direction_cb.isChecked()):
+            self.selftest_btn.setEnabled(False)
+        else:
+            self._selftest_runner = None
+
+    def _on_selftest_finished(self, ok, results):
+        self.selftest_btn.setEnabled(True)
+        runner = getattr(self, '_selftest_runner', None)
+        report_dir = runner.report_dir if runner is not None else ''
+        npass = sum(1 for r in results if r[1])
+        body = '\n'.join(f"[{'通过' if r[1] else '失败'}] {r[0]} — {r[2]}" for r in results)
+        msg = f"自检完成: {npass}/{len(results)} 项通过\n\n{body}\n\n报告目录: {report_dir}"
+        self.log_info(f"自检结果: {npass}/{len(results)} 项通过, 报告目录: {report_dir}")
+        if ok:
+            QMessageBox.information(self, "自检结果", msg)
+        else:
+            QMessageBox.critical(self, "自检结果（存在失败项）", msg)
 
     def _open_auto_log_files(self):
         self._close_auto_log_files()
