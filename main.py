@@ -1007,6 +1007,11 @@ class NMEADataAnalyzer(QMainWindow):
         self.serial_port3.error_occurred.connect(self.handle_serial_error)
         self.serial_port3.ubx_received.connect(self.handle_ubx)
 
+        # 串口重连状态消息（指数退避重试过程对用户可见）
+        self.serial_port1.status_message.connect(self.handle_serial_status)
+        self.serial_port2.status_message.connect(self.handle_serial_status)
+        self.serial_port3.status_message.connect(self.handle_serial_status)
+
 
     
     def refresh_serial_ports(self, port_id=1):
@@ -1106,6 +1111,9 @@ class NMEADataAnalyzer(QMainWindow):
 
     def handle_serial_error(self, error_message, port_id):
         self.log_error(error_message)
+
+    def handle_serial_status(self, message, port_id):
+        self.log_info(f"[串口{port_id}] {message}")
 
     def handle_ubx(self, frame, port_id):
         msg_type, data = parse_ubx_frame(frame)
