@@ -6,6 +6,7 @@ __pycache__/
 # PyInstaller
 build/
 dist/
+DoubleCom_V1.6.4/
 *.spec.bak
 
 # IDE
