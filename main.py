@@ -24,7 +24,6 @@ from pyqtgraph.exporters import ImageExporter
 from src.communication.serial_manager import SerialManager
 from src.nmea.nmea_parser import NMEAParser
 from src.nmea.nmea_gga_parser import NMEAGGAParser
-from src.positioning.error_calculator import ErrorCalculator
 from src.positioning.statistics_accumulator import MultiDimensionStatistics
 from src.positioning.direction_statistics import DirectionStatistics
 from src.protocol.ubx_parser import parse_ubx_frame
@@ -121,7 +120,6 @@ class NMEADataAnalyzer(QMainWindow):
         # 初始化独立模块
         self.gga_parser = NMEAGGAParser()
         self.nmea_parser = NMEAParser()
-        self.error_calculator = ErrorCalculator()
         self.statistics = MultiDimensionStatistics()
 
         # 方向测试统计（4个方向，针对串口2干扰测试口）
@@ -145,13 +143,10 @@ class NMEADataAnalyzer(QMainWindow):
         self._latest_enu3_up = 0.0
 
         self._p2_gga_new_epoch = False
-        self._last_enu1_pos = None
-        self._last_enu2_pos = None
         self._latest_p2_quality = 0
         # [新增] 串口3相关GGA标记
         self._p3_gga_new_epoch = False
         self._latest_p3_quality = 0
-        self._last_enu3_pos = None
 
         # GPS时间跟踪
         self.gps_week = 0
@@ -210,7 +205,6 @@ class NMEADataAnalyzer(QMainWindow):
         self.ENU_OUTLIER_SIGMA = 8.0
         self.ENU_OUTLIER_MIN_DELTA = 5.0
         self.ENU_OUTLIER_MIN_SAMPLES = 30
-        self._enu1_outlier_count = 0
         self._enu2_outlier_count = 0
         # [新增] 串口3异常值计数
         self._enu3_outlier_count = 0
@@ -1887,98 +1881,6 @@ class NMEADataAnalyzer(QMainWindow):
             return False
         return std > 0 and delta > self.ENU_OUTLIER_SIGMA * std
 
-    def _calc_and_update_enu(self, lat, lon, alt, ref_point, ref_ready,
-            east_label, north_label, up_label,
-            times, east_data, north_data, up_data,
-            std_east, std_north, std_up, name,
-            times3=None, east_data3=None, north_data3=None, up_data3=None,
-            std_east3=None, std_north3=None, std_up3=None):
-        if not ref_ready:
-            return
-        if lat == 0 and lon == 0:
-            return
-        r_lat, r_lon, r_alt = ref_point
-
-        a = WGS84_A
-        f = WGS84_F
-        e2 = WGS84_E2
-        sin_lat = math.sin(math.radians(r_lat))
-        cos_lat = math.cos(math.radians(r_lat))
-        sin_lon = math.sin(math.radians(r_lon))
-        cos_lon = math.cos(math.radians(r_lon))
-        N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
-        x0 = (N + r_alt) * cos_lat * cos_lon
-        y0 = (N + r_alt) * cos_lat * sin_lon
-        z0 = (N * (1 - e2) + r_alt) * sin_lat
-
-        sin_lat2 = math.sin(math.radians(lat))
-        cos_lat2 = math.cos(math.radians(lat))
-        sin_lon2 = math.sin(math.radians(lon))
-        cos_lon2 = math.cos(math.radians(lon))
-        N2 = a / math.sqrt(1 - e2 * sin_lat2 * sin_lat2)
-        x = (N2 + alt) * cos_lat2 * cos_lon2
-        y = (N2 + alt) * cos_lat2 * sin_lon2
-        z = (N2 * (1 - e2) + alt) * sin_lat2
-
-        dx, dy, dz = x - x0, y - y0, z - z0
-        east  = -sin_lon * dx + cos_lon * dy
-        north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
-        up    =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
-
-        east_label.setText(f"东: {east:+.3f} m")
-        north_label.setText(f"北: {north:+.3f} m")
-        up_label.setText(f"天: {up:+.3f} m")
-
-        east_bad = self._is_enu_outlier(std_east, east)
-        north_bad = self._is_enu_outlier(std_north, north)
-        up_bad = self._is_enu_outlier(std_up, up)
-
-        if east_bad:
-            self._enu1_outlier_count += 1
-            self.log_info(f"{name} 东向异常值已剔除: {east:+.3f}m (σ: {std_east.std:.3f}m)")
-        if north_bad:
-            self._enu1_outlier_count += 1
-            self.log_info(f"{name} 北向异常值已剔除: {north:+.3f}m (σ: {std_north.std:.3f}m)")
-        if up_bad:
-            self._enu1_outlier_count += 1
-            self.log_info(f"{name} 天向异常值已剔除: {up:+.3f}m (σ: {std_up.std:.3f}m)")
-
-        if east_bad or north_bad or up_bad:
-            return
-
-        std_east.add(east)
-        std_north.add(north)
-        std_up.add(up)
-        if std_east3 is not None:
-            std_east3.add(east)
-            std_north3.add(north)
-            std_up3.add(up)
-
-        t = times[-1] + 1.0 if times else 0.0
-        times.append(t)
-        east_data.append(east)
-        north_data.append(north)
-        up_data.append(up)
-        # [新增] 同步馈入 COM3 的独立 ENU1 副本（时间从各自的数组独立计算）
-        if times3 is not None:
-            t3 = times3[-1] + 1.0 if times3 else 0.0
-            times3.append(t3)
-            east_data3.append(east)
-            north_data3.append(north)
-            up_data3.append(up)
-
-        if len(times) > self.ENU_MAX_POINTS:
-            excess = len(times) - self.ENU_MAX_POINTS
-            del times[:excess]
-            del east_data[:excess]
-            del north_data[:excess]
-            del up_data[:excess]
-            if times3 is not None:
-                del times3[:excess]
-                del east_data3[:excess]
-                del north_data3[:excess]
-                del up_data3[:excess]
-
     def _calc_and_update_enu2(self, lat, lon, alt, ref_point, ref_ready,
             east_label, north_label, up_label,
             times, east_data, north_data, up_data,
@@ -2948,9 +2850,6 @@ class NMEADataAnalyzer(QMainWindow):
         self._latest_enu3_up = 0.0  # [新增]
         self._p2_gga_new_epoch = False
         self._p3_gga_new_epoch = False  # [新增]
-        self._last_enu1_pos = None
-        self._last_enu2_pos = None
-        self._last_enu3_pos = None  # [新增]
         self._latest_p2_quality = 0
         self._latest_p3_quality = 0  # [新增]
 

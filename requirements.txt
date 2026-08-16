@@ -1,6 +1,5 @@
 PyQt5>=5.15.0
 pyserial>=3.5
-chardet>=5.0.0
 pyqtgraph>=0.14.0
 numpy>=1.23.0
 pyinstaller>=6.0.0
