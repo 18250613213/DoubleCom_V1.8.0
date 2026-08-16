@@ -1157,12 +1157,7 @@ class NMEADataAnalyzer(QMainWindow):
             if decoded:
                 self.data_preview.append(f"[串口2] {decoded.strip()}")
 
-                if self.data_preview.document().blockCount() > 500:
-                    cursor = self.data_preview.textCursor()
-                    cursor.movePosition(QTextCursor.Start)
-                    cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, 200)
-                    cursor.removeSelectedText()
-                    cursor.movePosition(QTextCursor.End)
+                self._trim_text_edit(self.data_preview)
 
                 # 解析GSV获取卫星信噪比（仅GSV行触发）
                 is_gsv = False
@@ -1273,12 +1268,7 @@ class NMEADataAnalyzer(QMainWindow):
             if decoded:
                 self.data_preview.append(f"[串口3] {decoded.strip()}")
 
-                if self.data_preview.document().blockCount() > 500:
-                    cursor = self.data_preview.textCursor()
-                    cursor.movePosition(QTextCursor.Start)
-                    cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, 200)
-                    cursor.removeSelectedText()
-                    cursor.movePosition(QTextCursor.End)
+                self._trim_text_edit(self.data_preview)
 
                 # 解析GSV获取卫星信噪比
                 is_gsv = False
@@ -1466,12 +1456,7 @@ class NMEADataAnalyzer(QMainWindow):
                     self._feed_fixed_enu1()
                     self._update_enu_std()
 
-                if self.data_preview.document().blockCount() > 500:
-                    cursor = self.data_preview.textCursor()
-                    cursor.movePosition(QTextCursor.Start)
-                    cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, 200)
-                    cursor.removeSelectedText()
-                    cursor.movePosition(QTextCursor.End)
+                self._trim_text_edit(self.data_preview)
     
     def update_stats_display(self, gga_data, smoothed_coords, raw_errors, errors, stats):
         """更新串口1 GGA状态显示"""
@@ -3494,15 +3479,26 @@ class NMEADataAnalyzer(QMainWindow):
                 except:
                     pass
 
+    def _trim_text_edit(self, edit, max_blocks=500, remove_blocks=200):
+        """限制QTextEdit块数，防止长期运行无限增长"""
+        if edit.document().blockCount() > max_blocks:
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, remove_blocks)
+            cursor.removeSelectedText()
+            cursor.movePosition(QTextCursor.End)
+
     def log_info(self, message):
         timestamp = datetime.now().strftime('%H:%M:%S')
         self.log_window.append(f"[{timestamp}] INFO: {message}")
+        self._trim_text_edit(self.log_window)
         self.log_window.moveCursor(QTextCursor.End)
         self._write_info_to_logs("INFO", message)
 
     def log_error(self, message):
         timestamp = datetime.now().strftime('%H:%M:%S')
         self.log_window.append(f"[{timestamp}] ERROR: {message}")
+        self._trim_text_edit(self.log_window)
         self.log_window.moveCursor(QTextCursor.End)
         self._write_info_to_logs("ERROR", message)
         
