@@ -406,122 +406,53 @@ class NMEADataAnalyzer(QMainWindow):
         control_tab = QWidget()
         control_layout = QVBoxLayout(control_tab)
         
-        # 顶部布局：串口1 + 串口2 + 真值设置 + 阈值设置
-        top_layout = QHBoxLayout()
+        # 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
+        BAUD_RATES = ["9600", "19200", "38400", "57600", "115200",
+                      "230400", "460800", "921600"]
+        PORT_NAMES = {1: "串口1 (无干扰)", 2: "串口2 (干扰测试)", 3: "串口3 (干扰测试2)"}
 
-        # === 串口1（无干扰/主接收机）===
-        port1_panel = QGroupBox("串口1 (无干扰)")
-        port1_panel.setMinimumWidth(170)
-        port1_layout = QVBoxLayout(port1_panel)
+        ports_box = QGroupBox("串口连接")
+        ports_grid = QGridLayout(ports_box)
+        ports_grid.addWidget(QLabel("串口"), 0, 0)
+        ports_grid.addWidget(QLabel("串口号"), 0, 1)
+        ports_grid.addWidget(QLabel("波特率"), 0, 2)
+        ports_grid.addWidget(QLabel("操作"), 0, 3, 1, 3)
+        ports_grid.addWidget(QLabel("状态"), 0, 6)
 
-        self.port1_combo = QComboBox()
-        self.port1_baud = QComboBox()
-        self.port1_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.port1_baud.setCurrentText("9600")
+        for pid in (1, 2, 3):
+            row = pid
+            ports_grid.addWidget(QLabel(PORT_NAMES[pid]), row, 0)
 
-        port1_data_layout = QGridLayout()
-        port1_data_layout.addWidget(QLabel("串口号:"), 0, 0)
-        port1_data_layout.addWidget(self.port1_combo, 0, 1)
-        port1_data_layout.addWidget(QLabel("波特率:"), 1, 0)
-        port1_data_layout.addWidget(self.port1_baud, 1, 1)
+            combo = QComboBox()
+            setattr(self, f"port{pid}_combo", combo)
+            ports_grid.addWidget(combo, row, 1)
 
-        self.port1_refresh_btn = QPushButton("刷新")
-        self.port1_connect_btn = QPushButton("连接")
-        self.port1_disconnect_btn = QPushButton("断开")
-        self.port1_disconnect_btn.setEnabled(False)
+            baud = QComboBox()
+            baud.addItems(BAUD_RATES)
+            baud.setCurrentText("9600")
+            setattr(self, f"port{pid}_baud", baud)
+            ports_grid.addWidget(baud, row, 2)
 
-        port1_btn_layout = QHBoxLayout()
-        port1_btn_layout.addWidget(self.port1_refresh_btn)
-        port1_btn_layout.addWidget(self.port1_connect_btn)
-        port1_btn_layout.addWidget(self.port1_disconnect_btn)
+            refresh_btn = QPushButton("刷新")
+            connect_btn = QPushButton("连接")
+            disconnect_btn = QPushButton("断开")
+            disconnect_btn.setEnabled(False)
+            setattr(self, f"port{pid}_refresh_btn", refresh_btn)
+            setattr(self, f"port{pid}_connect_btn", connect_btn)
+            setattr(self, f"port{pid}_disconnect_btn", disconnect_btn)
+            btn_row = QHBoxLayout()
+            btn_row.addWidget(refresh_btn)
+            btn_row.addWidget(connect_btn)
+            btn_row.addWidget(disconnect_btn)
+            ports_grid.addLayout(btn_row, row, 3, 1, 3)
 
-        self.port1_status_label = QLabel("未连接")
-        self.port1_status_label.setStyleSheet("color: red; font-weight: bold;")
+            status_label = QLabel("未连接")
+            status_label.setStyleSheet("color: red; font-weight: bold;")
+            setattr(self, f"port{pid}_status_label", status_label)
+            ports_grid.addWidget(status_label, row, 6)
 
-        port1_layout.addLayout(port1_data_layout)
-        port1_layout.addLayout(port1_btn_layout)
-        port1_layout.addWidget(self.port1_status_label)
-        port1_layout.addStretch()
-
-        top_layout.addWidget(port1_panel)
-
-        # === 串口2（干扰测试/参考接收机）===
-        port2_panel = QGroupBox("串口2 (干扰测试)")
-        port2_panel.setMinimumWidth(170)
-        port2_layout = QVBoxLayout(port2_panel)
-
-        self.port2_combo = QComboBox()
-        self.port2_baud = QComboBox()
-        self.port2_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.port2_baud.setCurrentText("9600")
-
-        port2_data_layout = QGridLayout()
-        port2_data_layout.addWidget(QLabel("串口号:"), 0, 0)
-        port2_data_layout.addWidget(self.port2_combo, 0, 1)
-        port2_data_layout.addWidget(QLabel("波特率:"), 1, 0)
-        port2_data_layout.addWidget(self.port2_baud, 1, 1)
-
-        self.port2_refresh_btn = QPushButton("刷新")
-        self.port2_connect_btn = QPushButton("连接")
-        self.port2_disconnect_btn = QPushButton("断开")
-        self.port2_disconnect_btn.setEnabled(False)
-
-        port2_btn_layout = QHBoxLayout()
-        port2_btn_layout.addWidget(self.port2_refresh_btn)
-        port2_btn_layout.addWidget(self.port2_connect_btn)
-        port2_btn_layout.addWidget(self.port2_disconnect_btn)
-
-        self.port2_status_label = QLabel("未连接")
-        self.port2_status_label.setStyleSheet("color: red; font-weight: bold;")
-
-        port2_layout.addLayout(port2_data_layout)
-        port2_layout.addLayout(port2_btn_layout)
-        port2_layout.addWidget(self.port2_status_label)
-        port2_layout.addStretch()
-
-        top_layout.addWidget(port2_panel)
-
-        # [新增] === 串口3（干扰测试2 / 第二干扰口）===
-        port3_panel = QGroupBox("串口3 (干扰测试2)")
-        port3_panel.setMinimumWidth(170)
-        port3_layout = QVBoxLayout(port3_panel)
-
-        self.port3_combo = QComboBox()
-        self.port3_baud = QComboBox()
-        self.port3_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.port3_baud.setCurrentText("9600")
-
-        port3_data_layout = QGridLayout()
-        port3_data_layout.addWidget(QLabel("串口号:"), 0, 0)
-        port3_data_layout.addWidget(self.port3_combo, 0, 1)
-        port3_data_layout.addWidget(QLabel("波特率:"), 1, 0)
-        port3_data_layout.addWidget(self.port3_baud, 1, 1)
-
-        self.port3_refresh_btn = QPushButton("刷新")
-        self.port3_connect_btn = QPushButton("连接")
-        self.port3_disconnect_btn = QPushButton("断开")
-        self.port3_disconnect_btn.setEnabled(False)
-
-        port3_btn_layout = QHBoxLayout()
-        port3_btn_layout.addWidget(self.port3_refresh_btn)
-        port3_btn_layout.addWidget(self.port3_connect_btn)
-        port3_btn_layout.addWidget(self.port3_disconnect_btn)
-
-        self.port3_status_label = QLabel("未连接")
-        self.port3_status_label.setStyleSheet("color: red; font-weight: bold;")
-
-        port3_layout.addLayout(port3_data_layout)
-        port3_layout.addLayout(port3_btn_layout)
-        port3_layout.addWidget(self.port3_status_label)
-        port3_layout.addStretch()
-
-        top_layout.addWidget(port3_panel)
-        
-        top_layout.setStretch(0, 1)
-        top_layout.setStretch(1, 1)
-        top_layout.setStretch(2, 1)  # [新增] 串口3
-        
-        control_layout.addLayout(top_layout)
+        ports_grid.setColumnStretch(1, 1)
+        control_layout.addWidget(ports_box)
 
         # 双串口GGA状态面板：串口1（左）+ 串口2（右）
         port_stats_layout = QHBoxLayout()
@@ -624,6 +555,9 @@ class NMEADataAnalyzer(QMainWindow):
         port_stats_layout.addWidget(port3_stats)
 
         control_layout.addLayout(port_stats_layout)
+
+        # ENU 基准值设置（全局配置, 从方向测试页移至此处）
+        control_layout.addWidget(self._create_enu_ref_box())
 
         # ENU 误差实时显示 - 串口1 (无干扰) 和 串口2 (干扰测试)
         enu_val_box = QGroupBox("ENU 误差实时值")
@@ -764,15 +698,10 @@ class NMEADataAnalyzer(QMainWindow):
         info_layout.addWidget(self.antenna_height_input, 3, 1)
 
         control_layout.addWidget(info_group)
-        
-        # 设置控制标签页的整体拉伸比例
-        control_layout.setStretch(0, 1)  # 顶部面板占1份
-        control_layout.setStretch(1, 1)  # 统计面板占1份
-        control_layout.setStretch(2, 0)  # 日志窗口固定
-        control_layout.setStretch(3, 0)  # 设备序号行固定
-        control_layout.setStretch(4, 0)  # 测试基本信息固定
-        control_layout.setStretch(5, 0)  # 底部按钮固定
-        
+
+        # 控制面板拉伸比例: 0=串口连接(紧凑) 1=GGA统计 2=ENU基准 3=ENU实时值
+        # 4=ENU标准差 5=日志窗口 6=测试基本信息 7=底部按钮 (仅GGA统计可伸缩)
+        control_layout.setStretch(1, 1)
         # 最底部：操作按钮
         bottom_layout = QHBoxLayout()
         self.clear_data_btn = QPushButton("清空数据")
@@ -1990,19 +1919,19 @@ class NMEADataAnalyzer(QMainWindow):
             del north_data[:len(north_data) - self.ENU_MAX_POINTS]
             del up_data[:len(up_data) - self.ENU_MAX_POINTS]
 
-    def _create_direction_tab(self):
-        main_tab = QWidget()
-        layout = QVBoxLayout(main_tab)
-
-        # ENU基准值设置（共享一组控制）
-        enu_ref_box = QGroupBox("ENU 基准值设置（启动时自动应用）")
+    def _create_enu_ref_box(self):
+        """ENU基准值设置（全局控制, 影响所有串口的ENU误差计算）"""
+        enu_ref_box = QGroupBox("ENU 基准值设置（全局，影响所有 ENU 误差计算）")
         enu_ref_layout = QVBoxLayout(enu_ref_box)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("基准模式:"))
         self.enu_auto_radio = QRadioButton("自动基准(前100点)")
         self.enu_auto_radio.setChecked(True)
+        self.enu_auto_radio.setToolTip("以各串口开始接收后前100个有效GGA定位的平均坐标作为ENU误差基准点\n(推荐: 自动吸收初始定位噪声)")
         self.enu_instant_radio = QRadioButton("瞬时GGA定位值")
+        self.enu_instant_radio.setToolTip("以各串口第一个有效GGA定位值作为基准点\n(适合初始位置已稳定收敛的场景)")
         self.enu_manual_radio = QRadioButton("手动输入")
+        self.enu_manual_radio.setToolTip("手动输入已知精确坐标作为基准点\n(适合经过精密测量的测试场地)")
         mode_row.addWidget(self.enu_auto_radio)
         mode_row.addWidget(self.enu_instant_radio)
         mode_row.addWidget(self.enu_manual_radio)
@@ -2029,6 +1958,7 @@ class NMEADataAnalyzer(QMainWindow):
         manual_row.addWidget(self.enu_manual_alt)
         self.enu_apply_btn = QPushButton("应用基准")
         self.enu_apply_btn.setEnabled(False)
+        self.enu_apply_btn.setToolTip("将输入坐标同时应用为三个串口的ENU基准点")
         manual_row.addWidget(self.enu_apply_btn)
         manual_row.addStretch()
         enu_ref_layout.addLayout(manual_row)
@@ -2056,7 +1986,11 @@ class NMEADataAnalyzer(QMainWindow):
         enu_ref_labels.addWidget(self.enu3_points_label)
         enu_ref_labels.addStretch()
         enu_ref_layout.addLayout(enu_ref_labels)
-        layout.addWidget(enu_ref_box)
+        return enu_ref_box
+
+    def _create_direction_tab(self):
+        main_tab = QWidget()
+        layout = QVBoxLayout(main_tab)
 
         # 方向测试子标签：串口2和串口3分开
         dir_sub_tabs = QTabWidget()
