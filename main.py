@@ -44,7 +44,7 @@ TALKER_TO_SYSTEM = {
     'GP': 'G', 'GL': 'R', 'GA': 'E', 'GB': 'B', 'BD': 'B', 'GN': 'G',
 }
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 
 
@@ -1512,16 +1512,58 @@ class NMEADataAnalyzer(QMainWindow):
         self._update_enu_display()
         self._update_direction_stats_display()
 
+    # SNR表配色（Nord深色主题）
+    _SYS_BADGES = {
+        'GP': ('GPS', '#81a1c1'), 'GL': ('GLO', '#b48ead'), 'GA': ('GAL', '#a3be8c'),
+        'BD': ('BDS', '#8fbcbb'), 'GB': ('BDS', '#8fbcbb'), 'GN': ('GNSS', '#ebcb8b'),
+    }
+
+    @staticmethod
+    def _snr_cell(v):
+        """载噪比瞬时值单元格: 按信号强度分档色阶背景"""
+        if v is None:
+            return '<td align="center" bgcolor="#1b1b2a"><span style="color:#585b70;">--</span></td>'
+        if v >= 42:
+            bg = '#2f5e3f'
+        elif v >= 36:
+            bg = '#44583a'
+        elif v >= 30:
+            bg = '#5d5436'
+        elif v >= 24:
+            bg = '#5e4531'
+        else:
+            bg = '#5e3737'
+        return f'<td align="right" bgcolor="{bg}"><span style="color:#eceff4;">{v:.1f}</span></td>'
+
+    @staticmethod
+    def _avg_cell(v, row_bg, signed=False):
+        """均值单元格: 行底色, 弱化文字"""
+        if v is None:
+            return f'<td align="center" bgcolor="{row_bg}"><span style="color:#585b70;">--</span></td>'
+        txt = f"{v:+.1f}" if signed else f"{v:.1f}"
+        return f'<td align="right" bgcolor="{row_bg}"><span style="color:#a7adc6;">{txt}</span></td>'
+
+    @staticmethod
+    def _delta_cell(v):
+        """差值单元格: |Δ|分级色阶, ≥10dB橙/≥15dB红加粗"""
+        if v is None:
+            return '<td align="center" bgcolor="#1b1b2a"><span style="color:#585b70;">--</span></td>'
+        a = abs(v)
+        if a >= 15:
+            return f'<td align="right" bgcolor="#5e3737"><span style="color:#f38ba8; font-weight:bold;">{v:+.1f}</span></td>'
+        if a >= 10:
+            return f'<td align="right" bgcolor="#5e4531"><span style="color:#fab387;">{v:+.1f}</span></td>'
+        if a >= 3:
+            return f'<td align="right" bgcolor="#5d5436"><span style="color:#eceff4;">{v:+.1f}</span></td>'
+        return f'<td align="right" bgcolor="#2a3a4a"><span style="color:#a5b6cc;">{v:+.1f}</span></td>'
+
     def _refresh_snr_text(self):
         p1_utc = getattr(self, 'p1_utc_ts', '') or '--'
         p2_utc = getattr(self, 'p2_utc_ts', '') or '--'
-        p3_utc = getattr(self, 'p3_utc_ts', '') or '--'  # [新增]
+        p3_utc = getattr(self, 'p3_utc_ts', '') or '--'
         all_keys = sorted(
             set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
             key=lambda x: (x[:2], int(x[2:])))
-        html = ['<pre style="font-family: Consolas; font-size: 13px; color: #cdd6f4; margin:0;">']
-        html.append(f"=== 卫星信噪比实时数据 (Port1 & Port2 & Port3) ===")
-        html.append(f"UTC 串口1: {p1_utc}  |  串口2: {p2_utc}  |  串口3: {p3_utc}")
 
         # 更新差值平均值：Port2 vs Port1 (Delta)
         for key in all_keys:
@@ -1532,7 +1574,7 @@ class NMEADataAnalyzer(QMainWindow):
                 if self._last_snr_diff.get(key) != diff:
                     self._last_snr_diff[key] = diff
                     self._snr_diff_avg.add(key, diff)
-        # [新增] 更新差值平均值：Port3 vs Port1 (Delta2)
+        # 更新差值平均值：Port3 vs Port1 (Delta2)
         for key in all_keys:
             s1 = self.port1_satellites.get(key, None)
             s3 = self.port3_satellites.get(key, None)
@@ -1542,66 +1584,93 @@ class NMEADataAnalyzer(QMainWindow):
                     self._last_snr_diff2[key] = diff2
                     self._snr_diff2_avg.add(key, diff2)
 
-        hdr_fmt = "  {:2}  {:>4}  {:>4}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}"
-        html.append(hdr_fmt.format("Ty", "PRN", "Sig",
-            "Port1", "Avg1", "Port2", "Avg2", "Delta", "AvgD",
-            "Port3", "Avg3", "Delta2", "AvgD2"))
-        html.append(hdr_fmt.format("--", "---", "---",
-            "-----", "----", "-----", "----", "-----", "----",
-            "-----", "----", "-----", "-----"))
-        for key in all_keys:
+        if not all_keys:
+            self.snr_text1.setHtml(
+                '<div style="font-family:Consolas,monospace;font-size:13px;color:#585b70;">'
+                '等待GSV数据…</div>')
+            return
+
+        html = ['<div style="font-family:Consolas,monospace;font-size:13px;color:#cdd6f4;">']
+        html.append(
+            f'<p style="margin:2px 0 6px 0;"><b style="color:#eceff4;">卫星载噪比实时对比</b>'
+            f'&nbsp;&nbsp;<span style="color:#585b70;">UTC</span>'
+            f'&nbsp;串口1: <span style="color:#a3be8c;">{p1_utc}</span>'
+            f'&nbsp;串口2: <span style="color:#81a1c1;">{p2_utc}</span>'
+            f'&nbsp;串口3: <span style="color:#ebcb8b;">{p3_utc}</span></p>')
+        html.append('<table width="100%" cellspacing="0" cellpadding="3">')
+
+        # 双行表头: 组表头 + 子表头 (共13列)
+        grp = '<td colspan="{n}" align="center" bgcolor="#434c5e"><b>{t}</b></td>'
+        html.append('<tr>'
+                    + grp.format(n=2, t='卫星') + grp.format(n=1, t='信号')
+                    + grp.format(n=2, t='串口1 · 无干扰') + grp.format(n=2, t='串口2 · 干扰')
+                    + grp.format(n=2, t='Δ (2-1)') + grp.format(n=2, t='串口3 · 干扰2')
+                    + grp.format(n=2, t='Δ (3-1)')
+                    + '</tr>')
+        subs = ['星座', 'PRN', '信号', '瞬时', '均值', '瞬时', '均值', '差值', '均值',
+                '瞬时', '均值', '差值', '均值']
+        html.append('<tr>' + ''.join(
+            f'<td align="center" bgcolor="#3b4252"><span style="color:#d8dee9;">{s}</span></td>'
+            for s in subs) + '</tr>')
+
+        # 数据行
+        for i, key in enumerate(all_keys):
             sys = key[:2]
             prn = int(key[2:])
+            row_bg = '#232338' if i % 2 == 0 else '#1a1a29'
+            badge_name, badge_color = self._SYS_BADGES.get(sys, (sys, '#86878d'))
             s1 = self.port1_satellites.get(key, None)
             s2 = self.port2_satellites.get(key, None)
-            s3 = self.port3_satellites.get(key, None)  # [新增]
+            s3 = self.port3_satellites.get(key, None)
             a1 = self._port1_snr_avg.get(key)
             a2 = self._port2_snr_avg.get(key)
-            a3 = self._port3_snr_avg.get(key)  # [新增]
+            a3 = self._port3_snr_avg.get(key)
             ad = self._snr_diff_avg.get(key)
-            ad2 = self._snr_diff2_avg.get(key)  # [新增]
-            signal = self._port1_snr_signals.get(key) or self._port2_snr_signals.get(key) or self._port3_snr_signals.get(key) or '---'
+            ad2 = self._snr_diff2_avg.get(key)
+            d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+            d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+            signal = (self._port1_snr_signals.get(key)
+                      or self._port2_snr_signals.get(key)
+                      or self._port3_snr_signals.get(key) or '---')
+            warn = (d1 is not None and abs(d1) >= 15) or (d2 is not None and abs(d2) >= 15)
+            prn_extra = ' style="color:#f38ba8; font-weight:bold;"' if warn else ''
 
-            s1_str = f"{s1:8.1f}" if s1 is not None else "      --"
-            s2_str = f"{s2:8.1f}" if s2 is not None else "      --"
-            s3_str = f"{s3:8.1f}" if s3 is not None else "      --"  # [新增]
-            a1_str = f"{a1:8.1f}" if a1 is not None else "      --"
-            a2_str = f"{a2:8.1f}" if a2 is not None else "      --"
-            a3_str = f"{a3:8.1f}" if a3 is not None else "      --"  # [新增]
-            ad_str = f"{ad:+8.1f}" if ad is not None else "      --"
-            ad2_str = f"{ad2:+8.1f}" if ad2 is not None else "      --"  # [新增]
+            row = (f'<td align="center" bgcolor="{badge_color}">'
+                   f'<span style="color:#11111b; font-weight:bold;">{badge_name}</span></td>'
+                   f'<td align="right" bgcolor="{row_bg}"{prn_extra}>{prn:02d}</td>'
+                   f'<td align="center" bgcolor="{row_bg}"><span style="color:#89ddff;">{signal}</span></td>')
+            row += self._snr_cell(s1) + self._avg_cell(a1, row_bg)
+            row += self._snr_cell(s2) + self._avg_cell(a2, row_bg)
+            row += self._delta_cell(d1) + self._avg_cell(ad, row_bg, signed=True)
+            row += self._snr_cell(s3) + self._avg_cell(a3, row_bg)
+            row += self._delta_cell(d2) + self._avg_cell(ad2, row_bg, signed=True)
+            html.append('<tr>' + row + '</tr>')
 
-            if s1 is not None and s2 is not None:
-                diff = s2 - s1
-                diff_str = f"{diff:+8.1f}"
-            else:
-                diff_str = f'<span style="color:#888;">{"--":>8}</span>'
-            # [新增] Delta2
-            if s1 is not None and s3 is not None:
-                diff2 = s3 - s1
-                diff2_str = f"{diff2:+8.1f}"
-            else:
-                diff2_str = f'<span style="color:#888;">{"--":>8}</span>'
-
-            if s1 is not None and s2 is not None:
-                diff = s2 - s1
-                if abs(diff) > 15:
-                    row_color = "#ff4444"
-                elif abs(diff) >= 10:
-                    row_color = "#ff8844"
-                else:
-                    row_color = "#ffffff"
-                row = f'<span style="color:{row_color};">  {sys}  {prn:4d}  {signal:>4s}  {s1_str}  {a1_str}  {s2_str}  {a2_str}  {diff_str}  {ad_str}  {s3_str}  {a3_str}  {diff2_str}  {ad2_str}</span>'
-                html.append(row)
-            else:
-                html.append(f'  {sys}  {prn:4d}  {signal:>4s}  {s1_str}  {a1_str}  {s2_str}  {a2_str}  {diff_str}  {ad_str}  {s3_str}  {a3_str}  {diff2_str}  {ad2_str}')
+        # 汇总行
         n1 = len(self.port1_satellites)
         n2 = len(self.port2_satellites)
-        n3 = len(self.port3_satellites)  # [新增]
+        n3 = len(self.port3_satellites)
         common = sum(1 for k in all_keys if k in self.port1_satellites and k in self.port2_satellites)
-        common3 = sum(1 for k in all_keys if k in self.port1_satellites and k in self.port3_satellites)  # [新增]
-        html.append(f"--- 串口1: {n1} 颗 | 串口2: {n2} 颗 | 串口3: {n3} 颗 | 共同(1&2): {common} 颗 | 共同(1&3): {common3} 颗 ---")
-        html.append("</pre>")
+        common3 = sum(1 for k in all_keys if k in self.port1_satellites and k in self.port3_satellites)
+        html.append(
+            f'<tr><td colspan="13" align="center" bgcolor="#2e3440">'
+            f'串口1: <b style="color:#a3be8c;">{n1}</b> 颗 &nbsp;·&nbsp; '
+            f'串口2: <b style="color:#81a1c1;">{n2}</b> 颗 &nbsp;·&nbsp; '
+            f'串口3: <b style="color:#ebcb8b;">{n3}</b> 颗 &nbsp;·&nbsp; '
+            f'共同(1&2): <b>{common}</b> 颗 &nbsp;·&nbsp; 共同(1&3): <b>{common3}</b> 颗'
+            f'</td></tr>')
+        html.append('</table>')
+
+        # 色阶图例
+        html.append(
+            '<p style="margin:6px 0 0 0; color:#585b70;">载噪比: '
+            '<span style="background-color:#5e3737;">&nbsp;&lt;24&nbsp;</span>'
+            '<span style="background-color:#5e4531;">&nbsp;24-29&nbsp;</span>'
+            '<span style="background-color:#5d5436;">&nbsp;30-35&nbsp;</span>'
+            '<span style="background-color:#44583a;">&nbsp;36-41&nbsp;</span>'
+            '<span style="background-color:#2f5e3f;">&nbsp;≥42&nbsp;</span> dB-Hz'
+            '&nbsp;&nbsp;|&nbsp;&nbsp;Δ恶化: ≥10dB 橙 · ≥15dB 红(加粗)</p>')
+        html.append('</div>')
         self.snr_text1.setHtml("\n".join(html))
 
     def _feed_enu1_buffer(self, lat, lon, alt):
