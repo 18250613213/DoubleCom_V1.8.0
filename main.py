@@ -42,6 +42,8 @@ TALKER_TO_SYSTEM = {
     'GP': 'G', 'GL': 'R', 'GA': 'E', 'GB': 'B', 'BD': 'B', 'GN': 'G',
 }
 
+APP_VERSION = "1.7.0"
+
 
 
 # WGS84 ellipsoid constants (used in LLA-to-ECEF-to-ENU conversion)
@@ -116,7 +118,7 @@ class NMEADataAnalyzer(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NMEA 数据实时分析系统")
+        self.setWindowTitle(f"NMEA 数据实时分析系统 V{APP_VERSION}")
         self.setGeometry(100, 100, 1500, 1000)
         self.showMaximized()
         
@@ -399,8 +401,6 @@ class NMEADataAnalyzer(QMainWindow):
 
         table_layout.setStretch(0, 2)  # GSV数据占2份
         table_layout.setStretch(1, 1)  # 数据预览占1份
-        
-        self.tab_widget.addTab(table_tab, "表格视图")
         
         # ========== 标签2：功能与控制面板 ==========
         control_tab = QWidget()
@@ -777,12 +777,16 @@ class NMEADataAnalyzer(QMainWindow):
         bottom_layout = QHBoxLayout()
         self.clear_data_btn = QPushButton("清空数据")
         self.clear_data_btn.setMinimumWidth(100)
+        self.clear_data_btn.setToolTip("清空预览与三个串口的数据缓存, 并重置全部统计")
         self.reset_stats_btn = QPushButton("重置统计")
         self.reset_stats_btn.setMinimumWidth(100)
+        self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR均值/方向统计等), 不清空数据缓存")
         self.clear_log_btn = QPushButton("清除日志")
         self.clear_log_btn.setMinimumWidth(100)
+        self.clear_log_btn.setToolTip("清空界面日志窗口显示(不影响自动落盘日志文件)")
         self.save_all_log_btn = QPushButton("保存全部日志")
         self.save_all_log_btn.setMinimumWidth(110)
+        self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
         # [新增] 串口2独立报告按钮
         self.export_report2_btn = QPushButton("导出串口2测试报告")
         self.export_report2_btn.setMinimumWidth(140)
@@ -801,6 +805,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.selftest_btn = QPushButton("一键自检(无串口)")
         self.selftest_btn.setMinimumWidth(130)
         self.selftest_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
+        self.selftest_btn.setToolTip("无需真实串口: 使用随机生成的模拟导航数据(时长/倍率/种子可配)\n对解析/ENU/SNR/TTFF/方向测试/报告导出全链路进行自动化测试并输出验证清单")
 
         bottom_layout.addWidget(self.clear_data_btn)
         bottom_layout.addWidget(self.reset_stats_btn)
@@ -819,7 +824,9 @@ class NMEADataAnalyzer(QMainWindow):
 
         control_layout.addLayout(bottom_layout)
         
+        # 默认展示控制面板(高频操作), 表格视图次之
         self.tab_widget.addTab(control_tab, "功能与控制面板")
+        self.tab_widget.addTab(table_tab, "表格视图")
         
         # ========== 标签4：ENU 误差对比 ==========
         enu_comp_tab = QWidget()
