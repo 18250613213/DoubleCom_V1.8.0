@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QDoubleSpinBox, QSpinBox, QStatusBar,
     QGridLayout, QRadioButton, QButtonGroup, QCheckBox, QTabWidget,
     QLineEdit, QDialog, QFormLayout, QProgressBar,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QTextCursor
@@ -398,6 +399,12 @@ class NMEADataAnalyzer(QMainWindow):
         # 卫星信噪比数据 (GSV实时)
         snr_box = QGroupBox("卫星信噪比数据 (GSV) — 实时更新")
         snr_layout = QVBoxLayout(snr_box)
+        snr_btn_row = QHBoxLayout()
+        self.export_snr_btn = QPushButton("导出SNR表(CSV)")
+        self.export_snr_btn.setToolTip("将当前卫星载噪比对比表(含三口瞬时值/均值/差值)导出为CSV文件")
+        snr_btn_row.addWidget(self.export_snr_btn)
+        snr_btn_row.addStretch()
+        snr_layout.addLayout(snr_btn_row)
         self.snr_text1 = QTextEdit()
         self.snr_text1.setReadOnly(True)
         self.snr_text1.setStyleSheet("font-family: Consolas; font-size: 13px; background-color: #1e1e2e; color: #cdd6f4;")
@@ -873,6 +880,9 @@ class NMEADataAnalyzer(QMainWindow):
         # 将QTabWidget添加到主布局
         main_layout.addWidget(self.tab_widget)
 
+        # 菜单栏与快捷键
+        self._create_menu_bar()
+
         # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -952,6 +962,9 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 自检取消按钮
         self.selftest_cancel_btn.clicked.connect(self._cancel_selftest)
+
+        # SNR表导出
+        self.export_snr_btn.clicked.connect(self._export_snr_csv)
 
         # ENU基准模式切换（共享控制）
         self._enu_btn_group = QButtonGroup()
@@ -2064,6 +2077,28 @@ class NMEADataAnalyzer(QMainWindow):
         sn_row.addStretch()
         tab_layout.addLayout(sn_row)
 
+        # 方向测试汇总对比表（4方向关键指标一眼对比）
+        summary = QTableWidget(4, 8)
+        summary.setHorizontalHeaderLabels(
+            ["方向", "测试时长", "总历元", "成功率", "水平均值(m)",
+             "水平最大(m)", "垂直均值(m)", "垂直最大(m)"])
+        summary.verticalHeader().setVisible(False)
+        summary.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        summary.setSelectionMode(QAbstractItemView.NoSelection)
+        summary.setAlternatingRowColors(True)
+        summary.setMaximumHeight(170)
+        summary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        summary.horizontalHeader().setStretchLastSection(True)
+        for r in range(4):
+            for c in range(8):
+                summary.setItem(r, c, QTableWidgetItem(""))
+            summary.item(r, 0).setText(f"方向{r + 1}")
+        tab_layout.addWidget(summary)
+        if is_com3:
+            self.dir_summary_table3 = summary
+        else:
+            self.dir_summary_table = summary
+
         stats_grid = QGridLayout()
         stat_boxes = []
 
@@ -2115,6 +2150,7 @@ class NMEADataAnalyzer(QMainWindow):
         if is_com3:
             stop_cb = QCheckBox("启用自动停止")
             stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
             stop_cb.stateChanged.connect(lambda state: setattr(self, '_dir3_auto_stop_enabled', state == Qt.Checked))
             auto_stop_row.addWidget(stop_cb)
             auto_stop_row.addWidget(QLabel("最大时长(秒):"))
@@ -2133,6 +2169,7 @@ class NMEADataAnalyzer(QMainWindow):
         else:
             stop_cb = QCheckBox("启用自动停止")
             stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
             stop_cb.stateChanged.connect(self._on_auto_stop_toggled)
             auto_stop_row.addWidget(stop_cb)
             auto_stop_row.addWidget(QLabel("最大时长(秒):"))
@@ -2468,7 +2505,26 @@ class NMEADataAnalyzer(QMainWindow):
                             "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
                         self.log_info(f"方向{i + 1} 自动停止 ({reason})")
 
+    def _refresh_dir_summary(self, table, direction_stats):
+        """刷新方向测试汇总对比表"""
+        for i in range(4):
+            s = direction_stats[i].get_stats()
+            values = [
+                s['duration'],
+                str(s['total_epochs']),
+                f"{s['success_rate']:.1f}%",
+                f"{s['h_mean']:.3f}",
+                f"{s['h_max']:.3f}",
+                f"{s['v_mean']:.3f}",
+                f"{s['v_max']:.3f}",
+            ]
+            for c, v in enumerate(values, start=1):
+                table.item(i, c).setText(v)
+
     def _update_direction_stats_display(self):
+        # 方向测试汇总表
+        self._refresh_dir_summary(self.dir_summary_table, self.direction_stats)
+        self._refresh_dir_summary(self.dir_summary_table3, self.direction_stats3)
         # 串口2方向测试显示
         for i in range(4):
             ds = self.direction_stats[i]
@@ -3302,6 +3358,87 @@ class NMEADataAnalyzer(QMainWindow):
         except Exception as e:
             self.log_error(f"导出串口3PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
             QMessageBox.critical(self, "导出失败", f"无法生成串口3PDF报告:\n{str(e)}")
+
+    def _create_menu_bar(self):
+        """菜单栏与全局快捷键"""
+        mb = self.menuBar()
+
+        file_menu = mb.addMenu("文件(&F)")
+        act_save = file_menu.addAction("保存全部日志")
+        act_save.setShortcut("Ctrl+S")
+        act_save.triggered.connect(self._save_all_serial_logs)
+        act_snr = file_menu.addAction("导出SNR表(CSV)")
+        act_snr.triggered.connect(self._export_snr_csv)
+        file_menu.addSeparator()
+        act_exit = file_menu.addAction("退出")
+        act_exit.triggered.connect(self.close)
+
+        op_menu = mb.addMenu("操作(&O)")
+        act_refresh = op_menu.addAction("刷新串口列表")
+        act_refresh.setShortcut("F5")
+        act_refresh.triggered.connect(self._refresh_all_ports)
+        act_reset = op_menu.addAction("重置统计")
+        act_reset.setShortcut("Ctrl+R")
+        act_reset.triggered.connect(self.reset_all_stats)
+        act_clear = op_menu.addAction("清空数据")
+        act_clear.triggered.connect(self.clear_all_data)
+        op_menu.addSeparator()
+        act_selftest = op_menu.addAction("一键自检(无串口)...")
+        act_selftest.triggered.connect(self._open_selftest_dialog)
+
+    def _refresh_all_ports(self):
+        for pid in (1, 2, 3):
+            self.refresh_serial_ports(pid)
+
+    def _export_snr_csv(self):
+        """将当前卫星SNR对比表导出为CSV(UTF-8 BOM, Excel友好)"""
+        from PyQt5.QtWidgets import QFileDialog
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        os.makedirs(default_dir, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出SNR表", os.path.join(default_dir, f"snr_table_{ts}.csv"),
+            "CSV 文件 (*.csv);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            all_keys = sorted(
+                set(self.port1_satellites) | set(self.port2_satellites) | set(self.port3_satellites),
+                key=lambda x: (x[:2], int(x[2:])))
+            header = ["星座", "PRN", "信号", "Port1", "Avg1", "Port2", "Avg2",
+                      "Delta", "AvgD", "Port3", "Avg3", "Delta2", "AvgD2"]
+
+            def fmt(v, plus=False):
+                if v is None:
+                    return "--"
+                return f"{v:+.1f}" if plus else f"{v:.1f}"
+
+            with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                f.write(",".join(header) + "\n")
+                for key in all_keys:
+                    s1 = self.port1_satellites.get(key)
+                    s2 = self.port2_satellites.get(key)
+                    s3 = self.port3_satellites.get(key)
+                    a1 = self._port1_snr_avg.get(key)
+                    a2 = self._port2_snr_avg.get(key)
+                    a3 = self._port3_snr_avg.get(key)
+                    ad = self._snr_diff_avg.get(key)
+                    ad2 = self._snr_diff2_avg.get(key)
+                    d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+                    d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+                    signal = (self._port1_snr_signals.get(key)
+                              or self._port2_snr_signals.get(key)
+                              or self._port3_snr_signals.get(key) or '---')
+                    row = [key[:2], key[2:], signal,
+                           fmt(s1), fmt(a1), fmt(s2), fmt(a2),
+                           fmt(d1, plus=True), fmt(ad, plus=True),
+                           fmt(s3), fmt(a3), fmt(d2, plus=True), fmt(ad2, plus=True)]
+                    f.write(",".join(row) + "\n")
+            self.log_info(f"SNR表已导出: {path}")
+            QMessageBox.information(self, "成功", f"SNR表已导出到:\n{path}")
+        except Exception as e:
+            self.log_error(f"导出SNR表失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"无法导出SNR表:\n{str(e)}")
 
     def _open_selftest_dialog(self):
         """一键自检参数对话框（无真实串口, 模拟数据全链路测试）"""
