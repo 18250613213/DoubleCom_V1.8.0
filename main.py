@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import signal
+import time
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -9,7 +10,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QComboBox, QPushButton, QLabel, QTextEdit,
     QMessageBox, QDoubleSpinBox, QSpinBox, QStatusBar,
     QGridLayout, QRadioButton, QButtonGroup, QCheckBox, QTabWidget,
-    QLineEdit, QDialog, QFormLayout,
+    QLineEdit, QDialog, QFormLayout, QProgressBar,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QTextCursor
@@ -367,6 +368,20 @@ class NMEADataAnalyzer(QMainWindow):
         self.update_timer.timeout.connect(self.update_plots)
         self._update_frame_count = 0
         self._last_snr_data = None
+
+        # 数据速率统计（状态栏实时显示 行/s, 便于发现串口断流/卡死）
+        self._rate_counters = {}
+        self._rate_last = {}
+        self._rate_t0 = time.monotonic()
+        self._rate_timer = QTimer()
+        self._rate_timer.setInterval(2000)
+        self._rate_timer.timeout.connect(self._update_rate_label)
+        self._rate_timer.start()
+
+        # 自检进度条UI刷新定时器（自检运行期间启动）
+        self._selftest_ui_timer = QTimer()
+        self._selftest_ui_timer.setInterval(500)
+        self._selftest_ui_timer.timeout.connect(self._on_selftest_ui_tick)
     
     def init_ui(self):
         main_widget = QWidget()
@@ -886,6 +901,24 @@ class NMEADataAnalyzer(QMainWindow):
         sep4.setStyleSheet("color: #666;")
         self.status_bar.addWidget(sep4)
 
+        # 数据速率指示（每2秒刷新, 行/s）
+        self.rate_label = QLabel("速率: 1:-- | 2:-- | 3:-- 行/s")
+        self.rate_label.setStyleSheet("font-size: 12px; color: #666; padding: 0 6px;")
+        self.status_bar.addPermanentWidget(self.rate_label)
+
+        # 自检进度条与取消按钮（自检运行期间可见）
+        self.selftest_progress = QProgressBar()
+        self.selftest_progress.setRange(0, 100)
+        self.selftest_progress.setMaximumWidth(160)
+        self.selftest_progress.setToolTip("自检回放进度（取三路模拟数据最小进度）")
+        self.selftest_progress.setVisible(False)
+        self.status_bar.addPermanentWidget(self.selftest_progress)
+
+        self.selftest_cancel_btn = QPushButton("取消自检")
+        self.selftest_cancel_btn.setToolTip("提前终止自检并按已回放数据生成验证报告")
+        self.selftest_cancel_btn.setVisible(False)
+        self.status_bar.addPermanentWidget(self.selftest_cancel_btn)
+
         self.data_count_label = QLabel("已读取: 0 行")
         self.data_count_label.setStyleSheet("font-size: 12px; color: #666;")
         self.status_bar.addPermanentWidget(self.data_count_label)
@@ -916,6 +949,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.selftest_btn.clicked.connect(self._open_selftest_dialog)
 
         self.auto_log_cb.stateChanged.connect(self._on_auto_log_toggled)
+
+        # 自检取消按钮
+        self.selftest_cancel_btn.clicked.connect(self._cancel_selftest)
 
         # ENU基准模式切换（共享控制）
         self._enu_btn_group = QButtonGroup()
@@ -1091,6 +1127,7 @@ class NMEADataAnalyzer(QMainWindow):
         return value
 
     def handle_data(self, data, port_id=1):
+        self._rate_counters[port_id] = self._rate_counters.get(port_id, 0) + 1
         if port_id == 2:
             self.serial2_save_buffer.append(data)
             self._write_auto_log(2, data)
@@ -3333,11 +3370,45 @@ class NMEADataAnalyzer(QMainWindow):
         if runner.start(minutes_spin.value(), int(speed_combo.currentText()),
                         seed_spin.value(), direction_cb.isChecked()):
             self.selftest_btn.setEnabled(False)
+            self.selftest_progress.setValue(0)
+            self.selftest_progress.setVisible(True)
+            self.selftest_cancel_btn.setEnabled(True)
+            self.selftest_cancel_btn.setVisible(True)
+            self._selftest_ui_timer.start()
         else:
             self._selftest_runner = None
 
+    def _on_selftest_ui_tick(self):
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is not None and runner.is_running():
+            self.selftest_progress.setValue(int(runner.progress() * 100))
+
+    def _cancel_selftest(self):
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is None or not runner.is_running():
+            return
+        self.selftest_cancel_btn.setEnabled(False)
+        runner.cancel()
+
+    def _update_rate_label(self):
+        now = time.monotonic()
+        dt = now - self._rate_t0
+        if dt <= 0:
+            return
+        parts = []
+        for pid in (1, 2, 3):
+            cnt = self._rate_counters.get(pid, 0)
+            rate = (cnt - self._rate_last.get(pid, 0)) / dt
+            self._rate_last[pid] = cnt
+            parts.append(f"{pid}:{rate:.1f}")
+        self._rate_t0 = now
+        self.rate_label.setText(f"速率: {' | '.join(parts)} 行/s")
+
     def _on_selftest_finished(self, ok, results):
         self.selftest_btn.setEnabled(True)
+        self._selftest_ui_timer.stop()
+        self.selftest_progress.setVisible(False)
+        self.selftest_cancel_btn.setVisible(False)
         runner = getattr(self, '_selftest_runner', None)
         report_dir = runner.report_dir if runner is not None else ''
         npass = sum(1 for r in results if r[1])

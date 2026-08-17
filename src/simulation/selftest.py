@@ -30,6 +30,8 @@ class SelfTestRunner(QObject):
         self.headless = headless
         self._running = False
         self._finalized = False
+        self._timeout = False
+        self._cancelled = False
         self._sims = []
         self._finished_sims = 0
         self._dir_started = False
@@ -50,6 +52,28 @@ class SelfTestRunner(QObject):
 
     def is_running(self):
         return self._running
+
+    def progress(self):
+        """三路模拟数据回放的整体进度(0~1, 取最小值)"""
+        if not self._running or not self._sims:
+            return 0.0
+        return min(s.progress() for s in self._sims)
+
+    def cancel(self):
+        """用户手动取消: 停止回放与监控, 按已回放数据生成报告"""
+        if not self._running or self._finalized:
+            return
+        self._cancelled = True
+        self._monitor.stop()
+        for s in self._sims:
+            try:
+                s.disconnect()
+            except Exception:
+                pass
+        if self._dir_started and self.w.direction_stats[0]._active:
+            self.w._toggle_single_direction(0)
+        self.w.log_info("自检被用户取消, 提前结束")
+        QTimer.singleShot(200, self._finalize)
 
     def _fail_start(self, message):
         self.w.log_error(f"一键自检启动被拒绝: {message}")
@@ -75,6 +99,7 @@ class SelfTestRunner(QObject):
         self._running = True
         self._finalized = False
         self._timeout = False
+        self._cancelled = False
         self._dir_started = False
         self._finished_sims = 0
         self._last_quarter = 0
@@ -301,6 +326,10 @@ class SelfTestRunner(QObject):
         lines.append(f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f"- 参数: {self._minutes}分钟 @ {self._speed}x, seed={self._seed}, "
                      f"方向测试={'开' if self._direction else '关'}")
+        if self._cancelled:
+            lines.append("- **注意: 自检被用户手动取消, 数据不完整, 失败项仅反映截断状态**")
+        if getattr(self, '_timeout', False):
+            lines.append("- **注意: 自检超时被看门狗中断, 数据不完整**")
         lines.append(f"- 结果: **{npass}/{len(results)} 项通过**")
         lines.append("")
         lines.append("| 检查项 | 结果 | 说明 |")
