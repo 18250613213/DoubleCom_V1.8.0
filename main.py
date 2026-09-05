@@ -1,3 +1,25 @@
+"""
+DoubleCom - 多串口 GNSS 实时数据分析与抗干扰测试系统
+
+系统核心功能与业务架构:
+  1. 三路串口并发接入与多协议解析:
+     - 串口 1 (基准参考机): 连接未受干扰的高精度接收机，输出厘米级参考坐标，实时解算站心基准。
+     - 串口 2 (干扰测试机 1): 连接受干扰设备/抗干扰天线 1，实时评估干扰下的定位跳变、失锁与 SNR 衰减。
+     - 串口 3 (干扰测试机 2): 连接对比设备/抗干扰天线 2，支持双干扰天线横向比对或多频点对比测试。
+     - 协议兼容: 支持 NMEA-0183 文本语句 (GGA, RMC, GSV, GSA) 与 u-blox 二进制 UBX 协议 (NAV-STATUS)。
+  2. 坐标转换与 ENU 局部站心误差解算:
+     - 将三维大地经纬高坐标 (WGS84 LLA) 转换为地心地固直角坐标 (ECEF)。
+     - 结合基准原点，通过正交投影矩阵实时投影至站心局部坐标系 (East, North, Up)。
+  3. 智能抗尖峰异常值动态剔除算法 (Outlier Rejection):
+     - 基于定长滑动窗口递推维护标准差 (1-Sigma)，通过动态 8-Sigma 阈值拦截因多径或干扰造成的虚假野值。
+  4. 四方向转台抗干扰测试与自动启停:
+     - 支持在 4 个测试角度（0°/90°/180°/270°）下独立统计历元数、定位成功率、水平/高程极值与均值。
+     - 支持基于时间（秒）或历元数（点数）的自动停止条件。
+  5. 自动化测试报告导出:
+     - 一键渲染高质量 ENU 轨迹图、误差分布散点图，生成包含详细指标的 Markdown、HTML 及 PDF 报告。
+  6. 内置全仿真闭环一键自检引擎 (Self-Test Engine)。
+"""
+
 import sys
 import os
 import math
@@ -12,11 +34,11 @@ from PyQt5.QtWidgets import (
     QGridLayout, QRadioButton, QButtonGroup, QCheckBox, QTabWidget,
     QLineEdit, QDialog, QFormLayout, QProgressBar,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
+    QFrame, QStyledItemDelegate, QStyle, QMenu, QAction,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QTextCursor
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QRect, QRectF
+from PyQt5.QtGui import QTextCursor, QTextDocument, QPainter, QColor, QFont, QPen, QBrush, QIcon
 from PyQt5.QtPrintSupport import QPrinter
-from PyQt5.QtGui import QTextDocument
 import re
 
 import pyqtgraph as pg
@@ -33,6 +55,8 @@ from src.protocol.ubx_parser import parse_ubx_frame
 from collections import deque
 
 
+# --- NMEA 4.10+ 标准各导航系统信号频点编号到名称的映射表 ---
+# 字典键: 'G'(GPS), 'R'(GLONASS), 'E'(Galileo), 'B'(BeiDou)
 SIGNAL_NAMES = {
     'G': {0: 'ALL', 1: 'L1C', 2: 'L1P', 3: 'L1M', 4: 'L2P', 5: 'L2C', 6: 'L2C', 7: 'L5I', 8: 'L5Q'},
     'R': {0: 'ALL', 1: 'G1C', 2: 'G1P', 3: 'G2C', 4: 'G2P'},
@@ -40,25 +64,58 @@ SIGNAL_NAMES = {
     'B': {0: 'ALL', 1: 'B1I', 2: 'B1Q', 3: 'B1C', 4: 'B1A', 5: 'B2A', 6: 'B2B', 7: 'B2AB', 8: 'B3', 9: 'B3Q', 10: 'B3A', 11: 'B2I', 12: 'B2Q'},
 }
 
+# NMEA Talker ID 标识符到系统单字符代号的映射表
 TALKER_TO_SYSTEM = {
-    'GP': 'G', 'GL': 'R', 'GA': 'E', 'GB': 'B', 'BD': 'B', 'GN': 'G',
+    'GP': 'G',  # GPS
+    'GL': 'R',  # GLONASS
+    'GA': 'E',  # Galileo
+    'GB': 'B',  # BeiDou
+    'BD': 'B',  # BeiDou (旧版前缀)
+    'GN': 'G',  # 联合/默认归入 GPS 显示
 }
 
-APP_VERSION = "1.7.1"
+# 当前系统软件发布版本号
+APP_VERSION = "1.8.0"
 
 
+# --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
+WGS84_A = 6378137.0             # 椭球长半轴 (Semi-major axis, 米)
+WGS84_F = 1.0 / 298.257223563   # 椭球扁率 (Flattening)
+WGS84_E2 = 2 * WGS84_F - WGS84_F * WGS84_F  # 第一偏心率平方 (First Eccentricity Squared: e^2 = 2f - f^2)
 
-# WGS84 ellipsoid constants (used in LLA-to-ECEF-to-ENU conversion)
-WGS84_A = 6378137.0          # semi-major axis (meters)
-WGS84_F = 1.0 / 298.257223563  # flattening
-WGS84_E2 = 2 * WGS84_F - WGS84_F * WGS84_F  # first eccentricity squared
+
 class SlidingWindowStd:
+    """
+    定长滑动窗口均值与标准差增量计算器。
+
+    算法原理:
+      采用双端队列 (deque) 维护定长窗口 (window_size)。
+      通过增量维护窗口元素和 sum 与平方和 sum_sq:
+        - 当窗口满时，移除最老元素 old: sum -= old, sum_sq -= old^2
+        - 压入新元素 new: sum += new, sum_sq += new^2
+      计算方差:
+        Var = (sum_sq / n) - (sum / n)^2
+      使得每次添加新数值时，均值与标准差的计算开销均为 O(1) 时间复杂度，
+      极大降低高频刷新下的 CPU 占用。
+    """
     def __init__(self, window_size=200):
+        """
+        初始化滑动窗口。
+
+        参数:
+            window_size (int): 滑动窗口最大容量点数，默认 200。
+        """
         self._window = deque(maxlen=window_size)
         self._sum = 0.0
         self._sum_sq = 0.0
 
     def add(self, value):
+        """
+        向滑动窗口追加一个样本值，并在 O(1) 时间内更新一阶和与平方和。
+
+        参数:
+            value (float): 新输入的测量值。
+        """
         if len(self._window) == self._window.maxlen:
             old = self._window[0]
             self._sum -= old
@@ -68,12 +125,19 @@ class SlidingWindowStd:
         self._sum_sq += value * value
 
     def reset(self):
+        """清空窗口队列及累加和。"""
         self._window.clear()
         self._sum = 0.0
         self._sum_sq = 0.0
 
     @property
     def mean(self):
+        """
+        获取当前窗口内样本的平均值。
+
+        返回:
+            float: 窗口均值；无数据时返回 0.0。
+        """
         n = len(self._window)
         if n == 0:
             return 0.0
@@ -81,6 +145,12 @@ class SlidingWindowStd:
 
     @property
     def std(self):
+        """
+        获取当前窗口内样本的总体标准差。
+
+        返回:
+            float: 总体标准差 (Sigma)；若样本量少于 3 则返回 0.0（避免起步抖动假象）。
+        """
         n = len(self._window)
         if n < 3:
             return 0.0
@@ -89,14 +159,30 @@ class SlidingWindowStd:
         return math.sqrt(max(variance, 0.0))
 
     def __len__(self):
+        """返回当前窗口内已有样本数量。"""
         return len(self._window)
 
 
 class RunningAverage:
+    """
+    多键值增量递推平均值跟踪器 (Welford 递推均值算法)。
+
+    用于长周期平滑跟踪各颗卫星的载噪比 (SNR) 均值或信噪比差异 (Delta SNR)。
+    无需在内存中保存历史测量数组即可实现稳定的在线均值更新:
+      avg_n = avg_{n-1} + (x_n - avg_{n-1}) / n
+    """
     def __init__(self):
+        """初始化存储字典。"""
         self._data = {}
 
     def add(self, key, value):
+        """
+        向指定标识键录入一个新观测值并递推更新均值。
+
+        参数:
+            key (any): 跟踪对象标识键 (如 (talker_id, prn))。
+            value (float): 新观测值。
+        """
         if key not in self._data:
             self._data[key] = {'avg': float(value), 'n': 1}
         else:
@@ -105,88 +191,256 @@ class RunningAverage:
             d['avg'] += (value - d['avg']) / d['n']
 
     def get(self, key):
+        """
+        获取指定键的当前平滑平均值。
+
+        返回:
+            float 或 None: 存在则返回均值，不存在则返回 None。
+        """
         if key in self._data:
             return self._data[key]['avg']
         return None
 
     def values(self):
+        """
+        导出所有键当前均值的纯键值字典。
+
+        返回:
+            dict: {key: avg_val, ...}
+        """
         return {key: d['avg'] for key, d in self._data.items()}
 
-    def reset(self):
-        self._data.clear()
+class NumericTableWidgetItem(QTableWidgetItem):
+    """
+    支持真数值排序与缺失值吸底的表格单元项。
+    
+    标准 QTableWidgetItem 默认基于文本进行字典序排序 (例如 "2.0" 会排在 "10.0" 之后)。
+    本类重载 __lt__，优先通过 Qt.UserRole 取出原始浮点数值进行大小比较，
+    并能够感知表头排序方向 (升序/降序)，无论何种排序方式均将未锁定的缺失值 ('--') 稳定吸底置后。
+    """
+    def __init__(self, text="", value=None):
+        super().__init__(text)
+        if value is not None:
+            self.setData(Qt.UserRole, float(value))
+
+    def __lt__(self, other):
+        v1 = self.data(Qt.UserRole)
+        v2 = other.data(Qt.UserRole) if isinstance(other, QTableWidgetItem) else None
+        
+        # 两个都是有效浮点数时，直接按数值大小比较
+        if v1 is not None and v2 is not None:
+            try:
+                return float(v1) < float(v2)
+            except (ValueError, TypeError):
+                pass
+                
+        # 获取当前表格排序方向（升序或降序）
+        table = self.tableWidget()
+        is_descending = False
+        if table and table.horizontalHeader():
+            is_descending = (table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder)
+            
+        # 保证 None (即 '--' 缺失值) 无论升序还是降序永远排列在表格最底部
+        if v1 is None and v2 is not None:
+            return True if is_descending else False
+        if v1 is not None and v2 is None:
+            return False if is_descending else True
+            
+        return super().__lt__(other)
+
+
+class SNRBarDelegate(QStyledItemDelegate):
+    """
+    卫星载噪比表格原生绘制委托 (u-center 仪器级视觉风格)。
+    
+    功能特性:
+    1. 瞬时载噪比列 (COM1/COM2/COM3 瞬时):
+       - 左侧显示精准浮点数字 (dB-Hz)；
+       - 右侧自绘微型色阶进度柱 (0~50 dB-Hz，绿/青/黄/橙/红五阶平滑过渡)。
+    2. 恶化差值列 (Δ2-1, Δ3-1):
+       - 按受干扰衰减深度分级填充警示背景色 (|Δ|≥15dB 告警红, |Δ|≥10dB 预警橙)；
+       - 关键恶化卫星 PRN 与数值加粗高亮。
+    3. 全局暗黑主题与高对比度斑马纹，彻底消除文本重绘闪烁。
+    """
+    def paint(self, painter, option, index):
+        painter.save()
+        val = index.data(Qt.UserRole)
+        txt = index.data(Qt.DisplayRole) or ""
+        col = index.column()
+        rect = option.rect
+        
+        # 1. 确定单元格背景色
+        custom_bg = index.data(Qt.BackgroundRole)
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(rect, QColor("#45475a"))
+        elif custom_bg:
+            painter.fillRect(rect, QColor(custom_bg) if not isinstance(custom_bg, QColor) else custom_bg)
+        else:
+            # 深色斑马纹背景
+            row_bg = QColor("#1e1e2e") if index.row() % 2 == 0 else QColor("#181825")
+            painter.fillRect(rect, row_bg)
+            
+        # 2. 针对 SNR 瞬时值列 (列 3, 5, 9): 绘制数字 + 微型横向进度条
+        if col in (3, 5, 9) and val is not None and isinstance(val, (int, float)) and val > 0:
+            # 文本区（左侧留白）
+            text_rect = QRect(rect.left() + 2, rect.top(), rect.width() - 54, rect.height())
+            text_color = index.data(Qt.ForegroundRole) or QColor("#cdd6f4")
+            painter.setPen(QColor(text_color) if not isinstance(text_color, QColor) else text_color)
+            painter.setFont(QFont("Consolas", 11))
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignRight, txt)
+            
+            # 微型进度条槽（右侧 44px 宽，9px 高）
+            bar_w = 44
+            bar_h = 9
+            bar_x = rect.right() - bar_w - 5
+            bar_y = rect.top() + (rect.height() - bar_h) // 2
+            
+            # 槽底色
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#313244"))
+            painter.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
+            
+            # 进度填充 (满量程 50 dB-Hz)
+            fill_ratio = max(0.0, min(1.0, float(val) / 50.0))
+            fill_w = int(bar_w * fill_ratio)
+            if fill_w > 0:
+                if val >= 42:
+                    bar_color = QColor("#a6e3a1")  # 优良 (绿)
+                elif val >= 36:
+                    bar_color = QColor("#94e2d5")  # 良好 (青)
+                elif val >= 30:
+                    bar_color = QColor("#f9e2af")  # 一般 (黄)
+                elif val >= 24:
+                    bar_color = QColor("#fab387")  # 较差 (橙)
+                else:
+                    bar_color = QColor("#f38ba8")  # 恶劣 (红)
+                painter.setBrush(bar_color)
+                painter.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 3, 3)
+                
+        # 3. 针对星座徽章列 (列 0): 绘制圆角徽章胶囊
+        elif col == 0 and txt:
+            badge_bg = index.data(Qt.BackgroundRole)
+            if not badge_bg:
+                badge_bg = QColor("#89b4fa")
+            badge_rect = QRect(rect.left() + (rect.width() - 52) // 2, rect.top() + (rect.height() - 22) // 2, 52, 22)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(badge_bg) if not isinstance(badge_bg, QColor) else badge_bg)
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            
+            painter.setPen(QColor("#11111b"))
+            font = QFont("Consolas", 10, QFont.Bold)
+            painter.setFont(font)
+            painter.drawText(badge_rect, Qt.AlignCenter, txt)
+            
+        # 4. 其余常规单元格绘制
+        else:
+            text_color = index.data(Qt.ForegroundRole)
+            painter.setPen(QColor(text_color) if isinstance(text_color, (str, QColor)) else QColor("#cdd6f4"))
+            
+            font = index.data(Qt.FontRole)
+            if font:
+                painter.setFont(font)
+            else:
+                painter.setFont(QFont("Consolas", 11))
+                
+            align = index.data(Qt.TextAlignmentRole) or (Qt.AlignVCenter | Qt.AlignCenter)
+            padded_rect = QRect(rect.left() + 4, rect.top(), rect.width() - 8, rect.height())
+            painter.drawText(padded_rect, align, txt)
+            
+        painter.restore()
 
 
 class NMEADataAnalyzer(QMainWindow):
+    """
+    NMEA 数据实时分析与抗干扰测试主窗口界面类。
+    
+    集成了多路串口通信、多协议解码、三维站心坐标转换、异常值拦截、方向测试与报表导出等全部业务功能。
+    """
     
     def __init__(self):
+        """初始化主窗口组件、数据结构、内部算法模块与定时器。"""
         super().__init__()
         self.setWindowTitle(f"NMEA 数据实时分析系统 V{APP_VERSION}")
         self.setGeometry(100, 100, 1500, 1000)
         self.showMaximized()
-        
-        # 初始化独立模块
-        self.gga_parser = NMEAGGAParser()
-        self.nmea_parser = NMEAParser()
-        self.statistics = MultiDimensionStatistics()
 
-        # 方向测试统计（4个方向，针对串口2干扰测试口）
+        # 加载并设置程序窗口图标
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'app_icon.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        # 1. 核心独立算法与解析模块初始化
+        # ----------------------------------------------------
+        self.gga_parser = NMEAGGAParser()                     # GGA 专用解析器
+        self.nmea_parser = NMEAParser()                       # 串口 1 主 NMEA 解析器
+        self.statistics = MultiDimensionStatistics()          # 定位误差多维统计累加器
+
+        # ----------------------------------------------------
+        # 2. 四方向转台测试状态与统计对象 (串口2 与 串口3)
+        # ----------------------------------------------------
+        # 串口 2 方向测试统计对象 (索引 0~3 对应 4 个测试角度，如 0°/90°/180°/270°)
         self.direction_stats = [DirectionStatistics() for _ in range(4)]
-        self._dir_enu_active_index = -1
-        self._dir_auto_stop_enabled = False
-        self._dir_auto_stop_sec = 300
-        self._dir_auto_stop_epochs = 300
-        # [新增] 串口3方向测试统计
+        self._dir_enu_active_index = -1                       # 当前正在测试的方向索引 (-1 表示未激活)
+        self._dir_auto_stop_enabled = False                   # 是否开启达到阈值后自动停止
+        self._dir_auto_stop_sec = 300                         # 自动停止时长门限 (默认 300 秒)
+        self._dir_auto_stop_epochs = 300                      # 自动停止历元数门限 (默认 300 点)
+
+        # 串口 3 方向测试统计对象
         self.direction_stats3 = [DirectionStatistics() for _ in range(4)]
-        self._dir3_enu_active_index = -1
-        self._dir3_auto_stop_enabled = False
-        self._dir3_auto_stop_sec = 300
-        self._dir3_auto_stop_epochs = 300
-        self._latest_enu2_east = 0.0
-        self._latest_enu2_north = 0.0
-        self._latest_enu2_up = 0.0
-        # [新增] 串口3最新ENU值
-        self._latest_enu3_east = 0.0
-        self._latest_enu3_north = 0.0
-        self._latest_enu3_up = 0.0
+        self._dir3_enu_active_index = -1                      # 串口 3 当前激活方向索引
+        self._dir3_auto_stop_enabled = False                  # 串口 3 自动停止开关
+        self._dir3_auto_stop_sec = 300                        # 串口 3 自动停止时长
+        self._dir3_auto_stop_epochs = 300                     # 串口 3 自动停止历元数
 
-        self._p2_gga_new_epoch = False
-        self._latest_p2_quality = 0
-        # [新增] 串口3相关GGA标记
-        self._p3_gga_new_epoch = False
-        self._latest_p3_quality = 0
+        # 最新历元解算出的 ENU 误差实时值 (米)
+        self._latest_enu2_east = 0.0                          # 串口 2 最新东向误差
+        self._latest_enu2_north = 0.0                         # 串口 2 最新北向误差
+        self._latest_enu2_up = 0.0                            # 串口 2 最新天向误差
+        self._latest_enu3_east = 0.0                          # 串口 3 最新东向误差
+        self._latest_enu3_north = 0.0                         # 串口 3 最新北向误差
+        self._latest_enu3_up = 0.0                            # 串口 3 最新天向误差
 
-        # GPS时间跟踪
-        self.gps_week = 0
-        self.gps_sow = 0.0  # seconds of week
+        # 新历元到达标志与定位质量
+        self._p2_gga_new_epoch = False                        # 串口 2 新 GGA 历元就绪标记
+        self._latest_p2_quality = 0                           # 串口 2 最新定位质量
+        self._p3_gga_new_epoch = False                        # 串口 3 新 GGA 历元就绪标记
+        self._latest_p3_quality = 0                           # 串口 3 最新定位质量
 
-        # 双串口卫星信噪比数据
-        self.port1_satellites = {}  # {prn: {'snr': snr, 'system': sys}}
-        self.port2_satellites = {}  # {prn: {'snr': snr, 'system': sys}}
+        # GPS 时间跟踪
+        self.gps_week = 0                                     # 当前 GPS 星期数
+        self.gps_sow = 0.0                                    # 当前 GPS 周内秒 (Seconds of Week)
+
+        # ----------------------------------------------------
+        # 3. 多串口卫星信噪比 (SNR/CN0) 实时与历史数据
+        # ----------------------------------------------------
+        self.port1_satellites = {}  # 串口1当前可视星字典: {prn: {'snr': snr, 'system': sys}}
+        self.port2_satellites = {}  # 串口2当前可视星字典: {prn: {'snr': snr, 'system': sys}}
         self._port1_snr_signals = {}
         self._port2_snr_signals = {}
-        # [新增] 串口3卫星信噪比数据
-        self.port3_satellites = {}
+        self.port3_satellites = {}  # 串口3当前可视星字典
         self._port3_snr_signals = {}
 
-        # ENU 误差基准点 - 串口1 (无干扰)
-        self.enu1_ref_point = None
-        self.enu1_buffer = []
-        self.enu1_buffer_size = 100
-        self.enu1_ref_ready = False
-        self.enu_auto_mode = True
-        self.enu_instant_mode = False
-        self.enu1_times = []
-        self.enu1_east_data = []
-        self.enu1_north_data = []
-        self.enu1_up_data = []
+        # ----------------------------------------------------
+        # 4. ENU 误差计算基准参考点与时间序列缓存
+        # ----------------------------------------------------
+        # 串口 1 (基准参考机，无干扰)
+        self.enu1_ref_point = None                            # 基准点大地坐标 (lat, lon, alt)
+        self.enu1_buffer = []                                 # 启动阶段用于取平滑均值的坐标缓冲池
+        self.enu1_buffer_size = 100                           # 自动基准点采集历元数 (100 点约 100 秒)
+        self.enu1_ref_ready = False                           # 基准参考点是否已锁定就绪
+        self.enu_auto_mode = True                             # 是否为自动计算基准点模式 (True=自动均值, False=手动输入)
+        self.enu_instant_mode = False                         # 是否为即时瞬态基准点模式
+        self.enu1_times = []                                  # 串口 1 绘图时间戳数组
+        self.enu1_east_data = []                              # 串口 1 东向误差数组
+        self.enu1_north_data = []                             # 串口 1 北向误差数组
+        self.enu1_up_data = []                                # 串口 1 天向误差数组
 
-        # [新增] COM3 独立的 ENU1 副本（串口3 VS 串口1对比用）
+        # 串口 3 专用的串口 1 历史副本 (避免串口2与串口3绘制对比图时时间轴相互污染)
         self.enu1_3_times = []
         self.enu1_3_east_data = []
         self.enu1_3_north_data = []
         self.enu1_3_up_data = []
 
-        # ENU 误差基准点 - 串口2 (干扰测试)
+        # 串口 2 (干扰测试机 1)
         self.enu2_ref_point = None
         self.enu2_buffer = []
         self.enu2_buffer_size = 100
@@ -196,7 +450,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu2_north_data = []
         self.enu2_up_data = []
 
-        # [新增] ENU 误差基准点 - 串口3 (干扰测试2)
+        # 串口 3 (干扰测试机 2)
         self.enu3_ref_point = None
         self.enu3_buffer = []
         self.enu3_buffer_size = 100
@@ -206,102 +460,101 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu3_north_data = []
         self.enu3_up_data = []
 
-        self.ENU_STD_WINDOW = 200
+        # ----------------------------------------------------
+        # 5. 异常值动态检测与剔除参数 (Outlier Filter)
+        # ----------------------------------------------------
+        self.ENU_STD_WINDOW = 200                             # 滑动标准差计算窗口宽度 (点数)
+        self.ENU_OUTLIER_SIGMA = 8.0                          # 离群值判定倍数 (偏差 > 8*Sigma 触发候选)
+        self.ENU_OUTLIER_MIN_DELTA = 5.0                      # 最小绝对偏差门限 (偏差必须同时 > 5.0 米才剔除，防止静止极小标准差误杀)
+        self.ENU_OUTLIER_MIN_SAMPLES = 30                     # 滑动窗口最少起步样本数 (不足 30 点时不执行剔除)
+        self._enu2_outlier_count = 0                          # 串口 2 累计剔除异常点计数
+        self._enu3_outlier_count = 0                          # 串口 3 累计剔除异常点计数
 
-        # ENU异常值剔除参数
-        self.ENU_OUTLIER_SIGMA = 8.0
-        self.ENU_OUTLIER_MIN_DELTA = 5.0
-        self.ENU_OUTLIER_MIN_SAMPLES = 30
-        self._enu2_outlier_count = 0
-        # [新增] 串口3异常值计数
-        self._enu3_outlier_count = 0
-
-        # ENU数据数组上限（4Hz × 1800s = 7200点，约30分钟）
+        # 绘图曲线最大缓存点数 (4Hz × 1800s = 7200点，保留约 30 分钟连续轨迹)
         self.ENU_MAX_POINTS = 7200
 
-        # 滑动窗口标准差计算器（O(1)递推，替代 _running_std 的O(n)遍历）
+        # 各轴滑动窗口标准差计算器 (基于 SlidingWindowStd 实现 O(1) 递推)
         self._std_enu1_east = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu1_north = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu1_up = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu2_east = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu2_north = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu2_up = SlidingWindowStd(self.ENU_STD_WINDOW)
-        # [新增] 串口3滑动窗口标准差
         self._std_enu3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
-
-        # [新增] COM3 独立 ENU1 滑动标准差
+        self._std_enu3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu1_3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu1_3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
         self._std_enu1_3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
-        self._std_enu3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
 
-        # 卫星信噪比递推平均值跟踪
-        self._port1_snr_avg = RunningAverage()
-        self._port2_snr_avg = RunningAverage()
-        self._snr_diff_avg = RunningAverage()
-        self._last_port1_snr = {}
-        self._last_port2_snr = {}
-        self._last_snr_diff = {}
-        # [新增] 串口3信噪比递推均值和差异跟踪
-        self._port3_snr_avg = RunningAverage()
+        # ----------------------------------------------------
+        # 6. 卫星信噪比平滑均值与差值跟踪器
+        # ----------------------------------------------------
+        self._port1_snr_avg = RunningAverage()                # 串口 1 单星 SNR 长期递推均值
+        self._port2_snr_avg = RunningAverage()                # 串口 2 单星 SNR 长期递推均值
+        self._snr_diff_avg = RunningAverage()                 # 串口 2 VS 串口 1 SNR 差值均值
+        self._last_port1_snr = {}                             # 串口 1 上一历元单星 SNR 快照
+        self._last_port2_snr = {}                             # 串口 2 上一历元单星 SNR 快照
+        self._last_snr_diff = {}                              # 上一历元差值快照
+        self._port3_snr_avg = RunningAverage()                # 串口 3 单星 SNR 递推均值
         self._last_port3_snr = {}
-        self._snr_diff2_avg = RunningAverage()  # Port3 vs Port1 差值平均值
+        self._snr_diff2_avg = RunningAverage()                # 串口 3 VS 串口 1 SNR 差值均值
         self._last_snr_diff2 = {}
 
-        # 双串口GGA简明数据
-        self.port1_gga = None
-        self.port2_gga = None
-        self.p1_gga_nsat = 0
-        self.p2_gga_nsat = 0
-        self.p1_utc_ts = ""
-        self.p2_utc_ts = ""
-        # [新增] 串口3 GGA简明数据
-        self.port3_gga = None
-        self.p3_gga_nsat = 0
-        self.p3_utc_ts = ""
+        # ----------------------------------------------------
+        # 7. 简明 GGA 定位状态与 TTFF
+        # ----------------------------------------------------
+        self.port1_gga = None                                 # 串口 1 最新 GGA 简明字典
+        self.port2_gga = None                                 # 串口 2 最新 GGA 简明字典
+        self.port3_gga = None                                 # 串口 3 最新 GGA 简明字典
+        self.p1_gga_nsat = 0                                  # 串口 1 可用卫星数
+        self.p2_gga_nsat = 0                                  # 串口 2 可用卫星数
+        self.p3_gga_nsat = 0                                  # 串口 3 可用卫星数
+        self.p1_utc_ts = ""                                   # 串口 1 UTC 时间文本
+        self.p2_utc_ts = ""                                   # 串口 2 UTC 时间文本
+        self.p3_utc_ts = ""                                   # 串口 3 UTC 时间文本
 
-        self.p1_ttff_s = 0.0
-        self.p2_ttff_s = 0.0
-        # [新增] 串口3 TTFF
-        self.p3_ttff_s = 0.0
+        self.p1_ttff_s = 0.0                                  # 串口 1 首次定位时间 (秒)
+        self.p2_ttff_s = 0.0                                  # 串口 2 首次定位时间 (秒)
+        self.p3_ttff_s = 0.0                                  # 串口 3 首次定位时间 (秒)
 
-        # 双串口NMEA解析器
-        self.nmea_parser2 = NMEAParser()  # 串口2专用解析器
-        # [新增] 串口3专用NMEA解析器
-        self.nmea_parser3 = NMEAParser()
+        # 独立串口 NMEA 状态机解析器实例
+        self.nmea_parser2 = NMEAParser()                      # 串口 2 专用解析器
+        self.nmea_parser3 = NMEAParser()                      # 串口 3 专用解析器
 
-        # 保存最新GGA数据（用于改正数计算）
+        # 改正数计算缓存
         self.last_gga_data = None
         self.last_smoothed_data = None
 
-        # 其他组件
+        # ----------------------------------------------------
+        # 8. 通信管理器与内存保护循环队列
+        # ----------------------------------------------------
         self.current_parser = None
         self.current_data_source = None
-        self._selftest_runner = None
-        self.serial_port1 = SerialManager(port_id=1)
-        self.serial_port2 = SerialManager(port_id=2)
-        # [新增] 串口3管理器
-        self.serial_port3 = SerialManager(port_id=3)
+        self._selftest_runner = None                          # 自检执行器实例
+        self.serial_port1 = SerialManager(port_id=1)          # 串口 1 通信管理器
+        self.serial_port2 = SerialManager(port_id=2)          # 串口 2 通信管理器
+        self.serial_port3 = SerialManager(port_id=3)          # 串口 3 通信管理器
 
-        # 串口数据缓存（设上限防止内存无限增长）
+        # 串口数据缓存（限制容量上限为 40000 行，约可缓存数小时，防止无节制占用系统内存）
         self.serial_save_buffer = deque(maxlen=40000)
         self.serial2_save_buffer = deque(maxlen=40000)
-        # [新增] 串口3数据缓存
         self.serial3_save_buffer = deque(maxlen=40000)
         self.MAX_SERIAL_BUFFER = 40000
         
-        # 自动日志保存
+        # ----------------------------------------------------
+        # 9. 原始数据自动日志落盘配置
+        # ----------------------------------------------------
         self.auto_log_enabled = True
         self.auto_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
         os.makedirs(self.auto_log_dir, exist_ok=True)
-        self._log_file1 = None
-        self._log_file2 = None
-        # [新增] 串口3日志文件
-        self._log_file3 = None
+        self._log_file1 = None                                # 串口 1 自动日志句柄
+        self._log_file2 = None                                # 串口 2 自动日志句柄
+        self._log_file3 = None                                # 串口 3 自动日志句柄
         self._log_flush_count = 0
-        self._LOG_FLUSH_INTERVAL = 50
+        self._LOG_FLUSH_INTERVAL = 50                         # 每写入 50 行强制刷新一次系统磁盘缓冲
         self._data_count_update = 0
+        self._DATA_COUNT_INTERVAL = 10
         self._DATA_COUNT_INTERVAL = 10
         
         self.setStyleSheet("""
@@ -385,50 +638,294 @@ class NMEADataAnalyzer(QMainWindow):
         self._selftest_ui_timer.timeout.connect(self._on_selftest_ui_tick)
     
     def init_ui(self):
+        """
+        初始化主程序图形用户界面 (GUI)
+        
+        采用现代化 QTabWidget 多标签页架构，包含以下核心子页面与功能区：
+        1. 表格视图 (table_tab)：实时展示 GSV 载噪比 (SNR) 矩阵对比与原始数据滚动预览；
+        2. 功能与控制面板 (control_tab)：
+           - 3 串口统一配置与连接控制网格 (COM1/COM2/COM3)；
+           - 3 串口实时 GGA 定位状态卡片 (UTC/经纬高/解状态/星数/TTFF)；
+           - 全局 ENU 空间直角坐标基准源配置区 (自动基准 / 动态瞬时 / 手动输入)；
+           - 3 路实时 ENU 误差显示与滑动窗口标准差统计；
+           - 系统运行与调试日志窗口；
+           - 实验测试基本信息录入 (地点/型号/天线阵列/干扰模式/方位/高度)；
+           - 全局控制按钮栏 (清空/重置/日志导出/多路报告导出/一键全链路自检)；
+        3. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
+        4. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
+        5. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
+        6. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
+        """
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
         
-        # 创建QTabWidget框架
+        # 创建QTabWidget框架，承载多维业务分析与控制视图
         self.tab_widget = QTabWidget()
         
-        # ========== 标签1：表格视图 ==========
+        # =========================================================================
+        # 标签页 1：表格视图 (GSV 载噪比对比矩阵看板 + 原始语句数据监视)
+        # =========================================================================
         table_tab = QWidget()
         table_layout = QVBoxLayout(table_tab)
+        table_layout.setSpacing(6)
         
-        # 卫星信噪比数据 (GSV实时)
-        snr_box = QGroupBox("卫星信噪比数据 (GSV) — 实时更新")
+        # -------------------------------------------------------------------------
+        # 1. 顶部卫星态势摘要看板 (4 项核心 KPI Cards)
+        # -------------------------------------------------------------------------
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(10)
+
+        def _create_kpi_card(title_text, val_text="--", val_color="#89b4fa"):
+            frame = QFrame()
+            frame.setStyleSheet("""
+                QFrame {
+                    background-color: #1e1e2e;
+                    border: 1px solid #313244;
+                    border-radius: 6px;
+                }
+            """)
+            lay = QVBoxLayout(frame)
+            lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(4)
+            t_lbl = QLabel(title_text)
+            t_lbl.setStyleSheet("font-size: 13px; color: #a6adc8; font-weight: bold;")
+            v_lbl = QLabel(val_text)
+            v_lbl.setStyleSheet(f"font-size: 17px; color: {val_color}; font-weight: bold; font-family: Consolas, 'Segoe UI', monospace;")
+            lay.addWidget(t_lbl)
+            lay.addWidget(v_lbl)
+            return frame, v_lbl
+
+        kpi_card1, self.kpi_tracked_label = _create_kpi_card("跟踪星数 (P1 / P2 / P3)", "-- / -- / -- 颗", "#a6e3a1")
+        kpi_card2, self.kpi_avgsnr_label = _create_kpi_card("平均载噪比 (P1 / P2 / P3)", "-- / -- / -- dB", "#89b4fa")
+        kpi_card3, self.kpi_warn_label = _create_kpi_card("受干扰恶化星数 (|Δ| ≥ 10dB)", "-- 颗 (占比 --%)", "#fab387")
+        kpi_card4, self.kpi_maxdrop_label = _create_kpi_card("最大受扰压制深度", "--", "#f38ba8")
+
+        kpi_row.addWidget(kpi_card1)
+        kpi_row.addWidget(kpi_card2)
+        kpi_row.addWidget(kpi_card3)
+        kpi_row.addWidget(kpi_card4)
+        table_layout.addLayout(kpi_row)
+
+        # -------------------------------------------------------------------------
+        # 2. 交互式多维过滤工具栏 (Toolbar)
+        # -------------------------------------------------------------------------
+        snr_box = QGroupBox("卫星信噪比 (GSV) 载噪比矩阵对比看板")
+        snr_box.setStyleSheet("""
+            QGroupBox {
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #bdc3c7;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 12px;
+                color: #2c3e50;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 10px;
+                background-color: #ecf0f1;
+                border-radius: 3px;
+                color: #1a252f;
+                font-size: 14px;
+                font-weight: bold;
+            }
+        """)
         snr_layout = QVBoxLayout(snr_box)
-        snr_btn_row = QHBoxLayout()
+        snr_layout.setContentsMargins(6, 8, 6, 6)
+        snr_layout.setSpacing(6)
+
+        toolbar_row = QHBoxLayout()
+        toolbar_row.setSpacing(6)
+
+        # 星座过滤单选按钮组
+        lbl_filter = QLabel("星座筛选:")
+        lbl_filter.setStyleSheet("font-size: 15px; font-weight: bold;")
+        toolbar_row.addWidget(lbl_filter)
+        self.snr_filter_group = QButtonGroup(self)
+        self.snr_filter_all = QPushButton("全部")
+        self.snr_filter_bds = QPushButton("🇨🇳 北斗(BDS)")
+        self.snr_filter_gps = QPushButton("🇺🇸 GPS")
+        self.snr_filter_gal = QPushButton("🇪🇺 Galileo")
+        self.snr_filter_glo = QPushButton("🇷🇺 GLONASS")
+
+        filter_btn_style = """
+            QPushButton {
+                padding: 5px 12px; font-size: 13px; border: 1px solid #45475a;
+                border-radius: 4px; background-color: #313244; color: #cdd6f4;
+            }
+            QPushButton:checked {
+                background-color: #89b4fa; color: #11111b; font-weight: bold; border-color: #89b4fa;
+            }
+            QPushButton:hover:!checked {
+                background-color: #45475a;
+            }
+        """
+        for idx, btn in enumerate([self.snr_filter_all, self.snr_filter_bds, self.snr_filter_gps, self.snr_filter_gal, self.snr_filter_glo]):
+            btn.setCheckable(True)
+            btn.setStyleSheet(filter_btn_style)
+            self.snr_filter_group.addButton(btn, idx)
+            toolbar_row.addWidget(btn)
+        self.snr_filter_all.setChecked(True)
+
+        toolbar_row.addSpacing(10)
+
+        # 仅显示受扰恶化星复选框
+        self.snr_filter_warn_cb = QCheckBox("仅显示受扰星 (|Δ| ≥ 10 dB)")
+        self.snr_filter_warn_cb.setStyleSheet("font-weight: bold; color: #fab387; font-size: 15px;")
+        toolbar_row.addWidget(self.snr_filter_warn_cb)
+
+        toolbar_row.addSpacing(10)
+
+        # PRN 快速搜索框
+        self.snr_search_edit = QLineEdit()
+        self.snr_search_edit.setPlaceholderText("搜索 PRN (如 01, 03)...")
+        self.snr_search_edit.setMaximumWidth(160)
+        self.snr_search_edit.setStyleSheet("padding: 4px 8px; font-size: 13px; border: 1px solid #45475a; border-radius: 4px; background: white;")
+        toolbar_row.addWidget(self.snr_search_edit)
+
+        toolbar_row.addStretch()
+
+        # CSV 导出按钮
         self.export_snr_btn = QPushButton("导出SNR表(CSV)")
         self.export_snr_btn.setToolTip("将当前卫星载噪比对比表(含三口瞬时值/均值/差值)导出为CSV文件")
-        snr_btn_row.addWidget(self.export_snr_btn)
-        snr_btn_row.addStretch()
-        snr_layout.addLayout(snr_btn_row)
-        self.snr_text1 = QTextEdit()
-        self.snr_text1.setReadOnly(True)
-        self.snr_text1.setStyleSheet("font-family: Consolas; font-size: 13px; background-color: #1e1e2e; color: #cdd6f4;")
-        self.snr_text1.setPlaceholderText("等待GSV数据...")
-        self.snr_text1.setMinimumHeight(200)
-        snr_layout.addWidget(self.snr_text1)
-        table_layout.addWidget(snr_box, 1)
+        self.export_snr_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; font-size: 13px; padding: 5px 14px; border-radius: 4px; } QPushButton:hover { background-color: #2ecc71; }")
+        toolbar_row.addWidget(self.export_snr_btn)
 
-        # 数据预览
+        snr_layout.addLayout(toolbar_row)
+
+        # -------------------------------------------------------------------------
+        # 3. 原生交互式 QTableWidget 核心表格
+        # -------------------------------------------------------------------------
+        self.snr_table = QTableWidget()
+        self.snr_table.setColumnCount(13)
+        SNR_HEADERS = [
+            "星座", "PRN", "信号",
+            "串口1 瞬时", "串口1 均值",
+            "串口2 瞬时", "串口2 均值", "Δ (2-1)", "Δ2 均值",
+            "串口3 瞬时", "串口3 均值", "Δ (3-1)", "Δ3 均值"
+        ]
+        self.snr_table.setHorizontalHeaderLabels(SNR_HEADERS)
+        self.snr_table.verticalHeader().setVisible(False)
+        self.snr_table.verticalHeader().setDefaultSectionSize(28)
+        self.snr_table.setSortingEnabled(True)
+        self.snr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.snr_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.snr_table.setItemDelegate(SNRBarDelegate(self.snr_table))
+        self.snr_table.setAlternatingRowColors(True)
+
+        # 列宽与对齐设置 (适应放大后的 14px 字体与进度条)
+        header = self.snr_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        self.snr_table.setColumnWidth(0, 70)   # 星座
+        self.snr_table.setColumnWidth(1, 55)   # PRN
+        self.snr_table.setColumnWidth(2, 70)   # 信号
+        self.snr_table.setColumnWidth(3, 135)  # COM1 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(4, 90)   # COM1 均值
+        self.snr_table.setColumnWidth(5, 135)  # COM2 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(6, 90)   # COM2 均值
+        self.snr_table.setColumnWidth(7, 95)   # Δ(2-1)
+        self.snr_table.setColumnWidth(8, 90)   # Δ2 均值
+        self.snr_table.setColumnWidth(9, 135)  # COM3 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(10, 90)  # COM3 均值
+        self.snr_table.setColumnWidth(11, 95)  # Δ(3-1)
+        self.snr_table.setColumnWidth(12, 90)  # Δ3 均值
+
+        self.snr_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #181825;
+                alternate-background-color: #1e1e2e;
+                color: #cdd6f4;
+                gridline-color: #313244;
+                font-family: Consolas, 'Segoe UI', monospace;
+                font-size: 14px;
+                border: 1px solid #313244;
+                border-radius: 4px;
+            }
+            QHeaderView::section {
+                background-color: #313244;
+                color: #d8dee9;
+                font-weight: bold;
+                font-size: 13px;
+                padding: 5px 6px;
+                border: 1px solid #434c5e;
+            }
+            QTableWidget::item:selected {
+                background-color: #45475a;
+                color: #ffffff;
+            }
+        """)
+        self.snr_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.snr_table.customContextMenuRequested.connect(self._show_snr_table_context_menu)
+        snr_layout.addWidget(self.snr_table, 1)
+
+        # 底部图例说明行
+        legend_row = QHBoxLayout()
+        legend_lbl = QLabel(
+            "载噪比图例: "
+            "<span style='color:#f38ba8;'>■ &lt;24</span> &nbsp;"
+            "<span style='color:#fab387;'>■ 24~29</span> &nbsp;"
+            "<span style='color:#f9e2af;'>■ 30~35</span> &nbsp;"
+            "<span style='color:#94e2d5;'>■ 36~41</span> &nbsp;"
+            "<span style='color:#a6e3a1;'>■ ≥42 dB-Hz</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            "恶化差值: <span style='color:#fab387;font-weight:bold;'>|Δ|≥10dB 橙色预警</span> &nbsp;·&nbsp; "
+            "<span style='color:#f38ba8;font-weight:bold;'>|Δ|≥15dB 红色告警</span>"
+        )
+        legend_lbl.setStyleSheet("font-size: 13px; color: #a6adc8;")
+        legend_row.addWidget(legend_lbl)
+        legend_row.addStretch()
+        snr_layout.addLayout(legend_row)
+
+        table_layout.addWidget(snr_box, 3)
+
+        # -------------------------------------------------------------------------
+        # 4. 原始数据流监视区 (可暂停冻结、带语句协议过滤)
+        # -------------------------------------------------------------------------
+        preview_box = QGroupBox("原始数据流监视区")
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+
+        preview_ctrl_row = QHBoxLayout()
+        self.pause_preview_cb = QCheckBox("⏸ 暂停滚动 (Pause)")
+        self.pause_preview_cb.setToolTip("勾选后暂停界面滚动输出，便于鼠标选中、检查和复制语句。后台数据解析与文件记录照常进行。")
+        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9;")
+        preview_ctrl_row.addWidget(self.pause_preview_cb)
+
+        preview_ctrl_row.addSpacing(10)
+        preview_ctrl_row.addWidget(QLabel("协议过滤:"))
+        self.preview_filter_combo = QComboBox()
+        self.preview_filter_combo.addItems(["全部", "仅 GGA", "仅 GSV", "仅 RMC", "仅 UBX"])
+        self.preview_filter_combo.setStyleSheet("font-size: 11px;")
+        preview_ctrl_row.addWidget(self.preview_filter_combo)
+
+        self.clear_preview_btn = QPushButton("清空预览")
+        self.clear_preview_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.clear_preview_btn.clicked.connect(self.clear_data_preview)
+        preview_ctrl_row.addWidget(self.clear_preview_btn)
+
+        preview_ctrl_row.addStretch()
+        preview_layout.addLayout(preview_ctrl_row)
+
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 11px;")
+        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 11px; background-color: #fafafa;")
         self.data_preview.setPlaceholderText("数据预览区域...")
         self.data_preview.setMinimumHeight(60)
-        table_layout.addWidget(self.data_preview, 0)
+        preview_layout.addWidget(self.data_preview)
 
-        table_layout.setStretch(0, 2)  # GSV数据占2份
-        table_layout.setStretch(1, 1)  # 数据预览占1份
+        table_layout.addWidget(preview_box, 1)
         
-        # ========== 标签2：功能与控制面板 ==========
+        # =========================================================================
+        # 标签页 2：功能与控制面板 (串口管理、状态监视、ENU配置与报告导出)
+        # =========================================================================
         control_tab = QWidget()
         control_layout = QVBoxLayout(control_tab)
         
-        # 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
+        # -------------------------------------------------------------------------
+        # 1. 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
+        # -------------------------------------------------------------------------
         BAUD_RATES = ["9600", "19200", "38400", "57600", "115200",
                       "230400", "460800", "921600"]
         PORT_NAMES = {1: "串口1 (无干扰)", 2: "串口2 (干扰测试)", 3: "串口3 (干扰测试2)"}
@@ -441,6 +938,7 @@ class NMEADataAnalyzer(QMainWindow):
         ports_grid.addWidget(QLabel("操作"), 0, 3, 1, 3)
         ports_grid.addWidget(QLabel("状态"), 0, 6)
 
+        # 动态构建三路串口的下拉框、控制按钮与状态标签
         for pid in (1, 2, 3):
             row = pid
             ports_grid.addWidget(QLabel(PORT_NAMES[pid]), row, 0)
@@ -476,9 +974,12 @@ class NMEADataAnalyzer(QMainWindow):
         ports_grid.setColumnStretch(1, 1)
         control_layout.addWidget(ports_box)
 
-        # 双串口GGA状态面板：串口1（左）+ 串口2（右）
+        # -------------------------------------------------------------------------
+        # 2. 三串口 GGA 实时状态面板：串口1（参考基准）、串口2（干扰1）、串口3（干扰2）
+        # -------------------------------------------------------------------------
         port_stats_layout = QHBoxLayout()
 
+        # 串口1状态卡片 (参考机 / 无干扰基准通道)
         port1_stats = QGroupBox("串口1 GGA 状态")
         p1_grid = QGridLayout(port1_stats)
         p1_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
@@ -511,6 +1012,7 @@ class NMEADataAnalyzer(QMainWindow):
         p1_grid.addWidget(self.p1_ttff_label, 6, 1)
         port_stats_layout.addWidget(port1_stats)
 
+        # 串口2状态卡片 (待测设备 DUT 1 / 干扰测试通道)
         port2_stats = QGroupBox("串口2 GGA 状态")
         p2_grid = QGridLayout(port2_stats)
         p2_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
@@ -543,7 +1045,7 @@ class NMEADataAnalyzer(QMainWindow):
         p2_grid.addWidget(self.p2_ttff_label, 6, 1)
         port_stats_layout.addWidget(port2_stats)
 
-        # [新增] 串口3 GGA状态面板
+        # 串口3状态卡片 (待测设备 DUT 2 / 干扰测试通道 2)
         port3_stats = QGroupBox("串口3 GGA 状态")
         p3_grid = QGridLayout(port3_stats)
         p3_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
@@ -578,12 +1080,18 @@ class NMEADataAnalyzer(QMainWindow):
 
         control_layout.addLayout(port_stats_layout)
 
-        # ENU 基准值设置（全局配置, 从方向测试页移至此处）
+        # -------------------------------------------------------------------------
+        # 3. ENU 基准值配置区域（全局共享基准点选择）
+        # -------------------------------------------------------------------------
         control_layout.addWidget(self._create_enu_ref_box())
 
-        # ENU 误差实时显示 - 串口1 (无干扰) 和 串口2 (干扰测试)
+        # -------------------------------------------------------------------------
+        # 4. ENU 空间直角坐标定位误差实时值显示 (东 E / 北 N / 天 U，单位: m)
+        # -------------------------------------------------------------------------
         enu_val_box = QGroupBox("ENU 误差实时值")
         enu_val_layout = QVBoxLayout(enu_val_box)
+
+        # ENU1 实时误差行 (参考机相对基准点偏移)
         enu1_val_row = QHBoxLayout()
         enu1_val_row.addWidget(QLabel("ENU1 (无干扰):"))
         self.enu1_east_label = QLabel("东: -- m")
@@ -597,6 +1105,8 @@ class NMEADataAnalyzer(QMainWindow):
         enu1_val_row.addWidget(self.enu1_up_label)
         enu1_val_row.addStretch()
         enu_val_layout.addLayout(enu1_val_row)
+
+        # ENU2 实时误差行 (待测设备1相对基准点偏移)
         enu2_val_row = QHBoxLayout()
         enu2_val_row.addWidget(QLabel("ENU2 (干扰测试):"))
         self.enu2_east_label = QLabel("东: -- m")
@@ -610,7 +1120,8 @@ class NMEADataAnalyzer(QMainWindow):
         enu2_val_row.addWidget(self.enu2_up_label)
         enu2_val_row.addStretch()
         enu_val_layout.addLayout(enu2_val_row)
-        # [新增] ENU3 实时值行
+
+        # ENU3 实时误差行 (待测设备2相对基准点偏移)
         enu3_val_row = QHBoxLayout()
         enu3_val_row.addWidget(QLabel("ENU3 (干扰测试2):"))
         self.enu3_east_label = QLabel("东: -- m")
@@ -626,9 +1137,13 @@ class NMEADataAnalyzer(QMainWindow):
         enu_val_layout.addLayout(enu3_val_row)
         control_layout.addWidget(enu_val_box)
 
-        # ENU 标准差统计
+        # -------------------------------------------------------------------------
+        # 5. ENU 滑动窗口标准差统计 (显示当前定位离散度/稳定性 1-sigma，单位: m)
+        # -------------------------------------------------------------------------
         enu_std_box = QGroupBox("ENU 标准差统计")
         enu_std_layout = QVBoxLayout(enu_std_box)
+
+        # ENU1 标准差行
         std_row1 = QHBoxLayout()
         std_row1.addWidget(QLabel("ENU1 (无干扰):"))
         self.enu1_std_east = QLabel("E: -- m")
@@ -642,6 +1157,8 @@ class NMEADataAnalyzer(QMainWindow):
         std_row1.addWidget(self.enu1_std_up)
         std_row1.addStretch()
         enu_std_layout.addLayout(std_row1)
+
+        # ENU2 标准差行
         std_row2 = QHBoxLayout()
         std_row2.addWidget(QLabel("ENU2 (干扰测试):"))
         self.enu2_std_east = QLabel("E: -- m")
@@ -655,7 +1172,8 @@ class NMEADataAnalyzer(QMainWindow):
         std_row2.addWidget(self.enu2_std_up)
         std_row2.addStretch()
         enu_std_layout.addLayout(std_row2)
-        # [新增] ENU3标准差行
+
+        # ENU3 标准差行
         std_row3 = QHBoxLayout()
         std_row3.addWidget(QLabel("ENU3 (干扰测试2):"))
         self.enu3_std_east = QLabel("E: -- m")
@@ -671,49 +1189,60 @@ class NMEADataAnalyzer(QMainWindow):
         enu_std_layout.addLayout(std_row3)
         control_layout.addWidget(enu_std_box)
 
-        # 日志窗口
+        # -------------------------------------------------------------------------
+        # 6. 系统运行与调试日志窗口 (展示连接、解析、异常与操作历史)
+        # -------------------------------------------------------------------------
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
         self.log_window.setStyleSheet("font-family: Consolas; font-size: 11px;")
         self.log_window.setMaximumHeight(150)
         control_layout.addWidget(self.log_window)
 
-        # 测试基本信息
+        # -------------------------------------------------------------------------
+        # 7. 测试基本信息录入区 (用于导出试验报告与 PDF 报表的元数据配置)
+        # -------------------------------------------------------------------------
         info_group = QGroupBox("测试基本信息")
         info_layout = QGridLayout(info_group)
 
+        # 测试地点
         info_layout.addWidget(QLabel("测试地点:"), 0, 0)
         self.test_location_input = QLineEdit()
         self.test_location_input.setPlaceholderText("例如: 长沙")
         info_layout.addWidget(self.test_location_input, 0, 1)
 
+        # 待测设备 DUT 型号
         info_layout.addWidget(QLabel("待测设备型号:"), 0, 2)
         self.dut_model_input = QLineEdit()
         self.dut_model_input.setPlaceholderText("例如: 双频八通道抗干扰天线")
         info_layout.addWidget(self.dut_model_input, 0, 3)
 
+        # 天线阵列拓扑形式
         info_layout.addWidget(QLabel("阵列形式:"), 1, 0)
         self.array_form_combo = QComboBox()
         self.array_form_combo.setEditable(True)
         self.array_form_combo.addItems(["4 阵元", "7 阵元", "线阵", "面阵"])
         info_layout.addWidget(self.array_form_combo, 1, 1)
 
+        # 干扰信号调制样式
         info_layout.addWidget(QLabel("干扰类型:"), 1, 2)
         self.jam_type_combo = QComboBox()
         self.jam_type_combo.setEditable(True)
         self.jam_type_combo.addItems(["线性扫频干扰", "宽带干扰", "单音干扰", "脉冲干扰", "窄带干扰", "多音干扰"])
         info_layout.addWidget(self.jam_type_combo, 1, 3)
 
+        # 空间入射方位角
         info_layout.addWidget(QLabel("入射方位:"), 2, 0)
         self.azimuth_input = QLineEdit()
         self.azimuth_input.setPlaceholderText("例如: 正东 / 正南 / 正西 / 正北")
         info_layout.addWidget(self.azimuth_input, 2, 1)
 
+        # 干扰发射源与接收天线水平间距
         info_layout.addWidget(QLabel("收发天线间距:"), 2, 2)
         self.antenna_spacing_input = QLineEdit()
         self.antenna_spacing_input.setPlaceholderText("例如: 3 m")
         info_layout.addWidget(self.antenna_spacing_input, 2, 3)
 
+        # 接收天线架设离地高度
         info_layout.addWidget(QLabel("天线架设高度:"), 3, 0)
         self.antenna_height_input = QLineEdit()
         self.antenna_height_input.setPlaceholderText("例如: 1.5 m")
@@ -721,38 +1250,50 @@ class NMEADataAnalyzer(QMainWindow):
 
         control_layout.addWidget(info_group)
 
-        # 控制面板拉伸比例: 0=串口连接(紧凑) 1=GGA统计 2=ENU基准 3=ENU实时值
-        # 4=ENU标准差 5=日志窗口 6=测试基本信息 7=底部按钮 (仅GGA统计可伸缩)
+        # 控制面板拉伸比例分配: 仅GGA状态卡片可纵向伸缩，其余保持紧凑自适应
         control_layout.setStretch(1, 1)
-        # 最底部：操作按钮
+
+        # -------------------------------------------------------------------------
+        # 8. 全局操作与导出控制按钮栏
+        # -------------------------------------------------------------------------
         bottom_layout = QHBoxLayout()
+        # 清空数据：重置接收队列与全部统计缓存
         self.clear_data_btn = QPushButton("清空数据")
         self.clear_data_btn.setMinimumWidth(100)
         self.clear_data_btn.setToolTip("清空预览与三个串口的数据缓存, 并重置全部统计")
+
+        # 重置统计：仅清除统计累计量，保留已有数据帧
         self.reset_stats_btn = QPushButton("重置统计")
         self.reset_stats_btn.setMinimumWidth(100)
         self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR均值/方向统计等), 不清空数据缓存")
+
+        # 清除日志：重置界面窗口文本
         self.clear_log_btn = QPushButton("清除日志")
         self.clear_log_btn.setMinimumWidth(100)
         self.clear_log_btn.setToolTip("清空界面日志窗口显示(不影响自动落盘日志文件)")
+
+        # 保存全部原始日志
         self.save_all_log_btn = QPushButton("保存全部日志")
         self.save_all_log_btn.setMinimumWidth(110)
         self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
-        # [新增] 串口2独立报告按钮
+
+        # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report2_btn = QPushButton("导出串口2测试报告")
         self.export_report2_btn.setMinimumWidth(140)
         self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_pdf2_btn = QPushButton("导出串口2PDF报告")
         self.export_pdf2_btn.setMinimumWidth(140)
         self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
-        # [新增] 串口3独立报告按钮
+
+        # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report3_btn = QPushButton("导出串口3测试报告")
         self.export_report3_btn.setMinimumWidth(140)
         self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_pdf3_btn = QPushButton("导出串口3PDF报告")
         self.export_pdf3_btn.setMinimumWidth(140)
         self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
-        # 一键自检按钮（无真实串口, 模拟数据全链路测试）
+
+        # 一键自检按钮（脱机闭环仿真测试）
         self.selftest_btn = QPushButton("一键自检(无串口)")
         self.selftest_btn.setMinimumWidth(130)
         self.selftest_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
@@ -768,6 +1309,7 @@ class NMEADataAnalyzer(QMainWindow):
         bottom_layout.addWidget(self.export_pdf3_btn)
         bottom_layout.addWidget(self.selftest_btn)
 
+        # 自动落盘日志复选框 (默认勾选)
         self.auto_log_cb = QCheckBox("自动保存日志")
         self.auto_log_cb.setChecked(True)
         bottom_layout.addWidget(self.auto_log_cb)
@@ -779,11 +1321,13 @@ class NMEADataAnalyzer(QMainWindow):
         self.tab_widget.addTab(control_tab, "功能与控制面板")
         self.tab_widget.addTab(table_tab, "表格视图")
         
-        # ========== 标签4：ENU 误差对比 ==========
+        # =========================================================================
+        # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
+        # =========================================================================
         enu_comp_tab = QWidget()
         enu_comp_layout = QVBoxLayout(enu_comp_tab)
 
-        # 标题行
+        # 顶部标题提示行
         title_row = QHBoxLayout()
         title_label12 = QLabel("ENU1 (无干扰) vs ENU2 (干扰测试)")
         title_label12.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
@@ -795,13 +1339,14 @@ class NMEADataAnalyzer(QMainWindow):
         title_row.addStretch()
         enu_comp_layout.addLayout(title_row)
 
-        # 双列布局
+        # 双列对称布局 (左侧 COM1 vs COM2, 右侧 COM1 vs COM3)
         enu_comp_cols = QHBoxLayout()
 
-        # --- 左列: ENU1 vs ENU2 ---
+        # --- 左列图表: ENU1 (红实线) vs ENU2 (蓝实线) ---
         left_col = QVBoxLayout()
         left_col.setSpacing(2)
 
+        # 东向误差图 (East)
         self.enu_comp12_east_plot = pg.PlotWidget()
         self.enu_comp12_east_plot.setBackground('w')
         self.enu_comp12_east_plot.setLabel('left', '东向', units='m')
@@ -811,6 +1356,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu2_east_curve = self.enu_comp12_east_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
         left_col.addWidget(self.enu_comp12_east_plot)
 
+        # 北向误差图 (North)
         self.enu_comp12_north_plot = pg.PlotWidget()
         self.enu_comp12_north_plot.setBackground('w')
         self.enu_comp12_north_plot.setLabel('left', '北向', units='m')
@@ -820,6 +1366,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu2_north_curve = self.enu_comp12_north_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
         left_col.addWidget(self.enu_comp12_north_plot)
 
+        # 天向误差图 (Up)
         self.enu_comp12_up_plot = pg.PlotWidget()
         self.enu_comp12_up_plot.setBackground('w')
         self.enu_comp12_up_plot.setLabel('left', '天向', units='m')
@@ -832,10 +1379,11 @@ class NMEADataAnalyzer(QMainWindow):
 
         enu_comp_cols.addLayout(left_col)
 
-        # --- 右列: ENU1 vs ENU3 ---
+        # --- 右列图表: ENU1 (红实线) vs ENU3 (橙黄虚线) ---
         right_col = QVBoxLayout()
         right_col.setSpacing(2)
 
+        # 东向误差图 (East)
         self.enu_comp13_east_plot = pg.PlotWidget()
         self.enu_comp13_east_plot.setBackground('w')
         self.enu_comp13_east_plot.setLabel('left', '东向', units='m')
@@ -845,6 +1393,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu3_east_curve = self.enu_comp13_east_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
         right_col.addWidget(self.enu_comp13_east_plot)
 
+        # 北向误差图 (North)
         self.enu_comp13_north_plot = pg.PlotWidget()
         self.enu_comp13_north_plot.setBackground('w')
         self.enu_comp13_north_plot.setLabel('left', '北向', units='m')
@@ -854,6 +1403,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu3_north_curve = self.enu_comp13_north_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
         right_col.addWidget(self.enu_comp13_north_plot)
 
+        # 天向误差图 (Up)
         self.enu_comp13_up_plot = pg.PlotWidget()
         self.enu_comp13_up_plot.setBackground('w')
         self.enu_comp13_up_plot.setLabel('left', '天向', units='m')
@@ -869,24 +1419,31 @@ class NMEADataAnalyzer(QMainWindow):
         enu_comp_layout.addLayout(enu_comp_cols)
         self.tab_widget.addTab(enu_comp_tab, "ENU 误差对比")
         
-        # ========== 标签5：方向测试 ==========
+        # =========================================================================
+        # 标签页 4：方向测试 (转台测试各方向统计汇总与控制面板)
+        # =========================================================================
         direction_tab = self._create_direction_tab()
         self.tab_widget.addTab(direction_tab, "方向测试")
 
-        # ========== 标签6：各方向 ENU 误差对比 ==========
+        # =========================================================================
+        # 标签页 5：各方向 ENU 误差对比 (四向 ENU 曲线多子图)
+        # =========================================================================
         dir_enu_tab = self._create_dir_enu_tab()
         self.tab_widget.addTab(dir_enu_tab, "方向ENU对比")
         
-        # 将QTabWidget添加到主布局
+        # 将QTabWidget添加到主窗口垂直布局中
         main_layout.addWidget(self.tab_widget)
 
-        # 菜单栏与快捷键
+        # 构建窗口顶部原生菜单栏与全局快捷键
         self._create_menu_bar()
 
-        # 状态栏
+        # =========================================================================
+        # 底部系统状态栏 (QStatusBar)：串口连接指示灯、吞吐速率、自检进度
+        # =========================================================================
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
+        # 串口1连接状态指示灯与文字
         self.port1_indicator = QLabel("串口1: ● 未连接")
         self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
         self.status_bar.addWidget(self.port1_indicator)
@@ -895,6 +1452,7 @@ class NMEADataAnalyzer(QMainWindow):
         sep1.setStyleSheet("color: #666;")
         self.status_bar.addWidget(sep1)
 
+        # 串口2连接状态指示灯与文字
         self.port2_indicator = QLabel("串口2: ● 未连接")
         self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
         self.status_bar.addWidget(self.port2_indicator)
@@ -902,7 +1460,8 @@ class NMEADataAnalyzer(QMainWindow):
         sep3 = QLabel("|")
         sep3.setStyleSheet("color: #666;")
         self.status_bar.addWidget(sep3)
-        # [新增] 串口3状态指示器
+
+        # 串口3连接状态指示灯与文字
         self.port3_indicator = QLabel("串口3: ● 未连接")
         self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
         self.status_bar.addWidget(self.port3_indicator)
@@ -911,12 +1470,12 @@ class NMEADataAnalyzer(QMainWindow):
         sep4.setStyleSheet("color: #666;")
         self.status_bar.addWidget(sep4)
 
-        # 数据速率指示（每2秒刷新, 行/s）
+        # 数据接收速率指示器（每2秒统计滑动窗口内接收的 行/s，便于即时发现串口假死或波特率不匹配）
         self.rate_label = QLabel("速率: 1:-- | 2:-- | 3:-- 行/s")
         self.rate_label.setStyleSheet("font-size: 12px; color: #666; padding: 0 6px;")
         self.status_bar.addPermanentWidget(self.rate_label)
 
-        # 自检进度条与取消按钮（自检运行期间可见）
+        # 全链路脱机自检进度条与取消控制按钮（自检模式激活时动态显示）
         self.selftest_progress = QProgressBar()
         self.selftest_progress.setRange(0, 100)
         self.selftest_progress.setMaximumWidth(160)
@@ -929,6 +1488,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.selftest_cancel_btn.setVisible(False)
         self.status_bar.addPermanentWidget(self.selftest_cancel_btn)
 
+        # 累计处理的 NMEA/UBX 数据行数统计
         self.data_count_label = QLabel("已读取: 0 行")
         self.data_count_label.setStyleSheet("font-size: 12px; color: #666;")
         self.status_bar.addPermanentWidget(self.data_count_label)
@@ -963,8 +1523,11 @@ class NMEADataAnalyzer(QMainWindow):
         # 自检取消按钮
         self.selftest_cancel_btn.clicked.connect(self._cancel_selftest)
 
-        # SNR表导出
+        # SNR表导出与交互式筛选检索信号连接
         self.export_snr_btn.clicked.connect(self._export_snr_csv)
+        self.snr_filter_group.buttonClicked.connect(lambda: self._apply_snr_filters())
+        self.snr_filter_warn_cb.stateChanged.connect(lambda: self._apply_snr_filters())
+        self.snr_search_edit.textChanged.connect(lambda: self._apply_snr_filters())
 
         # ENU基准模式切换（共享控制）
         self._enu_btn_group = QButtonGroup()
@@ -1153,9 +1716,7 @@ class NMEADataAnalyzer(QMainWindow):
 
             decoded = self.nmea_parser2.decode_line(data) if self.nmea_parser2 else None
             if decoded:
-                self.data_preview.append(f"[串口2] {decoded.strip()}")
-
-                self._trim_text_edit(self.data_preview)
+                self._append_data_preview(f"[串口2] {decoded.strip()}", port_id=2)
 
                 # 解析GSV获取卫星信噪比（仅GSV行触发）
                 is_gsv = False
@@ -1264,9 +1825,7 @@ class NMEADataAnalyzer(QMainWindow):
 
             decoded = self.nmea_parser3.decode_line(data) if self.nmea_parser3 else None
             if decoded:
-                self.data_preview.append(f"[串口3] {decoded.strip()}")
-
-                self._trim_text_edit(self.data_preview)
+                self._append_data_preview(f"[串口3] {decoded.strip()}", port_id=3)
 
                 # 解析GSV获取卫星信噪比
                 is_gsv = False
@@ -1376,14 +1935,14 @@ class NMEADataAnalyzer(QMainWindow):
         if self.current_parser:
             decoded = self.current_parser.decode_line(data)
             if decoded:
-                self.data_preview.append(decoded.strip())
+                self._append_data_preview(f"[串口1] {decoded.strip()}", port_id=1)
 
                 # 解析标准NMEA语句（提取GPS时间）
                 if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                     self.nmea_parser.parse(decoded)
                     if self.nmea_parser.last_gps_time_valid:
                         self.gps_sow = self.nmea_parser.last_gps_tow
-                        self.data_preview.append(f"【GPS时间】TOW: {self.gps_sow:.2f}秒")
+                        self._append_data_preview(f"【GPS时间】TOW: {self.gps_sow:.2f}秒", port_id=1)
 
                 # 解析OBSVMA/OBSVHA数据（包含伪距和卫星信息）
                 if decoded.startswith('#OBSV'):
@@ -1417,10 +1976,11 @@ class NMEADataAnalyzer(QMainWindow):
                     raw_errors = {'horizontal_error': 0.0, 'vertical_error': 0.0}
 
                     # 聚合数据预览显示
-                    self.data_preview.append(
+                    self._append_data_preview(
                         f"GGA → 纬度:{gga_data['lat']:.8f} 经度:{gga_data['lon']:.8f} "
                         f"海拔:{gga_data['alt']:.4f}m "
-                        f"质量:{gga_data['quality']} 卫星:{gga_data['num_sat']}"
+                        f"质量:{gga_data['quality']} 卫星:{gga_data['num_sat']}",
+                        port_id=1
                     )
 
                     # 更新统计
@@ -1453,8 +2013,6 @@ class NMEADataAnalyzer(QMainWindow):
                 if gga_data:
                     self._feed_fixed_enu1()
                     self._update_enu_std()
-
-                self._trim_text_edit(self.data_preview)
     
     def update_stats_display(self, gga_data, smoothed_coords, raw_errors, errors, stats):
         """更新串口1 GGA状态显示"""
@@ -1506,66 +2064,129 @@ class NMEADataAnalyzer(QMainWindow):
                        tuple(sorted(self.port2_satellites.items())),
                        tuple(sorted(self.port3_satellites.items())))  # [新增] port3
         if current_snr != self._last_snr_data or self._update_frame_count % 2 == 0:
-            self._refresh_snr_text()
+            self._refresh_snr_table()
             self._last_snr_data = current_snr
 
         self._update_enu_display()
         self._update_direction_stats_display()
 
-    # SNR表配色（Nord深色主题）
+    # SNR表各星座徽章配色（Nord深色主题）
     _SYS_BADGES = {
         'GP': ('GPS', '#81a1c1'), 'GL': ('GLO', '#b48ead'), 'GA': ('GAL', '#a3be8c'),
         'BD': ('BDS', '#8fbcbb'), 'GB': ('BDS', '#8fbcbb'), 'GN': ('GNSS', '#ebcb8b'),
     }
 
-    @staticmethod
-    def _snr_cell(v):
-        """载噪比瞬时值单元格: 按信号强度分档色阶背景"""
-        if v is None:
-            return '<td align="center" bgcolor="#1b1b2a"><span style="color:#585b70;">--</span></td>'
-        if v >= 42:
-            bg = '#2f5e3f'
-        elif v >= 36:
-            bg = '#44583a'
-        elif v >= 30:
-            bg = '#5d5436'
-        elif v >= 24:
-            bg = '#5e4531'
-        else:
-            bg = '#5e3737'
-        return f'<td align="right" bgcolor="{bg}"><span style="color:#eceff4;">{v:.1f}</span></td>'
+    def _show_snr_table_context_menu(self, pos):
+        """信噪比表格右键快捷菜单 (支持单格复制、整行TSV导出与CSV导出)"""
+        menu = QMenu(self)
+        copy_cell_act = menu.addAction("📋 复制选定单元格内容")
+        copy_row_act = menu.addAction("📑 复制选定整行数据 (TSV/Excel格式)")
+        menu.addSeparator()
+        export_csv_act = menu.addAction("📊 导出全部数据为 CSV...")
+        
+        action = menu.exec_(self.snr_table.viewport().mapToGlobal(pos))
+        if action == copy_cell_act:
+            items = self.snr_table.selectedItems()
+            if items:
+                text = "\t".join(it.text() for it in items)
+                QApplication.clipboard().setText(text)
+        elif action == copy_row_act:
+            selected_rows = sorted(set(index.row() for index in self.snr_table.selectedIndexes()))
+            if selected_rows:
+                lines = []
+                header = [self.snr_table.horizontalHeaderItem(c).text() for c in range(self.snr_table.columnCount())]
+                lines.append("\t".join(header))
+                for r in selected_rows:
+                    row_data = [self.snr_table.item(r, c).text() if self.snr_table.item(r, c) else "" for c in range(self.snr_table.columnCount())]
+                    lines.append("\t".join(row_data))
+                QApplication.clipboard().setText("\n".join(lines))
+        elif action == export_csv_act:
+            self._export_snr_csv()
 
-    @staticmethod
-    def _avg_cell(v, row_bg, signed=False):
-        """均值单元格: 行底色, 弱化文字"""
-        if v is None:
-            return f'<td align="center" bgcolor="{row_bg}"><span style="color:#585b70;">--</span></td>'
-        txt = f"{v:+.1f}" if signed else f"{v:.1f}"
-        return f'<td align="right" bgcolor="{row_bg}"><span style="color:#a7adc6;">{txt}</span></td>'
+    def _apply_snr_filters(self):
+        """实时执行星座筛选、恶化星过滤与PRN模糊搜索"""
+        selected_sys = "ALL"
+        if getattr(self, 'snr_filter_bds', None) and self.snr_filter_bds.isChecked():
+            selected_sys = "BD"
+        elif getattr(self, 'snr_filter_gps', None) and self.snr_filter_gps.isChecked():
+            selected_sys = "GP"
+        elif getattr(self, 'snr_filter_gal', None) and self.snr_filter_gal.isChecked():
+            selected_sys = "GA"
+        elif getattr(self, 'snr_filter_glo', None) and self.snr_filter_glo.isChecked():
+            selected_sys = "GL"
 
-    @staticmethod
-    def _delta_cell(v):
-        """差值单元格: |Δ|分级色阶, ≥10dB橙/≥15dB红加粗"""
-        if v is None:
-            return '<td align="center" bgcolor="#1b1b2a"><span style="color:#585b70;">--</span></td>'
-        a = abs(v)
-        if a >= 15:
-            return f'<td align="right" bgcolor="#5e3737"><span style="color:#f38ba8; font-weight:bold;">{v:+.1f}</span></td>'
-        if a >= 10:
-            return f'<td align="right" bgcolor="#5e4531"><span style="color:#fab387;">{v:+.1f}</span></td>'
-        if a >= 3:
-            return f'<td align="right" bgcolor="#5d5436"><span style="color:#eceff4;">{v:+.1f}</span></td>'
-        return f'<td align="right" bgcolor="#2a3a4a"><span style="color:#a5b6cc;">{v:+.1f}</span></td>'
+        warn_only = self.snr_filter_warn_cb.isChecked() if getattr(self, 'snr_filter_warn_cb', None) else False
+        search_txt = self.snr_search_edit.text().strip().upper() if getattr(self, 'snr_search_edit', None) else ""
 
-    def _refresh_snr_text(self):
-        p1_utc = getattr(self, 'p1_utc_ts', '') or '--'
-        p2_utc = getattr(self, 'p2_utc_ts', '') or '--'
-        p3_utc = getattr(self, 'p3_utc_ts', '') or '--'
+        for row in range(self.snr_table.rowCount()):
+            # 1. 检查星座
+            item_sys = self.snr_table.item(row, 0)
+            sys_code = item_sys.data(Qt.UserRole + 1) if item_sys else ""
+            if selected_sys != "ALL":
+                if selected_sys == "BD" and sys_code not in ("BD", "GB"):
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+                elif selected_sys != "BD" and sys_code != selected_sys:
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+
+            # 2. 检查 PRN 关键词搜索
+            item_prn = self.snr_table.item(row, 1)
+            prn_str = item_prn.text() if item_prn else ""
+            full_prn = f"{sys_code}{prn_str}".upper()
+            if search_txt and (search_txt not in prn_str and search_txt not in full_prn):
+                self.snr_table.setRowHidden(row, True)
+                continue
+
+            # 3. 检查恶化告警过滤 (|Δ| >= 10 dB)
+            if warn_only:
+                d1_item = self.snr_table.item(row, 7)
+                d2_item = self.snr_table.item(row, 11)
+                v1 = d1_item.data(Qt.UserRole) if d1_item else None
+                v2 = d2_item.data(Qt.UserRole) if d2_item else None
+                has_warn = (v1 is not None and abs(v1) >= 10) or (v2 is not None and abs(v2) >= 10)
+                if not has_warn:
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+
+            self.snr_table.setRowHidden(row, False)
+
+    def _append_data_preview(self, text, port_id=1):
+        """向数据流预览窗口追加数据（支持暂停冻结与语句协议快速过滤）"""
+        if getattr(self, 'pause_preview_cb', None) and self.pause_preview_cb.isChecked():
+            return
+        
+        filt = getattr(self, 'preview_filter_combo', None)
+        if filt:
+            mode = filt.currentText()
+            if mode == "仅 GGA" and "GGA" not in text:
+                return
+            elif mode == "仅 GSV" and "GSV" not in text:
+                return
+            elif mode == "仅 RMC" and "RMC" not in text:
+                return
+            elif mode == "仅 UBX" and "UBX" not in text:
+                return
+
+        self.data_preview.append(text)
+        self._trim_text_edit(self.data_preview)
+
+    def _refresh_snr_table(self):
+        """
+        刷新原生 QTableWidget 卫星信噪比看板与顶部态势 KPI 卡片。
+        
+        具备以下企业级交互特性:
+        1. 增量单元格就地更新，彻底消除 HTML 重刷带来的界面闪烁与垂直滚动条跳动；
+        2. 基于 NumericTableWidgetItem 存储真数值，支持点击任意表头实现真数值升降序排序；
+        3. 联动计算并更新 4 项顶部 KPI 卡片 (跟踪星数、全网平均SNR、恶化星占比、最大受扰深度)；
+        4. 实时响应星座筛选 (北斗/GPS/Galileo/GLONASS)、恶化星过滤 (|Δ|>=10dB) 与 PRN 检索。
+        """
         all_keys = sorted(
             set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
-            key=lambda x: (x[:2], int(x[2:])))
+            key=lambda x: (x[:2], int(x[2:]))
+        )
 
-        # 更新差值平均值：Port2 vs Port1 (Delta)
+        # 1. 更新差值均值统计
         for key in all_keys:
             s1 = self.port1_satellites.get(key, None)
             s2 = self.port2_satellites.get(key, None)
@@ -1574,7 +2195,7 @@ class NMEADataAnalyzer(QMainWindow):
                 if self._last_snr_diff.get(key) != diff:
                     self._last_snr_diff[key] = diff
                     self._snr_diff_avg.add(key, diff)
-        # 更新差值平均值：Port3 vs Port1 (Delta2)
+                    
         for key in all_keys:
             s1 = self.port1_satellites.get(key, None)
             s3 = self.port3_satellites.get(key, None)
@@ -1584,44 +2205,60 @@ class NMEADataAnalyzer(QMainWindow):
                     self._last_snr_diff2[key] = diff2
                     self._snr_diff2_avg.add(key, diff2)
 
-        if not all_keys:
-            self.snr_text1.setHtml(
-                '<div style="font-family:Consolas,monospace;font-size:13px;color:#585b70;">'
-                '等待GSV数据…</div>')
+        # 2. 刷新顶部 KPI 态势卡片
+        n1 = len(self.port1_satellites)
+        n2 = len(self.port2_satellites)
+        n3 = len(self.port3_satellites)
+        if getattr(self, 'kpi_tracked_label', None):
+            self.kpi_tracked_label.setText(f"{n1} / {n2} / {n3} 颗")
+
+            avg1 = (sum(self.port1_satellites.values()) / n1) if n1 > 0 else 0.0
+            avg2 = (sum(self.port2_satellites.values()) / n2) if n2 > 0 else 0.0
+            avg3 = (sum(self.port3_satellites.values()) / n3) if n3 > 0 else 0.0
+            self.kpi_avgsnr_label.setText(f"{avg1:.1f} / {avg2:.1f} / {avg3:.1f} dB")
+
+            warn_sats = set()
+            max_drop_val = 0.0
+            max_drop_info = "无数据" if not all_keys else "无明显衰减"
+
+            for key in all_keys:
+                s1 = self.port1_satellites.get(key)
+                s2 = self.port2_satellites.get(key)
+                s3 = self.port3_satellites.get(key)
+                d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+                d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+                
+                if (d1 is not None and abs(d1) >= 10) or (d2 is not None and abs(d2) >= 10):
+                    warn_sats.add(key)
+                    
+                for port_idx, diff_val in [(2, d1), (3, d2)]:
+                    if diff_val is not None and diff_val < max_drop_val:
+                        max_drop_val = diff_val
+                        sys_name, _ = self._SYS_BADGES.get(key[:2], (key[:2], ""))
+                        max_drop_info = f"{sys_name}{key[2:]} ({diff_val:+.1f}dB, P{port_idx})"
+
+            total_tracked = len(all_keys)
+            warn_pct = (len(warn_sats) / total_tracked * 100) if total_tracked > 0 else 0.0
+            self.kpi_warn_label.setText(f"{len(warn_sats)} 颗 (占比 {warn_pct:.1f}%)")
+            self.kpi_maxdrop_label.setText(max_drop_info)
+
+        # 3. 填充或就地更新 QTableWidget
+        if not hasattr(self, 'snr_table'):
             return
 
-        html = ['<div style="font-family:Consolas,monospace;font-size:13px;color:#cdd6f4;">']
-        html.append(
-            f'<p style="margin:2px 0 6px 0;"><b style="color:#eceff4;">卫星载噪比实时对比</b>'
-            f'&nbsp;&nbsp;<span style="color:#585b70;">UTC</span>'
-            f'&nbsp;串口1: <span style="color:#a3be8c;">{p1_utc}</span>'
-            f'&nbsp;串口2: <span style="color:#81a1c1;">{p2_utc}</span>'
-            f'&nbsp;串口3: <span style="color:#ebcb8b;">{p3_utc}</span></p>')
-        html.append('<table width="100%" cellspacing="0" cellpadding="3">')
+        self.snr_table.setSortingEnabled(False)
+        
+        if self.snr_table.rowCount() != len(all_keys):
+            self.snr_table.setRowCount(len(all_keys))
 
-        # 双行表头: 组表头 + 子表头 (共13列)
-        grp = '<td colspan="{n}" align="center" bgcolor="#434c5e"><b>{t}</b></td>'
-        html.append('<tr>'
-                    + grp.format(n=2, t='卫星') + grp.format(n=1, t='信号')
-                    + grp.format(n=2, t='串口1 · 无干扰') + grp.format(n=2, t='串口2 · 干扰')
-                    + grp.format(n=2, t='Δ (2-1)') + grp.format(n=2, t='串口3 · 干扰2')
-                    + grp.format(n=2, t='Δ (3-1)')
-                    + '</tr>')
-        subs = ['星座', 'PRN', '信号', '瞬时', '均值', '瞬时', '均值', '差值', '均值',
-                '瞬时', '均值', '差值', '均值']
-        html.append('<tr>' + ''.join(
-            f'<td align="center" bgcolor="#3b4252"><span style="color:#d8dee9;">{s}</span></td>'
-            for s in subs) + '</tr>')
-
-        # 数据行
-        for i, key in enumerate(all_keys):
-            sys = key[:2]
+        for row, key in enumerate(all_keys):
+            sys_prefix = key[:2]
             prn = int(key[2:])
-            row_bg = '#232338' if i % 2 == 0 else '#1a1a29'
-            badge_name, badge_color = self._SYS_BADGES.get(sys, (sys, '#86878d'))
-            s1 = self.port1_satellites.get(key, None)
-            s2 = self.port2_satellites.get(key, None)
-            s3 = self.port3_satellites.get(key, None)
+            badge_name, badge_color = self._SYS_BADGES.get(sys_prefix, (sys_prefix, "#89b4fa"))
+            
+            s1 = self.port1_satellites.get(key)
+            s2 = self.port2_satellites.get(key)
+            s3 = self.port3_satellites.get(key)
             a1 = self._port1_snr_avg.get(key)
             a2 = self._port2_snr_avg.get(key)
             a3 = self._port3_snr_avg.get(key)
@@ -1631,47 +2268,128 @@ class NMEADataAnalyzer(QMainWindow):
             d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
             signal = (self._port1_snr_signals.get(key)
                       or self._port2_snr_signals.get(key)
-                      or self._port3_snr_signals.get(key) or '---')
-            warn = (d1 is not None and abs(d1) >= 15) or (d2 is not None and abs(d2) >= 15)
-            prn_extra = ' style="color:#f38ba8; font-weight:bold;"' if warn else ''
+                      or self._port3_snr_signals.get(key) or "---")
+                      
+            is_warn = (d1 is not None and abs(d1) >= 10) or (d2 is not None and abs(d2) >= 10)
 
-            row = (f'<td align="center" bgcolor="{badge_color}">'
-                   f'<span style="color:#11111b; font-weight:bold;">{badge_name}</span></td>'
-                   f'<td align="right" bgcolor="{row_bg}"{prn_extra}>{prn:02d}</td>'
-                   f'<td align="center" bgcolor="{row_bg}"><span style="color:#89ddff;">{signal}</span></td>')
-            row += self._snr_cell(s1) + self._avg_cell(a1, row_bg)
-            row += self._snr_cell(s2) + self._avg_cell(a2, row_bg)
-            row += self._delta_cell(d1) + self._avg_cell(ad, row_bg, signed=True)
-            row += self._snr_cell(s3) + self._avg_cell(a3, row_bg)
-            row += self._delta_cell(d2) + self._avg_cell(ad2, row_bg, signed=True)
-            html.append('<tr>' + row + '</tr>')
+            # Col 0: 星座 Badge
+            item_sys = NumericTableWidgetItem(badge_name)
+            item_sys.setData(Qt.BackgroundRole, QColor(badge_color))
+            item_sys.setData(Qt.UserRole + 1, sys_prefix)  # 存原始 talker 便于快速过滤
+            item_sys.setTextAlignment(Qt.AlignCenter)
+            self.snr_table.setItem(row, 0, item_sys)
 
-        # 汇总行
-        n1 = len(self.port1_satellites)
-        n2 = len(self.port2_satellites)
-        n3 = len(self.port3_satellites)
-        common = sum(1 for k in all_keys if k in self.port1_satellites and k in self.port2_satellites)
-        common3 = sum(1 for k in all_keys if k in self.port1_satellites and k in self.port3_satellites)
-        html.append(
-            f'<tr><td colspan="13" align="center" bgcolor="#2e3440">'
-            f'串口1: <b style="color:#a3be8c;">{n1}</b> 颗 &nbsp;·&nbsp; '
-            f'串口2: <b style="color:#81a1c1;">{n2}</b> 颗 &nbsp;·&nbsp; '
-            f'串口3: <b style="color:#ebcb8b;">{n3}</b> 颗 &nbsp;·&nbsp; '
-            f'共同(1&2): <b>{common}</b> 颗 &nbsp;·&nbsp; 共同(1&3): <b>{common3}</b> 颗'
-            f'</td></tr>')
-        html.append('</table>')
+            # Col 1: PRN
+            item_prn = NumericTableWidgetItem(f"{prn:02d}", prn)
+            item_prn.setTextAlignment(Qt.AlignCenter)
+            if is_warn:
+                item_prn.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                item_prn.setFont(QFont("Consolas", 11, QFont.Bold))
+            self.snr_table.setItem(row, 1, item_prn)
 
-        # 色阶图例
-        html.append(
-            '<p style="margin:6px 0 0 0; color:#585b70;">载噪比: '
-            '<span style="background-color:#5e3737;">&nbsp;&lt;24&nbsp;</span>'
-            '<span style="background-color:#5e4531;">&nbsp;24-29&nbsp;</span>'
-            '<span style="background-color:#5d5436;">&nbsp;30-35&nbsp;</span>'
-            '<span style="background-color:#44583a;">&nbsp;36-41&nbsp;</span>'
-            '<span style="background-color:#2f5e3f;">&nbsp;≥42&nbsp;</span> dB-Hz'
-            '&nbsp;&nbsp;|&nbsp;&nbsp;Δ恶化: ≥10dB 橙 · ≥15dB 红(加粗)</p>')
-        html.append('</div>')
-        self.snr_text1.setHtml("\n".join(html))
+            # Col 2: 信号
+            item_sig = NumericTableWidgetItem(signal)
+            item_sig.setTextAlignment(Qt.AlignCenter)
+            item_sig.setData(Qt.ForegroundRole, QColor("#89ddff"))
+            self.snr_table.setItem(row, 2, item_sig)
+
+            # Col 3: COM1 瞬时
+            txt_s1 = f"{s1:.1f}" if s1 is not None else "--"
+            self.snr_table.setItem(row, 3, NumericTableWidgetItem(txt_s1, s1))
+
+            # Col 4: COM1 均值
+            txt_a1 = f"{a1:.1f}" if a1 is not None else "--"
+            item_a1 = NumericTableWidgetItem(txt_a1, a1)
+            item_a1.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 4, item_a1)
+
+            # Col 5: COM2 瞬时
+            txt_s2 = f"{s2:.1f}" if s2 is not None else "--"
+            self.snr_table.setItem(row, 5, NumericTableWidgetItem(txt_s2, s2))
+
+            # Col 6: COM2 均值
+            txt_a2 = f"{a2:.1f}" if a2 is not None else "--"
+            item_a2 = NumericTableWidgetItem(txt_a2, a2)
+            item_a2.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 6, item_a2)
+
+            # Col 7: Δ(2-1)
+            txt_d1 = f"{d1:+.1f}" if d1 is not None else "--"
+            item_d1 = NumericTableWidgetItem(txt_d1, d1)
+            item_d1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if d1 is not None:
+                if abs(d1) >= 15:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5e3737"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d1) >= 10:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5e4531"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#fab387"))
+                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d1) >= 3:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5d5436"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#eceff4"))
+                else:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#2a3a4a"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#a5b6cc"))
+            self.snr_table.setItem(row, 7, item_d1)
+
+            # Col 8: Δ2 均值
+            txt_ad1 = f"{ad:+.1f}" if ad is not None else "--"
+            item_ad1 = NumericTableWidgetItem(txt_ad1, ad)
+            item_ad1.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_ad1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 8, item_ad1)
+
+            # Col 9: COM3 瞬时
+            txt_s3 = f"{s3:.1f}" if s3 is not None else "--"
+            self.snr_table.setItem(row, 9, NumericTableWidgetItem(txt_s3, s3))
+
+            # Col 10: COM3 均值
+            txt_a3 = f"{a3:.1f}" if a3 is not None else "--"
+            item_a3 = NumericTableWidgetItem(txt_a3, a3)
+            item_a3.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a3.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 10, item_a3)
+
+            # Col 11: Δ(3-1)
+            txt_d2 = f"{d2:+.1f}" if d2 is not None else "--"
+            item_d2 = NumericTableWidgetItem(txt_d2, d2)
+            item_d2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if d2 is not None:
+                if abs(d2) >= 15:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5e3737"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d2) >= 10:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5e4531"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#fab387"))
+                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d2) >= 3:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5d5436"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#eceff4"))
+                else:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#2a3a4a"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#a5b6cc"))
+            self.snr_table.setItem(row, 11, item_d2)
+
+            # Col 12: Δ3 均值
+            txt_ad2 = f"{ad2:+.1f}" if ad2 is not None else "--"
+            item_ad2 = NumericTableWidgetItem(txt_ad2, ad2)
+            item_ad2.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_ad2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 12, item_ad2)
+
+        self.snr_table.setSortingEnabled(True)
+
+        # 4. 重新应用当前活动筛选规则
+        self._apply_snr_filters()
+
+    def _refresh_snr_text(self):
+        """向后兼容别名，调用新版 _refresh_snr_table"""
+        self._refresh_snr_table()
 
     def _feed_enu1_buffer(self, lat, lon, alt):
         if self.enu_instant_mode:
@@ -2083,25 +2801,25 @@ class NMEADataAnalyzer(QMainWindow):
         enu_ref_layout.addLayout(manual_row)
         enu_ref_labels = QHBoxLayout()
         self.enu1_ref_label = QLabel("ENU1 基准: 未设置")
-        self.enu1_ref_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu1_ref_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu1_ref_label)
         self.enu1_points_label = QLabel("")
-        self.enu1_points_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu1_points_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu1_points_label)
         enu_ref_labels.addStretch()
         self.enu2_ref_label = QLabel("ENU2 基准: 未设置")
-        self.enu2_ref_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu2_ref_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu2_ref_label)
         self.enu2_points_label = QLabel("")
-        self.enu2_points_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu2_points_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu2_points_label)
         enu_ref_labels.addStretch()
         # [新增] ENU3基准点状态标签
         self.enu3_ref_label = QLabel("ENU3 基准: 未设置")
-        self.enu3_ref_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu3_ref_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu3_ref_label)
         self.enu3_points_label = QLabel("")
-        self.enu3_points_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.enu3_points_label.setStyleSheet("color: #888; font-size: 14px;")
         enu_ref_labels.addWidget(self.enu3_points_label)
         enu_ref_labels.addStretch()
         enu_ref_layout.addLayout(enu_ref_labels)
@@ -3731,6 +4449,12 @@ class NMEADataAnalyzer(QMainWindow):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda *args: QApplication.quit())
     app = QApplication(sys.argv)
+    
+    # 设置应用级任务栏与窗口图标
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'app_icon.png')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        
     window = NMEADataAnalyzer()
     window.show()
     sys.exit(app.exec_())
