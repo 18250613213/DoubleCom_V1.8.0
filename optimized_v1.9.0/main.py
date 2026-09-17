@@ -3611,6 +3611,7 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _reset_direction_stats(self):
         previously_active = [i for i in range(4) if self.direction_stats[i]._active]
+        self._reset_enu_chart_data(2)
         for i in range(4):
             self.direction_stats[i].reset()
             btn = self.dir_stat_boxes[i]['btn']
@@ -3629,6 +3630,7 @@ class NMEADataAnalyzer(QMainWindow):
 
     def _reset_direction_stats3(self):
         previously_active = [i for i in range(4) if self.direction_stats3[i]._active]
+        self._reset_enu_chart_data(3)
         for i in range(4):
             self.direction_stats3[i].reset()
             btn = self.dir_stat_boxes3[i]['btn']
