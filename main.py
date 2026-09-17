@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -664,7 +664,7 @@ class NMEADataAnalyzer(QMainWindow):
         初始化主程序图形用户界面 (GUI)
         
         采用现代化 QTabWidget 多标签页架构，包含以下核心子页面与功能区：
-        1. 表格视图 (table_tab)：实时展示 GSV 载噪比 (SNR) 矩阵对比与原始数据滚动预览；
+        1. 表格视图 (table_tab)：实时展示 GSV 载噪比 (SNR) 矩阵对比；
         2. 功能与控制面板 (control_tab)：
            - 3 串口统一配置与连接控制网格 (COM1/COM2/COM3)；
            - 3 串口实时 GGA 定位状态卡片 (UTC/经纬高/解状态/星数/TTFF)；
@@ -673,10 +673,11 @@ class NMEADataAnalyzer(QMainWindow):
            - 系统运行与调试日志窗口；
            - 实验测试基本信息录入 (地点/型号/天线阵列/干扰模式/方位/高度)；
            - 全局控制按钮栏 (清空/重置/日志导出/多路报告导出/一键全链路自检)；
-        3. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
-        4. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
-        5. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
-        6. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
+        3. 串口实时数据流 (stream_tab)：独立承载原始语句滚动、暂停、过滤与清空操作；
+        4. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
+        5. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
+        6. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
+        7. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
         """
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -686,7 +687,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.tab_widget = QTabWidget()
         
         # =========================================================================
-        # 标签页 1：表格视图 (GSV 载噪比对比矩阵看板 + 原始语句数据监视)
+        # 标签页 1：表格视图 (GSV 载噪比对比矩阵看板)
         # =========================================================================
         table_tab = QWidget()
         table_layout = QVBoxLayout(table_tab)
@@ -903,27 +904,31 @@ class NMEADataAnalyzer(QMainWindow):
         table_layout.addWidget(snr_box, 3)
 
         # -------------------------------------------------------------------------
-        # 4. 原始数据流监视区 (可暂停冻结、带语句协议过滤)
+        # 标签页 2：独立原始数据流监视区 (可暂停冻结、带语句协议过滤)
         # -------------------------------------------------------------------------
-        preview_box = QGroupBox("原始数据流监视区")
+        self.stream_tab = QWidget()
+        stream_layout = QVBoxLayout(self.stream_tab)
+        stream_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_box = QGroupBox("实时串口信息流")
+        preview_box = self.preview_box
         preview_layout = QVBoxLayout(preview_box)
-        preview_layout.setContentsMargins(6, 6, 6, 6)
+        preview_layout.setContentsMargins(10, 10, 10, 10)
 
         preview_ctrl_row = QHBoxLayout()
         self.pause_preview_cb = QCheckBox("⏸ 暂停滚动 (Pause)")
         self.pause_preview_cb.setToolTip("勾选后暂停界面滚动输出，便于鼠标选中、检查和复制语句。后台数据解析与文件记录照常进行。")
-        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9;")
+        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 14px;")
         preview_ctrl_row.addWidget(self.pause_preview_cb)
 
         preview_ctrl_row.addSpacing(10)
         preview_ctrl_row.addWidget(QLabel("协议过滤:"))
         self.preview_filter_combo = QComboBox()
         self.preview_filter_combo.addItems(["全部", "仅 GGA", "仅 GSV", "仅 RMC", "仅 UBX"])
-        self.preview_filter_combo.setStyleSheet("font-size: 11px;")
+        self.preview_filter_combo.setStyleSheet("font-size: 14px; padding: 4px 8px;")
         preview_ctrl_row.addWidget(self.preview_filter_combo)
 
         self.clear_preview_btn = QPushButton("清空预览")
-        self.clear_preview_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.clear_preview_btn.setStyleSheet("padding: 5px 12px; font-size: 14px;")
         self.clear_preview_btn.clicked.connect(self.clear_data_preview)
         preview_ctrl_row.addWidget(self.clear_preview_btn)
 
@@ -932,15 +937,15 @@ class NMEADataAnalyzer(QMainWindow):
 
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 11px; background-color: #fafafa;")
+        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 13px; background-color: #fafafa;")
         self.data_preview.setPlaceholderText("数据预览区域...")
-        self.data_preview.setMinimumHeight(60)
+        self.data_preview.setMinimumHeight(400)
         preview_layout.addWidget(self.data_preview)
 
-        table_layout.addWidget(preview_box, 1)
+        stream_layout.addWidget(preview_box)
         
         # =========================================================================
-        # 标签页 2：功能与控制面板 (串口管理、状态监视、ENU配置与报告导出)
+        # 标签页 3：功能与控制面板 (串口管理、状态监视、ENU配置与报告导出)
         # =========================================================================
         control_tab = QWidget()
         control_tab_layout = QVBoxLayout(control_tab)
@@ -1292,11 +1297,16 @@ class NMEADataAnalyzer(QMainWindow):
         # -------------------------------------------------------------------------
         # 8. 全局操作与导出控制中心 (功能卡片化双行整合: 数据维护 / 报告导出 / 自动化自检)
         # -------------------------------------------------------------------------
-        action_box = QGroupBox("系统全局操作与测试报告导出")
+        self.action_box = QGroupBox("系统全局操作与测试报告导出")
+        action_box = self.action_box
+        action_box_font = QFont(action_box.font())
+        action_box_font.setPointSize(15)
+        action_box_font.setBold(True)
+        action_box.setFont(action_box_font)
         action_box.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 15px;
                 border: 1px solid #bdc3c7;
                 border-radius: 6px;
                 margin-top: 10px;
@@ -1311,6 +1321,7 @@ class NMEADataAnalyzer(QMainWindow):
                 border-radius: 3px;
                 color: #2c3e50;
                 font-weight: bold;
+                font-size: 16px;
             }
         """)
         action_layout = QVBoxLayout(action_box)
@@ -1322,7 +1333,7 @@ class NMEADataAnalyzer(QMainWindow):
         row1.setSpacing(8)
 
         lbl_sec1 = QLabel("数据与日志:")
-        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 12px;")
+        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
         row1.addWidget(lbl_sec1)
 
         # 清空数据：重置接收队列与全部统计缓存
@@ -1330,7 +1341,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.clear_data_btn.setMinimumWidth(95)
         self.clear_data_btn.setToolTip("清空数据预览区与三个串口的底层接收队列, 并重置全部统计累计值")
         self.clear_data_btn.setStyleSheet("""
-            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
             QPushButton:hover { background-color: #fde8e8; border-color: #f05252; }
         """)
 
@@ -1339,7 +1350,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.reset_stats_btn.setMinimumWidth(95)
         self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR递推均值/方向统计等), 保留已有串口数据流缓存")
         self.reset_stats_btn.setStyleSheet("""
-            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
             QPushButton:hover { background-color: #e0e7ff; border-color: #818cf8; }
         """)
 
@@ -1347,13 +1358,13 @@ class NMEADataAnalyzer(QMainWindow):
         self.clear_log_btn = QPushButton("🧹 清除日志")
         self.clear_log_btn.setMinimumWidth(95)
         self.clear_log_btn.setToolTip("清空界面日志窗口显示内容(不影响本地自动落盘日志文件)")
-        self.clear_log_btn.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self.clear_log_btn.setStyleSheet("padding: 7px 12px; font-size: 14px;")
 
         # 保存全部原始日志
         self.save_all_log_btn = QPushButton("💾 保存全部日志")
         self.save_all_log_btn.setMinimumWidth(115)
         self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
-        self.save_all_log_btn.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self.save_all_log_btn.setStyleSheet("padding: 7px 12px; font-size: 14px;")
 
         row1.addWidget(self.clear_data_btn)
         row1.addWidget(self.reset_stats_btn)
@@ -1365,7 +1376,7 @@ class NMEADataAnalyzer(QMainWindow):
         # 自动落盘日志复选框 (默认勾选)
         self.auto_log_cb = QCheckBox("自动保存原始日志")
         self.auto_log_cb.setChecked(True)
-        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 12px;")
+        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 14px;")
         self.auto_log_cb.setToolTip("勾选后将三个串口收到的原始数据按时间戳实时自动保存到 log/ 目录")
         row1.addWidget(self.auto_log_cb)
 
@@ -1384,36 +1395,36 @@ class NMEADataAnalyzer(QMainWindow):
         row2.setSpacing(8)
 
         lbl_sec2 = QLabel("报告与自检:")
-        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 12px;")
+        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
         row2.addWidget(lbl_sec2)
 
         # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report2_btn = QPushButton("📄 导出串口2报告 (MD)")
-        self.export_report2_btn.setMinimumWidth(135)
-        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report2_btn.setMinimumWidth(155)
+        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_report2_btn.setToolTip("将串口2受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
 
         self.export_pdf2_btn = QPushButton("📑 导出串口2报告 (PDF)")
-        self.export_pdf2_btn.setMinimumWidth(135)
-        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf2_btn.setMinimumWidth(155)
+        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
         self.export_pdf2_btn.setToolTip("将串口2受测机数据导出为带高清散点图的专业 PDF 测试报告")
 
         # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report3_btn = QPushButton("📄 导出串口3报告 (MD)")
-        self.export_report3_btn.setMinimumWidth(135)
-        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report3_btn.setMinimumWidth(155)
+        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_report3_btn.setToolTip("将串口3受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
 
         self.export_pdf3_btn = QPushButton("📑 导出串口3报告 (PDF)")
-        self.export_pdf3_btn.setMinimumWidth(135)
-        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf3_btn.setMinimumWidth(155)
+        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
         self.export_pdf3_btn.setToolTip("将串口3受测机数据导出为带高清散点图的专业 PDF 测试报告")
 
         # 一键自检按钮（脱机闭环仿真测试）
         self.selftest_btn = QPushButton("🚀 一键自检 (无串口)")
-        self.selftest_btn.setMinimumWidth(140)
+        self.selftest_btn.setMinimumWidth(165)
         self.selftest_btn.setStyleSheet("""
-            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 12px; }
+            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
             QPushButton:hover { background-color: #9b59b6; }
             QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
         """)
@@ -1428,6 +1439,17 @@ class NMEADataAnalyzer(QMainWindow):
         row2.addStretch()
 
         action_layout.addLayout(row2)
+        self.action_controls = [
+            lbl_sec1, self.clear_data_btn, self.reset_stats_btn,
+            self.clear_log_btn, self.save_all_log_btn, self.auto_log_cb,
+            lbl_sec2, self.export_report2_btn, self.export_pdf2_btn,
+            self.export_report3_btn, self.export_pdf3_btn, self.selftest_btn,
+        ]
+        for control in self.action_controls:
+            control_font = QFont(control.font())
+            control_font.setPointSize(14)
+            control.setFont(control_font)
+            control.setMinimumHeight(34)
         control_layout.addWidget(action_box)
 
         # 组装滚动容器到控制面板页面中
@@ -1437,6 +1459,7 @@ class NMEADataAnalyzer(QMainWindow):
         # 默认展示控制面板(高频操作), 表格视图次之
         self.tab_widget.addTab(control_tab, "功能与控制面板")
         self.tab_widget.addTab(table_tab, "表格视图")
+        self.tab_widget.addTab(self.stream_tab, "串口实时数据流")
         
         # =========================================================================
         # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
@@ -2940,7 +2963,15 @@ class NMEADataAnalyzer(QMainWindow):
     def _create_dir_port_widget(self, parent_tab, port_id):
         """为指定串口创建方向测试UI"""
         tab = QWidget()
-        tab_layout = QVBoxLayout(tab)
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        direction_scroll = QScrollArea()
+        direction_scroll.setWidgetResizable(True)
+        direction_scroll.setFrameShape(QFrame.NoFrame)
+        direction_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        direction_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        content_widget = QWidget()
+        tab_layout = QVBoxLayout(content_widget)
 
         is_com3 = (port_id == 3)
 
@@ -2991,6 +3022,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         for i in range(4):
             box = QGroupBox(f"方向{i + 1}")
+            box.setMinimumHeight(208)
             box.setStyleSheet("QGroupBox { font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 14px; } QGroupBox::title { background-color: #ecf0f1; padding: 2px 10px; border-radius: 3px; }")
             box_layout = QVBoxLayout(box)
 
@@ -3010,15 +3042,47 @@ class NMEADataAnalyzer(QMainWindow):
             v_label.setStyleSheet("font-size: 12px; color: #27ae60;")
             box_layout.addWidget(v_label)
 
-            start_btn = QPushButton("启动方向测试")
-            start_btn.setMinimumWidth(100)
-            start_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
+            state_label = QLabel("状态: 未开始")
+            state_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #7f8c8d;")
+            box_layout.addWidget(state_label)
+
+            controls_layout = QGridLayout()
+            controls_layout.setSpacing(6)
+            start_btn = QPushButton("启动测试")
+            pause_btn = QPushButton("暂停测试")
+            resume_btn = QPushButton("继续测试")
+            terminate_btn = QPushButton("终止测试")
+            button_styles = {
+                start_btn: "#27ae60",
+                pause_btn: "#f39c12",
+                resume_btn: "#2980b9",
+                terminate_btn: "#c0392b",
+            }
+            for button, color in button_styles.items():
+                button.setMinimumWidth(88)
+                button.setMinimumHeight(32)
+                button.setStyleSheet(
+                    f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
+                    "padding: 5px 10px; border-radius: 4px; font-size: 13px; } "
+                    "QPushButton:disabled { background-color: #bdc3c7; color: #ecf0f1; }"
+                )
+            pause_btn.setEnabled(False)
+            resume_btn.setEnabled(False)
+            terminate_btn.setEnabled(False)
             idx = i
-            if is_com3:
-                start_btn.clicked.connect(lambda checked, d=idx: self._toggle_single_direction3(d))
-            else:
-                start_btn.clicked.connect(lambda checked, d=idx: self._toggle_single_direction(d))
-            box_layout.addWidget(start_btn)
+            start_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._start_direction_test(p, d))
+            pause_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._pause_direction_test(p, d))
+            resume_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._resume_direction_test(p, d))
+            terminate_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._terminate_direction_test(p, d))
+            controls_layout.addWidget(start_btn, 0, 0)
+            controls_layout.addWidget(pause_btn, 0, 1)
+            controls_layout.addWidget(resume_btn, 1, 0)
+            controls_layout.addWidget(terminate_btn, 1, 1)
+            box_layout.addLayout(controls_layout)
 
             stat_boxes.append({
                 'box': box,
@@ -3026,7 +3090,11 @@ class NMEADataAnalyzer(QMainWindow):
                 'epoch': epoch_label,
                 'h': h_label,
                 'v': v_label,
-                'btn': start_btn,
+                'state': state_label,
+                'start_btn': start_btn,
+                'pause_btn': pause_btn,
+                'resume_btn': resume_btn,
+                'terminate_btn': terminate_btn,
             })
             stats_grid.addWidget(box, i // 2, i % 2)
 
@@ -3115,6 +3183,9 @@ class NMEADataAnalyzer(QMainWindow):
             self.dir_h_chart = h_chart
             self.dir_v_chart = v_chart
 
+        content_widget.setMinimumHeight(tab_layout.sizeHint().height())
+        direction_scroll.setWidget(content_widget)
+        outer_layout.addWidget(direction_scroll)
         title = f"串口3 (干扰测试2)" if is_com3 else f"串口2 (干扰测试)"
         parent_tab.addTab(tab, title)
 
@@ -3186,51 +3257,96 @@ class NMEADataAnalyzer(QMainWindow):
         layout.addWidget(sub_tabs)
         return tab
 
-    def _toggle_single_direction(self, direction_index):
-        ds = self.direction_stats[direction_index]
-        boxes = self.dir_stat_boxes
-        if ds._active:
-            self._save_enu_for_direction(direction_index, self.direction_stats, boxes)
-            ds.stop()
-            boxes[direction_index]['btn'].setText("继续方向测试")
-            boxes[direction_index]['btn'].setStyleSheet(
-                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-            self._dir_enu_active_index = -1
-            self.log_info(f"方向{direction_index + 1} 测试已停止 (串口2)")
-        else:
-            self._save_enu_for_active_direction()
-            self._reset_enu_chart_data(2)
-            ds.start()
-            if ds.total_epochs == 0:
-                ds.clear_enu()
-            self._dir_enu_active_index = direction_index
-            boxes[direction_index]['btn'].setText("暂停方向测试")
-            boxes[direction_index]['btn'].setStyleSheet(
-                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
-            self.log_info(f"方向{direction_index + 1} 测试已启动 (串口2)")
+    def _direction_context(self, port_id):
+        """返回指定测试串口的统计对象、界面卡片和活动索引属性名。"""
+        if port_id == 3:
+            return self.direction_stats3, self.dir_stat_boxes3, '_dir3_enu_active_index'
+        return self.direction_stats, self.dir_stat_boxes, '_dir_enu_active_index'
 
-    def _toggle_single_direction3(self, direction_index):
-        ds = self.direction_stats3[direction_index]
-        boxes = self.dir_stat_boxes3
-        if ds._active:
-            self._save_enu_for_direction(direction_index, self.direction_stats3, boxes)
-            ds.stop()
-            boxes[direction_index]['btn'].setText("继续方向测试")
-            boxes[direction_index]['btn'].setStyleSheet(
-                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-            self._dir3_enu_active_index = -1
-            self.log_info(f"方向{direction_index + 1} 测试已停止 (串口3)")
-        else:
-            self._save_enu_for_active_direction3()
-            self._reset_enu_chart_data(3)
-            ds.start()
-            if ds.total_epochs == 0:
-                ds.clear_enu()
-            self._dir3_enu_active_index = direction_index
-            boxes[direction_index]['btn'].setText("暂停方向测试")
-            boxes[direction_index]['btn'].setStyleSheet(
-                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
-            self.log_info(f"方向{direction_index + 1} 测试已启动 (串口3)")
+    def _refresh_direction_controls(self, port_id, direction_index):
+        stats, boxes, _ = self._direction_context(port_id)
+        ds = stats[direction_index]
+        controls = boxes[direction_index]
+        states = {
+            'idle': ("状态: 未开始", "#7f8c8d"),
+            'running': ("状态: 测试中", "#27ae60"),
+            'paused': ("状态: 已暂停", "#f39c12"),
+            'terminated': ("状态: 已终止", "#c0392b"),
+        }
+        text, color = states[ds.state]
+        controls['state'].setText(text)
+        controls['state'].setStyleSheet(
+            f"font-size: 13px; font-weight: bold; color: {color};")
+        controls['start_btn'].setEnabled(ds.state == 'idle')
+        controls['pause_btn'].setEnabled(ds.state == 'running')
+        controls['resume_btn'].setEnabled(ds.state == 'paused')
+        controls['terminate_btn'].setEnabled(ds.state in ('running', 'paused'))
+
+    def _pause_active_direction(self, port_id, except_index=None):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        for index, ds in enumerate(stats):
+            if ds.is_active and index != except_index:
+                self._save_enu_for_direction(index, stats, boxes)
+                ds.pause()
+                self._refresh_direction_controls(port_id, index)
+                self.log_info(f"方向{index + 1} 测试已自动暂停 (串口{port_id})")
+        active = next((i for i, ds in enumerate(stats) if ds.is_active), -1)
+        setattr(self, active_attr, active)
+
+    def _start_direction_test(self, port_id, direction_index):
+        stats, _, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state != 'idle':
+            return False
+        self._pause_active_direction(port_id, except_index=direction_index)
+        self._reset_enu_chart_data(port_id)
+        ds.clear_enu()
+        if not ds.start():
+            return False
+        setattr(self, active_attr, direction_index)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已启动 (串口{port_id})")
+        return True
+
+    def _pause_direction_test(self, port_id, direction_index):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if not ds.is_active:
+            return False
+        self._save_enu_for_direction(direction_index, stats, boxes)
+        ds.pause()
+        setattr(self, active_attr, -1)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已暂停 (串口{port_id})")
+        return True
+
+    def _resume_direction_test(self, port_id, direction_index):
+        stats, _, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state != 'paused':
+            return False
+        self._pause_active_direction(port_id, except_index=direction_index)
+        self._reset_enu_chart_data(port_id)
+        if not ds.start():
+            return False
+        setattr(self, active_attr, direction_index)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已继续 (串口{port_id})")
+        return True
+
+    def _terminate_direction_test(self, port_id, direction_index):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state not in ('running', 'paused'):
+            return False
+        if ds.is_active:
+            self._save_enu_for_direction(direction_index, stats, boxes)
+        ds.terminate()
+        if getattr(self, active_attr) == direction_index:
+            setattr(self, active_attr, -1)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已终止 (串口{port_id})")
+        return True
 
     def _on_auto_stop_toggled(self, state):
         self._dir_auto_stop_enabled = (state == Qt.Checked)
@@ -3243,26 +3359,10 @@ class NMEADataAnalyzer(QMainWindow):
         self._dir_auto_stop_epochs = val
 
     def _save_enu_for_active_direction(self):
-        for i in range(4):
-            ds = self.direction_stats[i]
-            if ds._active:
-                self._save_enu_for_direction(i, self.direction_stats, self.dir_stat_boxes)
-                ds.stop()
-                self.dir_stat_boxes[i]['btn'].setText("继续方向测试")
-                self.dir_stat_boxes[i]['btn'].setStyleSheet(
-                    "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-                self.log_info(f"方向{i + 1} 测试已停止 (串口2)")
+        self._pause_active_direction(2)
 
     def _save_enu_for_active_direction3(self):
-        for i in range(4):
-            ds = self.direction_stats3[i]
-            if ds._active:
-                self._save_enu_for_direction(i, self.direction_stats3, self.dir_stat_boxes3)
-                ds.stop()
-                self.dir_stat_boxes3[i]['btn'].setText("继续方向测试")
-                self.dir_stat_boxes3[i]['btn'].setStyleSheet(
-                    "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-                self.log_info(f"方向{i + 1} 测试已停止 (串口3)")
+        self._pause_active_direction(3)
 
     def _save_enu_for_direction(self, direction_index, direction_stats=None, dir_stat_boxes=None):
         if direction_stats is None:
@@ -3388,10 +3488,12 @@ class NMEADataAnalyzer(QMainWindow):
                         reason = f"达到设定历元数 {auto_stop_epochs}"
                     if stopped:
                         self._save_enu_for_direction(i, direction_stats, dir_stat_boxes)
-                        ds.stop()
-                        dir_stat_boxes[i]['btn'].setText("继续方向测试")
-                        dir_stat_boxes[i]['btn'].setStyleSheet(
-                            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
+                        ds.terminate()
+                        port_id = 3 if direction_stats is self.direction_stats3 else 2
+                        active_attr = '_dir3_enu_active_index' if port_id == 3 else '_dir_enu_active_index'
+                        if getattr(self, active_attr) == i:
+                            setattr(self, active_attr, -1)
+                        self._refresh_direction_controls(port_id, i)
                         self.log_info(f"方向{i + 1} 自动停止 ({reason})")
 
     def _refresh_dir_summary(self, table, direction_stats):
@@ -3610,42 +3712,24 @@ class NMEADataAnalyzer(QMainWindow):
         return png_paths
 
     def _reset_direction_stats(self):
-        previously_active = [i for i in range(4) if self.direction_stats[i]._active]
         self._reset_enu_chart_data(2)
         for i in range(4):
             self.direction_stats[i].reset()
-            btn = self.dir_stat_boxes[i]['btn']
-            btn.setText("启动方向测试")
-            btn.setStyleSheet(
-                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-        for i in previously_active:
-            self.direction_stats[i].start()
-            self._dir_enu_active_index = i
-            self.dir_stat_boxes[i]['btn'].setText("暂停方向测试")
-            self.dir_stat_boxes[i]['btn'].setStyleSheet(
-                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
+            self._refresh_direction_controls(2, i)
+        self._dir_enu_active_index = -1
         self._update_direction_charts()
         self._update_direction_stats_display()
-        self.log_info("串口2方向统计已重置")
+        self.log_info("串口2方向测试已重新开始准备：全部统计和时长已清空")
 
     def _reset_direction_stats3(self):
-        previously_active = [i for i in range(4) if self.direction_stats3[i]._active]
         self._reset_enu_chart_data(3)
         for i in range(4):
             self.direction_stats3[i].reset()
-            btn = self.dir_stat_boxes3[i]['btn']
-            btn.setText("启动方向测试")
-            btn.setStyleSheet(
-                "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
-        for i in previously_active:
-            self.direction_stats3[i].start()
-            self._dir3_enu_active_index = i
-            self.dir_stat_boxes3[i]['btn'].setText("暂停方向测试")
-            self.dir_stat_boxes3[i]['btn'].setStyleSheet(
-                "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
+            self._refresh_direction_controls(3, i)
+        self._dir3_enu_active_index = -1
         self._update_direction_charts3()
         self._update_direction_stats_display()
-        self.log_info("串口3方向统计已重置")
+        self.log_info("串口3方向测试已重新开始准备：全部统计和时长已清空")
 
     def reset_all_stats(self):
         """重置所有统计"""
@@ -3797,8 +3881,6 @@ class NMEADataAnalyzer(QMainWindow):
         self.p3_gga_nsat = 0  # [新增]
 
         # 重置方向统计
-        for ds in self.direction_stats + self.direction_stats3:
-            ds._active = False
         self._reset_direction_stats()
         self._reset_direction_stats3()
         self._latest_enu2_east = None

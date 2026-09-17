@@ -6,7 +6,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt5.QtCore import QCoreApplication
+from PyQt5.QtWidgets import QApplication
 
 from src.communication.serial_manager import SerialManager
 from src.nmea.nmea_parser import NMEAParser
@@ -18,7 +18,7 @@ from src.simulation.nmea_generator import _ubx_nav_status
 class OptimizedCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QCoreApplication.instance() or QCoreApplication([])
+        cls.app = QApplication.instance() or QApplication([])
 
     def test_reconnect_timer_stops_after_success(self):
         manager = SerialManager(1)
@@ -79,6 +79,25 @@ class OptimizedCoreTests(unittest.TestCase):
         stats.stop()
         self.assertGreater(stats.duration, first_duration)
         self.assertEqual(stats.successful_epochs, 1)
+
+    def test_direction_termination_preserves_results_and_blocks_resume_until_reset(self):
+        stats = DirectionStatistics()
+        self.assertTrue(stats.start())
+        stats.add_epoch(3.0, 4.0, 2.0, 1)
+        self.assertTrue(stats.pause())
+        paused_duration = stats.duration
+
+        self.assertTrue(stats.start())
+        self.assertTrue(stats.terminate())
+        self.assertTrue(stats.is_terminated)
+        self.assertFalse(stats.is_active)
+        self.assertEqual(stats.total_epochs, 1)
+        self.assertGreaterEqual(stats.duration, paused_duration)
+        self.assertFalse(stats.start())
+
+        stats.reset()
+        self.assertFalse(stats.is_terminated)
+        self.assertTrue(stats.start())
 
 
 if __name__ == "__main__":
