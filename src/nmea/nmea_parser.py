@@ -26,6 +26,7 @@ NMEA-0183 协议与原始观测数据综合解析器
 
 import re
 from collections import deque
+from datetime import datetime, timezone
 
 
 class NMEAParser:
@@ -50,6 +51,9 @@ class NMEAParser:
         self.obsvha_data = deque(maxlen=1)  # 最新一条 OBSVHA 观测报文
         self.obsvma_data = deque(maxlen=1)  # 最新一条 OBSVMA 观测报文
         self.satellite_info = {}            # 当前所有可视卫星信息字典 {prn: {elevation, azimuth, snr, signal_id, talker_id}}
+        self._gsv_cycles = {}                # 正在组装的完整 GSV 历元 {(talker, signal): {...}}
+        self.gsv_sequence = 0                # 每提交一个完整星座/频点历元递增，供上层去重采样
+        self.last_gsv_commit_keys = set()    # 最近一次完整提交实际更新的卫星键
         self.position_fixes = deque(maxlen=1) # 最新有效定位解（转为十进制度）
         self.dop_values = deque(maxlen=1)   # 最新精度衰减因子 (PDOP, HDOP, VDOP)
         self.errors = deque(maxlen=100)     # 最近 100 条错误信息日志
@@ -255,16 +259,20 @@ class NMEAParser:
             try:
                 day = int(data["date"][:2])
                 month = int(data["date"][2:4])
-                year = 2000 + int(data["date"][4:6])
+                yy = int(data["date"][4:6])
+                year = 1900 + yy if yy >= 80 else 2000 + yy
 
                 hours = int(data["timestamp"][:2])
                 minutes = int(data["timestamp"][2:4])
                 seconds = float(data["timestamp"][4:])
 
+                whole_seconds = int(seconds)
+                dt = datetime(year, month, day, hours, minutes, whole_seconds,
+                              tzinfo=timezone.utc)
                 seconds_of_day = hours * 3600 + minutes * 60 + seconds
-
-                # 计算本周内的秒数 (以 604800 秒为一周模长)
-                self.last_gps_tow = seconds_of_day % 604800
+                # Python Monday=0；GPS 周从 Sunday 开始。
+                gps_day = (dt.weekday() + 1) % 7
+                self.last_gps_tow = gps_day * 86400 + seconds_of_day
                 self.last_gps_time_valid = True
             except Exception:
                 pass
@@ -300,14 +308,6 @@ class NMEAParser:
         message_number = int(parts[2]) if parts[2] else 0
         total_satellites = int(parts[3]) if parts[3] else 0
 
-        # --- GSV 序列重置: 收到第 1 包时清空该星系旧缓存 ---
-        if message_number == 1:
-            self.satellite_info = {
-                prn: info
-                for prn, info in self.satellite_info.items()
-                if info.get("talker_id") != talker_id
-            }
-
         # 检查是否包含 NMEA 4.10+ 标准末尾的 Signal ID 字段
         extra_fields = len(parts) - 4
         signal_id = 0
@@ -339,14 +339,42 @@ class NMEAParser:
                 "signal_id": signal_id,
             })
 
-            # 更新全局卫星字典
-            self.satellite_info[prn] = {
-                "elevation": elevation,
-                "azimuth": azimuth,
-                "snr": snr,
-                "signal_id": signal_id,
-                "talker_id": talker_id,
+        cycle_key = (talker_id, signal_id)
+        if message_number == 1 or cycle_key not in self._gsv_cycles:
+            self._gsv_cycles[cycle_key] = {
+                "total_messages": total_messages,
+                "messages": {},
             }
+        cycle = self._gsv_cycles[cycle_key]
+        # 总包数变化说明上一历元不完整，直接开始新的候选历元。
+        if cycle["total_messages"] != total_messages:
+            cycle = {"total_messages": total_messages, "messages": {}}
+            self._gsv_cycles[cycle_key] = cycle
+        cycle["messages"][message_number] = satellites
+
+        # 仅在 1..N 全部到齐时原子提交，旧历元中消失的卫星会被正确移除。
+        expected = set(range(1, total_messages + 1))
+        if total_messages > 0 and set(cycle["messages"]) == expected:
+            merged = []
+            for msg_no in range(1, total_messages + 1):
+                merged.extend(cycle["messages"][msg_no])
+            self.satellite_info = {
+                key: info for key, info in self.satellite_info.items()
+                if not (key[0] == talker_id and key[1] == signal_id)
+            }
+            for sat in merged:
+                prn = sat["prn"]
+                if prn:
+                    self.satellite_info[(talker_id, signal_id, prn)] = {
+                        **sat,
+                        "talker_id": talker_id,
+                    }
+            self.last_gsv_commit_keys = {
+                key for key in self.satellite_info
+                if key[0] == talker_id and key[1] == signal_id
+            }
+            self.gsv_sequence += 1
+            del self._gsv_cycles[cycle_key]
 
         self.gpgsv_data.append({
             "talker_id": talker_id,
@@ -356,6 +384,10 @@ class NMEAParser:
             "signal_id": signal_id,
             "satellites": satellites,
         })
+
+    def get_satellite_snapshot(self):
+        """返回最近已完整提交的多星座、多频点卫星快照副本。"""
+        return {key: dict(value) for key, value in self.satellite_info.items()}
 
     def parse_gpgsa(self, sentence):
         """

@@ -155,6 +155,8 @@ class SelfTestRunner(QObject):
         self._exc_count = 0
         self._exc_details = []
         self._wall0 = time.monotonic()
+        # 保证方向启动检测的虚拟时间步长不超过约 5 秒；高倍率下避免 500ms 轮询造成大量样本误差。
+        self._monitor.setInterval(max(20, min(500, int(5000 / max(self._speed, 1.0)))))
 
         # 挂载异常拦截钩子，记录运行期间的任何未捕获异常
         self._orig_hook = sys.excepthook
@@ -177,7 +179,8 @@ class SelfTestRunner(QObject):
         w.auto_log_enabled = True
         w._open_auto_log_files()
 
-        # 清空界面数据预览与图表
+        # 每次自检从完全干净的解析器、统计与图表状态开始，保证重复运行可复现。
+        w.reset_all_stats()
         w.clear_data_preview()
         w.current_data_source = 'serial'
         w.current_parser = NMEAParser()
@@ -342,15 +345,17 @@ class SelfTestRunner(QObject):
         # 3. ENU 数据量
         expect = epochs - (DIR_START_EPOCH if self._direction else 0)
         min_pts = max(10, int(expect * 0.8))
-        e2n, e3n = len(w.enu2_times), len(w.enu3_times)
-        item("ENU数据量", e2n >= min_pts and e3n >= min_pts,
-             f"ENU2={e2n} ENU3={e3n} 期望≥{min_pts}")
+        e1n, e2n, e3n = len(w.enu1_times), len(w.enu2_times), len(w.enu3_times)
+        item("ENU数据量", e1n >= min_pts and e2n >= min_pts and e3n >= min_pts,
+             f"ENU1={e1n} ENU2={e2n} ENU3={e3n} 期望≥{min_pts}")
 
         # 4. ENU 标准差有效性
         s2e, s2n, s2u = w._std_enu2_east.std, w._std_enu2_north.std, w._std_enu2_up.std
         item("ENU标准差有效",
-             s2e > 0 and s2n > 0 and s2u > 0 and w._std_enu3_east.std > 0,
-             "σ2(E/N/U)=%.3f/%.3f/%.3f σ3E=%.3f" % (s2e, s2n, s2u, w._std_enu3_east.std))
+             w._std_enu1_east.std > 0 and s2e > 0 and s2n > 0 and s2u > 0
+             and w._std_enu3_east.std > 0,
+             "σ1E=%.3f σ2(E/N/U)=%.3f/%.3f/%.3f σ3E=%.3f" %
+             (w._std_enu1_east.std, s2e, s2n, s2u, w._std_enu3_east.std))
 
         # 5. 尖峰异常值剔除
         item("异常值剔除生效(尖峰被拦截)",
@@ -359,7 +364,7 @@ class SelfTestRunner(QObject):
 
         # 6. SNR 卫星数据
         p1s, p2s, p3s = w.port1_satellites, w.port2_satellites, w.port3_satellites
-        gn_cnt = sum(1 for d in (p1s, p2s, p3s) for k in d if k.startswith('GN'))
+        gn_cnt = sum(1 for d in (p1s, p2s, p3s) for k in d if k[0] == 'GN')
         item("SNR表三口有数据且含GNGSV卫星",
              len(p1s) > 0 and len(p2s) > 0 and len(p3s) > 0 and gn_cnt > 0,
              f"卫星数 {len(p1s)}/{len(p2s)}/{len(p3s)} GN键={gn_cnt}")
@@ -442,4 +447,3 @@ class SelfTestRunner(QObject):
         path = os.path.join(self.report_dir, "selftest_report.md")
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
-

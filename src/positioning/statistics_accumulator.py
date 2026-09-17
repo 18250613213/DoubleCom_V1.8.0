@@ -84,7 +84,9 @@ class StatisticsAccumulator:
         """
         if self.n < 2:
             return 0.0
-        return (self.sum_sq - self.sum ** 2 / self.n) / (self.n - 1)
+        value = (self.sum_sq - self.sum ** 2 / self.n) / (self.n - 1)
+        # 浮点消减误差可能产生极小负数，标准差不应因此触发 math domain error。
+        return max(value, 0.0)
     
     @property
     def std(self):
@@ -174,4 +176,3 @@ class MultiDimensionStatistics:
             'v_rms': v_stats['rms'],
             'v_std': v_stats['std']
         }
-
