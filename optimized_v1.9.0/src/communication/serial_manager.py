@@ -58,7 +58,8 @@ class SerialManager(QObject):
         self.serial_port = None                 # 底层 PySerial Serial 对象引用
         
         # 重连定时器配置
-        self.reconnect_timer = QTimer()
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
         self.reconnect_timer.timeout.connect(self.try_reconnect)
         self.reconnect_enabled = False          # 是否允许自动重连（用户手动断开时设为 False）
         self.last_port = None                   # 上次成功连接的串口名称 (如 'COM3')
@@ -71,7 +72,7 @@ class SerialManager(QObject):
         self._reconnect_interval_ms = RECONNECT_INITIAL_MS # 当前重连等待周期
 
         # 核心轮询定时器: 10ms 间隔查询串口是否到达新字节
-        self._read_timer = QTimer()
+        self._read_timer = QTimer(self)
         self._read_timer.timeout.connect(self._poll_serial)
 
     def get_available_ports(self):
@@ -102,6 +103,7 @@ class SerialManager(QObject):
         返回:
             bool: 连接成功返回 True，发生异常或占用失败返回 False。
         """
+        new_port = None
         try:
             # 映射校验位枚举
             parity_map = {
@@ -119,7 +121,7 @@ class SerialManager(QObject):
             }
 
             # 创建并打开 PySerial 实例，设置超时为 0 实现纯非阻塞轮询
-            self.serial_port = serial.Serial(
+            new_port = serial.Serial(
                 port=port,
                 baudrate=baud_rate,
                 bytesize=data_bits,
@@ -128,12 +130,22 @@ class SerialManager(QObject):
                 timeout=0,
             )
 
+            # 串口完全打开成功后才替换当前句柄，避免失败尝试破坏已有状态。
+            old_port = self.serial_port
+            self.serial_port = new_port
+            if old_port is not None and old_port is not new_port:
+                try:
+                    old_port.close()
+                except Exception:
+                    pass
+
             # 记录连接参数以便断线后恢复
             self.last_port = port
             self.last_settings = (baud_rate, data_bits, stop_bits, parity)
             self._read_buffer = b''
             self._reconnect_count = 0
             self._reconnect_interval_ms = RECONNECT_INITIAL_MS
+            self.reconnect_timer.stop()
 
             # 启动 10ms 轮询定时器
             self._read_timer.start(10)
@@ -144,6 +156,11 @@ class SerialManager(QObject):
             return True
 
         except Exception as e:
+            if new_port is not None:
+                try:
+                    new_port.close()
+                except Exception:
+                    pass
             self.error_occurred.emit(
                 f"Port {self.port_id} connect failed: {str(e)}", self.port_id
             )
@@ -181,6 +198,8 @@ class SerialManager(QObject):
           3. 尝试重新打开串口，成功则重置退避间隔；
              失败则按指数退避算法（乘 2.0，上限 30 秒）重新启动下一次定时。
         """
+        # 单次定时器原则：本次尝试结束前不允许旧定时事件再次进入。
+        self.reconnect_timer.stop()
         if not self.last_port or not self.last_settings or not self.reconnect_enabled:
             return
 
@@ -199,6 +218,7 @@ class SerialManager(QObject):
         )
 
         if self.connect(self.last_port, *self.last_settings):
+            self.reconnect_timer.stop()
             self.status_message.emit(
                 f"Port {self.port_id} reconnected successfully",
                 self.port_id
@@ -303,4 +323,5 @@ class SerialManager(QObject):
                 self.port_id
             )
             self._reconnect_interval_ms = RECONNECT_INITIAL_MS
-            self.reconnect_timer.start(self._reconnect_interval_ms)
+            if not self.reconnect_timer.isActive():
+                self.reconnect_timer.start(self._reconnect_interval_ms)

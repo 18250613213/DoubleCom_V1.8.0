@@ -24,6 +24,7 @@ UBX_SYNC2 = 0x62          # 同步字节 2 (ASCII: b)
 UBX_HEADER_SIZE = 6       # 头部固定大小: 同步头(2) + Class(1) + ID(1) + Length(2)
 UBX_OVERHEAD = 8          # 帧总开销: 头部(6) + 校验和(2)
 UBX_SYNC_LEN = 2          # 同步字节长度
+UBX_MAX_PAYLOAD = 8192    # 防止噪声伪同步头声明超长负载并阻塞整个混合协议流
 
 # --- 消息类别 (Class) 与标识 (ID) ---
 CLASS_NAV = 0x01          # 导航类消息 (Navigation Results)
@@ -100,6 +101,10 @@ def find_ubx_frame(buffer_data):
     # 小端字节序解析负载长度 (2 字节无符号整数)
     length = struct.unpack_from('<H', remaining, 4)[0]
 
+    if length > UBX_MAX_PAYLOAD:
+        # 只跳过伪同步头的第一个字节，保留其余数据重新扫描；不能按伪长度吞掉后续数据。
+        return -1, (pre_data, None, remaining[1:])
+
     total_len = UBX_OVERHEAD + length
     if len(remaining) < total_len:
         # 负载数据尚未接收完整，继续等待
@@ -114,8 +119,8 @@ def find_ubx_frame(buffer_data):
 
     # 验证末尾两字节校验和
     if ck_a != frame[UBX_HEADER_SIZE + length] or ck_b != frame[UBX_HEADER_SIZE + length + 1]:
-        # 校验和不匹配：为虚假同步字（False Sync），通知调用者跳过该错误帧并继续检索
-        return -1, (pre_data, None, rest)
+        # 校验失败时仅跳过首个 0xB5，避免错误长度字段吞掉其中嵌套的合法 NMEA/UBX 数据。
+        return -1, (pre_data, None, remaining[1:])
 
     return idx, (pre_data, frame, rest)
 
@@ -146,7 +151,7 @@ def extract_ubx_frames_from_buffer(buffer_data):
 
         pre_data, frame, rest = result
         if frame is None:
-            # 校验和失败（虚假同步字）：丢弃错误的头部，并将前后数据拼接继续扫描
+            # 校验和失败或长度异常：仅丢弃一个同步字节后继续扫描。
             remaining = pre_data + rest
             continue
 

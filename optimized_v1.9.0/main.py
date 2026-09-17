@@ -55,6 +55,10 @@ from src.protocol.ubx_parser import parse_ubx_frame
 
 from collections import deque
 
+# 打包后资源位于 PyInstaller 临时目录，日志和报告写到 EXE 所在目录。
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+RESOURCE_DIR = getattr(sys, '_MEIPASS', SOURCE_DIR)
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else SOURCE_DIR
 
 # --- NMEA 4.10+ 标准各导航系统信号频点编号到名称的映射表 ---
 # 字典键: 'G'(GPS), 'R'(GLONASS), 'E'(Galileo), 'B'(BeiDou)
@@ -76,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -201,6 +205,14 @@ class RunningAverage:
         if key in self._data:
             return self._data[key]['avg']
         return None
+
+    def reset(self):
+        """清空全部键的累计样本和均值。"""
+        self._data.clear()
+
+    def count(self, key):
+        """返回指定键已累计的真实历元样本数。"""
+        return self._data.get(key, {}).get('n', 0)
 
     def values(self):
         """
@@ -366,7 +378,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.showMaximized()
 
         # 加载并设置程序窗口图标
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'app_icon.png')
+        icon_path = os.path.join(RESOURCE_DIR, 'resources', 'app_icon.png')
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         # 1. 核心独立算法与解析模块初始化
@@ -413,12 +425,14 @@ class NMEADataAnalyzer(QMainWindow):
         # ----------------------------------------------------
         # 3. 多串口卫星信噪比 (SNR/CN0) 实时与历史数据
         # ----------------------------------------------------
-        self.port1_satellites = {}  # 串口1当前可视星字典: {prn: {'snr': snr, 'system': sys}}
+        # 键统一为 (talker_id, signal_id, prn)，避免同一卫星多频点互相覆盖。
+        self.port1_satellites = {}
         self.port2_satellites = {}  # 串口2当前可视星字典: {prn: {'snr': snr, 'system': sys}}
         self._port1_snr_signals = {}
         self._port2_snr_signals = {}
         self.port3_satellites = {}  # 串口3当前可视星字典
         self._port3_snr_signals = {}
+        self._last_gsv_sequence = {1: 0, 2: 0, 3: 0}
 
         # ----------------------------------------------------
         # 4. ENU 误差计算基准参考点与时间序列缓存
@@ -547,12 +561,12 @@ class NMEADataAnalyzer(QMainWindow):
         # 9. 原始数据自动日志落盘配置
         # ----------------------------------------------------
         self.auto_log_enabled = True
-        self.auto_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
+        self.auto_log_dir = os.path.join(APP_DIR, "log")
         os.makedirs(self.auto_log_dir, exist_ok=True)
         self._log_file1 = None                                # 串口 1 自动日志句柄
         self._log_file2 = None                                # 串口 2 自动日志句柄
         self._log_file3 = None                                # 串口 3 自动日志句柄
-        self._log_flush_count = 0
+        self._log_flush_count = {1: 0, 2: 0, 3: 0}
         self._LOG_FLUSH_INTERVAL = 50                         # 每写入 50 行强制刷新一次系统磁盘缓冲
         self._data_count_update = 0
         self._DATA_COUNT_INTERVAL = 10
@@ -637,6 +651,13 @@ class NMEADataAnalyzer(QMainWindow):
         self._selftest_ui_timer = QTimer()
         self._selftest_ui_timer.setInterval(500)
         self._selftest_ui_timer.timeout.connect(self._on_selftest_ui_tick)
+
+        # 数据预览批量刷新，避免每条串口语句触发一次 QTextEdit 布局。
+        self._preview_pending = deque(maxlen=2000)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(100)
+        self._preview_timer.timeout.connect(self._flush_data_preview)
+        self._preview_timer.start()
     
     def init_ui(self):
         """
@@ -1700,12 +1721,14 @@ class NMEADataAnalyzer(QMainWindow):
             QMessageBox.warning(self, "警告", f"请选择串口{port_id}的串口号")
             return
 
+        if not manager.connect(port, baud):
+            return
+
         if port_id == 1:
             self.clear_data_preview()
             self.current_data_source = 'serial'
-            self.current_parser = NMEAParser()
+            self.current_parser = self.nmea_parser
 
-        manager.connect(port, baud)
         self.update_timer.start()
 
     def disconnect_serial(self, port_id=1):
@@ -1798,6 +1821,54 @@ class NMEADataAnalyzer(QMainWindow):
             value = -value
         return value
 
+    @staticmethod
+    def _snr_sort_key(key):
+        talker, signal_id, prn = key
+        return talker, prn, signal_id
+
+    @staticmethod
+    def _snr_key_parts(key):
+        return key[0], key[1], key[2]
+
+    def _sync_gsv_snapshot(self, port_id, parser):
+        """在完整 GSV 历元提交后原子更新当前快照并按真实历元采样均值。"""
+        if parser.gsv_sequence == self._last_gsv_sequence.get(port_id, 0):
+            return
+        self._last_gsv_sequence[port_id] = parser.gsv_sequence
+
+        snapshot = parser.get_satellite_snapshot()
+        satellites = {}
+        signals = {}
+        for key, sat in snapshot.items():
+            talker, signal_id, prn = key
+            snr = sat.get('snr', 0)
+            if prn and 0 < snr <= 99:
+                satellites[key] = snr
+                system_key = TALKER_TO_SYSTEM.get(talker, 'G')
+                system_signals = SIGNAL_NAMES.get(system_key, SIGNAL_NAMES['G'])
+                signals[key] = system_signals.get(signal_id, f'S{signal_id}')
+
+        avg = {1: self._port1_snr_avg, 2: self._port2_snr_avg, 3: self._port3_snr_avg}[port_id]
+        for key in parser.last_gsv_commit_keys:
+            if key in satellites:
+                avg.add(key, satellites[key])
+
+        if port_id == 1:
+            self.port1_satellites = satellites
+            self._port1_snr_signals = signals
+        elif port_id == 2:
+            self.port2_satellites = satellites
+            self._port2_snr_signals = signals
+            for key in parser.last_gsv_commit_keys:
+                if key in satellites and key in self.port1_satellites:
+                    self._snr_diff_avg.add(key, satellites[key] - self.port1_satellites[key])
+        else:
+            self.port3_satellites = satellites
+            self._port3_snr_signals = signals
+            for key in parser.last_gsv_commit_keys:
+                if key in satellites and key in self.port1_satellites:
+                    self._snr_diff2_avg.add(key, satellites[key] - self.port1_satellites[key])
+
     def handle_data(self, data, port_id=1):
         self._rate_counters[port_id] = self._rate_counters.get(port_id, 0) + 1
         if port_id == 2:
@@ -1814,46 +1885,10 @@ class NMEADataAnalyzer(QMainWindow):
             if decoded:
                 self._append_data_preview(f"[串口2] {decoded.strip()}", port_id=2)
 
-                # 解析GSV获取卫星信噪比（仅GSV行触发）
-                is_gsv = False
-                if decoded.startswith('$GP') and 'GSV' in decoded[3:6]:
+                if any(decoded.startswith(p) for p in
+                       ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
                     self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$BD') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GL') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GA') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GB') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GN') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser2.parse(decoded)
-                    is_gsv = True
-
-                if is_gsv:
-                    entry = self.nmea_parser2.gpgsv_data[-1]
-                    talker = entry.get('talker_id', 'GP')
-                    signal_id = entry.get('signal_id', 0)
-                    system_key = TALKER_TO_SYSTEM.get(talker, 'G')
-                    system_signals = SIGNAL_NAMES.get(system_key, SIGNAL_NAMES['G'])
-                    signal_name = system_signals.get(signal_id, f'S{signal_id}')
-                    for sat in entry.get('satellites', []):
-                        prn = sat.get('prn', 0)
-                        snr = sat.get('snr', 0)
-                        if prn and 0 < snr <= 99:
-                            key = f"{talker}{prn:02d}"
-                            self.port2_satellites[key] = snr
-                            self._port2_snr_signals[key] = signal_name
-
-            for key, snr in self.port2_satellites.items():
-                if self._last_port2_snr.get(key) != snr:
-                    self._last_port2_snr[key] = snr
-                    self._port2_snr_avg.add(key, snr)
+                    self._sync_gsv_snapshot(2, self.nmea_parser2)
 
             # 解析GGA获取定位状态
             if decoded.startswith('$GNGGA') or decoded.startswith('$GPGGA') or \
@@ -1901,6 +1936,10 @@ class NMEADataAnalyzer(QMainWindow):
                             self.enu2_times, self.enu2_east_data, self.enu2_north_data, self.enu2_up_data,
                             self._std_enu2_east, self._std_enu2_north, self._std_enu2_up, "ENU2")
                         self._update_enu_std()
+                    else:
+                        self._latest_enu2_east = None
+                        self._latest_enu2_north = None
+                        self._latest_enu2_up = None
 
             if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                 self.nmea_parser2.parse(decoded)
@@ -1923,46 +1962,10 @@ class NMEADataAnalyzer(QMainWindow):
             if decoded:
                 self._append_data_preview(f"[串口3] {decoded.strip()}", port_id=3)
 
-                # 解析GSV获取卫星信噪比
-                is_gsv = False
-                if decoded.startswith('$GP') and 'GSV' in decoded[3:6]:
+                if any(decoded.startswith(p) for p in
+                       ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
                     self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$BD') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GL') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GA') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GB') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-                elif decoded.startswith('$GN') and 'GSV' in decoded[3:6]:
-                    self.nmea_parser3.parse(decoded)
-                    is_gsv = True
-
-                if is_gsv:
-                    entry = self.nmea_parser3.gpgsv_data[-1]
-                    talker = entry.get('talker_id', 'GP')
-                    signal_id = entry.get('signal_id', 0)
-                    system_key = TALKER_TO_SYSTEM.get(talker, 'G')
-                    system_signals = SIGNAL_NAMES.get(system_key, SIGNAL_NAMES['G'])
-                    signal_name = system_signals.get(signal_id, f'S{signal_id}')
-                    for sat in entry.get('satellites', []):
-                        prn = sat.get('prn', 0)
-                        snr = sat.get('snr', 0)
-                        if prn and 0 < snr <= 99:
-                            key = f"{talker}{prn:02d}"
-                            self.port3_satellites[key] = snr
-                            self._port3_snr_signals[key] = signal_name
-
-            for key, snr in self.port3_satellites.items():
-                if self._last_port3_snr.get(key) != snr:
-                    self._last_port3_snr[key] = snr
-                    self._port3_snr_avg.add(key, snr)
+                    self._sync_gsv_snapshot(3, self.nmea_parser3)
 
             # 解析GGA获取定位状态
             if decoded.startswith('$GNGGA') or decoded.startswith('$GPGGA') or \
@@ -2010,6 +2013,10 @@ class NMEADataAnalyzer(QMainWindow):
                             self.enu3_times, self.enu3_east_data, self.enu3_north_data, self.enu3_up_data,
                             self._std_enu3_east, self._std_enu3_north, self._std_enu3_up, "ENU3")
                         self._update_enu_std()
+                    else:
+                        self._latest_enu3_east = None
+                        self._latest_enu3_north = None
+                        self._latest_enu3_up = None
 
             if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
                 self.nmea_parser3.parse(decoded)
@@ -2056,6 +2063,7 @@ class NMEADataAnalyzer(QMainWindow):
                 # 解析GSV获取卫星信噪比
                 if any(decoded.startswith(p) for p in ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
                     self.nmea_parser.parse(decoded)
+                    self._sync_gsv_snapshot(1, self.nmea_parser)
 
                 # GGA 解析
                 gga_data = None
@@ -2106,8 +2114,9 @@ class NMEADataAnalyzer(QMainWindow):
                         stats
                     )
 
-                if gga_data:
-                    self._feed_fixed_enu1()
+                if gga_data and gga_data.get('quality', 0) > 0:
+                    self._feed_real_enu1(
+                        gga_data['lat'], gga_data['lon'], gga_data['alt'])
                     self._update_enu_std()
     
     def update_stats_display(self, gga_data, smoothed_coords, raw_errors, errors, stats):
@@ -2134,32 +2143,10 @@ class NMEADataAnalyzer(QMainWindow):
     def update_plots(self):
         self._update_frame_count += 1
 
-        if self.nmea_parser and self.nmea_parser.gpgsv_data:
-            self.port1_satellites = {}
-            self._port1_snr_signals = {}
-            for entry in self.nmea_parser.gpgsv_data:
-                talker = entry.get('talker_id', '?')
-                signal_id = entry.get('signal_id', 0)
-                system_key = TALKER_TO_SYSTEM.get(talker, 'G')
-                system_signals = SIGNAL_NAMES.get(system_key, SIGNAL_NAMES['G'])
-                signal_name = system_signals.get(signal_id, f'S{signal_id}')
-                for sat in entry.get('satellites', []):
-                    prn = sat.get('prn', 0)
-                    snr = sat.get('snr', 0)
-                    if prn and 0 < snr <= 99:
-                        key = f"{talker}{prn:02d}"
-                        self.port1_satellites[key] = snr
-                        self._port1_snr_signals[key] = signal_name
-
-        for key, snr in self.port1_satellites.items():
-            if self._last_port1_snr.get(key) != snr:
-                self._last_port1_snr[key] = snr
-                self._port1_snr_avg.add(key, snr)
-
         current_snr = (tuple(sorted(self.port1_satellites.items())),
                        tuple(sorted(self.port2_satellites.items())),
                        tuple(sorted(self.port3_satellites.items())))  # [新增] port3
-        if current_snr != self._last_snr_data or self._update_frame_count % 2 == 0:
+        if current_snr != self._last_snr_data:
             self._refresh_snr_table()
             self._last_snr_data = current_snr
 
@@ -2264,7 +2251,16 @@ class NMEADataAnalyzer(QMainWindow):
             elif mode == "仅 UBX" and "UBX" not in text:
                 return
 
-        self.data_preview.append(text)
+        self._preview_pending.append(text)
+
+    def _flush_data_preview(self):
+        """按批次写入预览窗口，降低高数据率下的富文本重排次数。"""
+        if not self._preview_pending:
+            return
+        batch = []
+        while self._preview_pending and len(batch) < 200:
+            batch.append(self._preview_pending.popleft())
+        self.data_preview.append("\n".join(batch))
         self._trim_text_edit(self.data_preview)
 
     def _refresh_snr_table(self):
@@ -2278,28 +2274,8 @@ class NMEADataAnalyzer(QMainWindow):
         4. 实时响应星座筛选 (北斗/GPS/Galileo/GLONASS)、恶化星过滤 (|Δ|>=10dB) 与 PRN 检索。
         """
         all_keys = sorted(
-            set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
-            key=lambda x: (x[:2], int(x[2:]))
-        )
-
-        # 1. 更新差值均值统计
-        for key in all_keys:
-            s1 = self.port1_satellites.get(key, None)
-            s2 = self.port2_satellites.get(key, None)
-            if s1 is not None and s2 is not None:
-                diff = s2 - s1
-                if self._last_snr_diff.get(key) != diff:
-                    self._last_snr_diff[key] = diff
-                    self._snr_diff_avg.add(key, diff)
-                    
-        for key in all_keys:
-            s1 = self.port1_satellites.get(key, None)
-            s3 = self.port3_satellites.get(key, None)
-            if s1 is not None and s3 is not None:
-                diff2 = s3 - s1
-                if self._last_snr_diff2.get(key) != diff2:
-                    self._last_snr_diff2[key] = diff2
-                    self._snr_diff2_avg.add(key, diff2)
+            set(self.port1_satellites) | set(self.port2_satellites) | set(self.port3_satellites),
+            key=self._snr_sort_key)
 
         # 2. 刷新顶部 KPI 态势卡片
         n1 = len(self.port1_satellites)
@@ -2330,8 +2306,9 @@ class NMEADataAnalyzer(QMainWindow):
                 for port_idx, diff_val in [(2, d1), (3, d2)]:
                     if diff_val is not None and diff_val < max_drop_val:
                         max_drop_val = diff_val
-                        sys_name, _ = self._SYS_BADGES.get(key[:2], (key[:2], ""))
-                        max_drop_info = f"{sys_name}{key[2:]} ({diff_val:+.1f}dB, P{port_idx})"
+                        talker, signal_id, prn = self._snr_key_parts(key)
+                        sys_name, _ = self._SYS_BADGES.get(talker, (talker, ""))
+                        max_drop_info = f"{sys_name}{prn:02d}/{signal_id} ({diff_val:+.1f}dB, P{port_idx})"
 
             total_tracked = len(all_keys)
             warn_pct = (len(warn_sats) / total_tracked * 100) if total_tracked > 0 else 0.0
@@ -2348,8 +2325,7 @@ class NMEADataAnalyzer(QMainWindow):
             self.snr_table.setRowCount(len(all_keys))
 
         for row, key in enumerate(all_keys):
-            sys_prefix = key[:2]
-            prn = int(key[2:])
+            sys_prefix, signal_id, prn = self._snr_key_parts(key)
             badge_name, badge_color = self._SYS_BADGES.get(sys_prefix, (sys_prefix, "#89b4fa"))
             
             s1 = self.port1_satellites.get(key)
@@ -2547,6 +2523,34 @@ class NMEADataAnalyzer(QMainWindow):
             del self.enu1_east_data[:excess]
             del self.enu1_north_data[:excess]
             del self.enu1_up_data[:excess]
+        if len(self.enu1_3_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_3_times) - self.ENU_MAX_POINTS
+            del self.enu1_3_times[:excess]
+            del self.enu1_3_east_data[:excess]
+            del self.enu1_3_north_data[:excess]
+            del self.enu1_3_up_data[:excess]
+
+    def _feed_real_enu1(self, lat, lon, alt):
+        """按串口1自己的独立参考点计算真实 ENU1，并同步到两组对比曲线。"""
+        self._feed_enu1_buffer(lat, lon, alt)
+        before = len(self.enu1_times)
+        self._calc_and_update_enu2(
+            lat, lon, alt, self.enu1_ref_point, self.enu1_ref_ready,
+            self.enu1_east_label, self.enu1_north_label, self.enu1_up_label,
+            self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data,
+            self._std_enu1_east, self._std_enu1_north, self._std_enu1_up, "ENU1")
+        if len(self.enu1_times) == before:
+            return
+        t = self.enu1_3_times[-1] + 1.0 if self.enu1_3_times else 0.0
+        east, north, up = (self.enu1_east_data[-1], self.enu1_north_data[-1],
+                           self.enu1_up_data[-1])
+        self.enu1_3_times.append(t)
+        self.enu1_3_east_data.append(east)
+        self.enu1_3_north_data.append(north)
+        self.enu1_3_up_data.append(up)
+        self._std_enu1_3_east.add(east)
+        self._std_enu1_3_north.add(north)
+        self._std_enu1_3_up.add(up)
         if len(self.enu1_3_times) > self.ENU_MAX_POINTS:
             excess = len(self.enu1_3_times) - self.ENU_MAX_POINTS
             del self.enu1_3_times[:excess]
@@ -2796,12 +2800,12 @@ class NMEADataAnalyzer(QMainWindow):
         north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
         up    =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
 
-        if name != "ENU3":
+        if name == "ENU2":
             self._latest_enu2_east = east
             self._latest_enu2_north = north
             self._latest_enu2_up = up
         # [新增] ENU3最新值跟踪
-        if name == "ENU3":
+        elif name == "ENU3":
             self._latest_enu3_east = east
             self._latest_enu3_north = north
             self._latest_enu3_up = up
@@ -2822,7 +2826,7 @@ class NMEADataAnalyzer(QMainWindow):
                 self._enu3_outlier_count += 1
             if up_bad:
                 self._enu3_outlier_count += 1
-        else:
+        elif name == "ENU2":
             if east_bad:
                 self._enu2_outlier_count += 1
                 self.log_info(f"{name} 东向异常值已剔除: {east:+.3f}m (σ: {std_east.std:.3f}m)")
@@ -3091,7 +3095,7 @@ class NMEADataAnalyzer(QMainWindow):
         tab_layout.addLayout(charts_layout)
 
         btn_row = QHBoxLayout()
-        reset_btn = QPushButton("重置方向统计")
+        reset_btn = QPushButton("重新测试（清空统计）")
         reset_btn.setMinimumWidth(120)
         if is_com3:
             reset_btn.clicked.connect(self._reset_direction_stats3)
@@ -3188,7 +3192,7 @@ class NMEADataAnalyzer(QMainWindow):
         if ds._active:
             self._save_enu_for_direction(direction_index, self.direction_stats, boxes)
             ds.stop()
-            boxes[direction_index]['btn'].setText("启动方向测试")
+            boxes[direction_index]['btn'].setText("继续方向测试")
             boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
             self._dir_enu_active_index = -1
@@ -3197,9 +3201,10 @@ class NMEADataAnalyzer(QMainWindow):
             self._save_enu_for_active_direction()
             self._reset_enu_chart_data(2)
             ds.start()
-            ds.clear_enu()
+            if ds.total_epochs == 0:
+                ds.clear_enu()
             self._dir_enu_active_index = direction_index
-            boxes[direction_index]['btn'].setText("停止方向测试")
+            boxes[direction_index]['btn'].setText("暂停方向测试")
             boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
             self.log_info(f"方向{direction_index + 1} 测试已启动 (串口2)")
@@ -3210,7 +3215,7 @@ class NMEADataAnalyzer(QMainWindow):
         if ds._active:
             self._save_enu_for_direction(direction_index, self.direction_stats3, boxes)
             ds.stop()
-            boxes[direction_index]['btn'].setText("启动方向测试")
+            boxes[direction_index]['btn'].setText("继续方向测试")
             boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
             self._dir3_enu_active_index = -1
@@ -3219,9 +3224,10 @@ class NMEADataAnalyzer(QMainWindow):
             self._save_enu_for_active_direction3()
             self._reset_enu_chart_data(3)
             ds.start()
-            ds.clear_enu()
+            if ds.total_epochs == 0:
+                ds.clear_enu()
             self._dir3_enu_active_index = direction_index
-            boxes[direction_index]['btn'].setText("停止方向测试")
+            boxes[direction_index]['btn'].setText("暂停方向测试")
             boxes[direction_index]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
             self.log_info(f"方向{direction_index + 1} 测试已启动 (串口3)")
@@ -3242,7 +3248,7 @@ class NMEADataAnalyzer(QMainWindow):
             if ds._active:
                 self._save_enu_for_direction(i, self.direction_stats, self.dir_stat_boxes)
                 ds.stop()
-                self.dir_stat_boxes[i]['btn'].setText("启动方向测试")
+                self.dir_stat_boxes[i]['btn'].setText("继续方向测试")
                 self.dir_stat_boxes[i]['btn'].setStyleSheet(
                     "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
                 self.log_info(f"方向{i + 1} 测试已停止 (串口2)")
@@ -3253,7 +3259,7 @@ class NMEADataAnalyzer(QMainWindow):
             if ds._active:
                 self._save_enu_for_direction(i, self.direction_stats3, self.dir_stat_boxes3)
                 ds.stop()
-                self.dir_stat_boxes3[i]['btn'].setText("启动方向测试")
+                self.dir_stat_boxes3[i]['btn'].setText("继续方向测试")
                 self.dir_stat_boxes3[i]['btn'].setStyleSheet(
                     "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
                 self.log_info(f"方向{i + 1} 测试已停止 (串口3)")
@@ -3284,7 +3290,7 @@ class NMEADataAnalyzer(QMainWindow):
                 enu3_e = self.enu3_east_data[-n:] if len(self.enu3_east_data) >= n else list(self.enu3_east_data)
                 enu3_n = self.enu3_north_data[-n:] if len(self.enu3_north_data) >= n else list(self.enu3_north_data)
                 enu3_u = self.enu3_up_data[-n:] if len(self.enu3_up_data) >= n else list(self.enu3_up_data)
-                ds.save_enu_snapshot(
+                ds.append_enu_snapshot(
                     enu1_t, enu1_e, enu1_n, enu1_u,
                     [], [], [], [],
                     enu3_t, enu3_e, enu3_n, enu3_u)
@@ -3294,7 +3300,7 @@ class NMEADataAnalyzer(QMainWindow):
                 enu2_e = self.enu2_east_data[-n:] if len(self.enu2_east_data) >= n else list(self.enu2_east_data)
                 enu2_n = self.enu2_north_data[-n:] if len(self.enu2_north_data) >= n else list(self.enu2_north_data)
                 enu2_u = self.enu2_up_data[-n:] if len(self.enu2_up_data) >= n else list(self.enu2_up_data)
-                ds.save_enu_snapshot(
+                ds.append_enu_snapshot(
                     enu1_t, enu1_e, enu1_n, enu1_u,
                     enu2_t, enu2_e, enu2_n, enu2_u)
                 self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {len(enu2_e)}点)")
@@ -3383,7 +3389,7 @@ class NMEADataAnalyzer(QMainWindow):
                     if stopped:
                         self._save_enu_for_direction(i, direction_stats, dir_stat_boxes)
                         ds.stop()
-                        dir_stat_boxes[i]['btn'].setText("启动方向测试")
+                        dir_stat_boxes[i]['btn'].setText("继续方向测试")
                         dir_stat_boxes[i]['btn'].setStyleSheet(
                             "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #2ecc71; }")
                         self.log_info(f"方向{i + 1} 自动停止 ({reason})")
@@ -3447,21 +3453,27 @@ class NMEADataAnalyzer(QMainWindow):
         v_means = [self.direction_stats[i].v_mean for i in range(4)]
         v_maxs = [self.direction_stats[i].v_max for i in range(4)]
 
-        self.dir_h_chart.clear()
-        bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
-        bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
-        self.dir_h_chart.addItem(bar_mean)
-        self.dir_h_chart.addItem(bar_max)
-        self.dir_h_chart.addLegend()
+        if not hasattr(self, '_dir_h_bar_mean'):
+            self._dir_h_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
+            self._dir_h_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
+            self.dir_h_chart.addLegend()
+            self.dir_h_chart.addItem(self._dir_h_bar_mean)
+            self.dir_h_chart.addItem(self._dir_h_bar_max)
+        else:
+            self._dir_h_bar_mean.setOpts(height=h_means)
+            self._dir_h_bar_max.setOpts(height=h_maxs)
         ax_h = self.dir_h_chart.getAxis('bottom')
         ax_h.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
 
-        self.dir_v_chart.clear()
-        bar_mean_v = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
-        bar_max_v = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
-        self.dir_v_chart.addItem(bar_mean_v)
-        self.dir_v_chart.addItem(bar_max_v)
-        self.dir_v_chart.addLegend()
+        if not hasattr(self, '_dir_v_bar_mean'):
+            self._dir_v_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
+            self._dir_v_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
+            self.dir_v_chart.addLegend()
+            self.dir_v_chart.addItem(self._dir_v_bar_mean)
+            self.dir_v_chart.addItem(self._dir_v_bar_max)
+        else:
+            self._dir_v_bar_mean.setOpts(height=v_means)
+            self._dir_v_bar_max.setOpts(height=v_maxs)
         ax_v = self.dir_v_chart.getAxis('bottom')
         ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
 
@@ -3472,21 +3484,27 @@ class NMEADataAnalyzer(QMainWindow):
         v_means = [self.direction_stats3[i].v_mean for i in range(4)]
         v_maxs = [self.direction_stats3[i].v_max for i in range(4)]
 
-        self.dir_h_chart3.clear()
-        bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
-        bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
-        self.dir_h_chart3.addItem(bar_mean)
-        self.dir_h_chart3.addItem(bar_max)
-        self.dir_h_chart3.addLegend()
+        if not hasattr(self, '_dir3_h_bar_mean'):
+            self._dir3_h_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
+            self._dir3_h_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
+            self.dir_h_chart3.addLegend()
+            self.dir_h_chart3.addItem(self._dir3_h_bar_mean)
+            self.dir_h_chart3.addItem(self._dir3_h_bar_max)
+        else:
+            self._dir3_h_bar_mean.setOpts(height=h_means)
+            self._dir3_h_bar_max.setOpts(height=h_maxs)
         ax_h = self.dir_h_chart3.getAxis('bottom')
         ax_h.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
 
-        self.dir_v_chart3.clear()
-        bar_mean_v = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
-        bar_max_v = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
-        self.dir_v_chart3.addItem(bar_mean_v)
-        self.dir_v_chart3.addItem(bar_max_v)
-        self.dir_v_chart3.addLegend()
+        if not hasattr(self, '_dir3_v_bar_mean'):
+            self._dir3_v_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
+            self._dir3_v_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
+            self.dir_v_chart3.addLegend()
+            self.dir_v_chart3.addItem(self._dir3_v_bar_mean)
+            self.dir_v_chart3.addItem(self._dir3_v_bar_max)
+        else:
+            self._dir3_v_bar_mean.setOpts(height=v_means)
+            self._dir3_v_bar_max.setOpts(height=v_maxs)
         ax_v = self.dir_v_chart3.getAxis('bottom')
         ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
 
@@ -3602,7 +3620,7 @@ class NMEADataAnalyzer(QMainWindow):
         for i in previously_active:
             self.direction_stats[i].start()
             self._dir_enu_active_index = i
-            self.dir_stat_boxes[i]['btn'].setText("停止方向测试")
+            self.dir_stat_boxes[i]['btn'].setText("暂停方向测试")
             self.dir_stat_boxes[i]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
         self._update_direction_charts()
@@ -3620,7 +3638,7 @@ class NMEADataAnalyzer(QMainWindow):
         for i in previously_active:
             self.direction_stats3[i].start()
             self._dir3_enu_active_index = i
-            self.dir_stat_boxes3[i]['btn'].setText("停止方向测试")
+            self.dir_stat_boxes3[i]['btn'].setText("暂停方向测试")
             self.dir_stat_boxes3[i]['btn'].setStyleSheet(
                 "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 4px 12px; } QPushButton:hover { background-color: #c0392b; }")
         self._update_direction_charts3()
@@ -3629,6 +3647,11 @@ class NMEADataAnalyzer(QMainWindow):
 
     def reset_all_stats(self):
         """重置所有统计"""
+        self.nmea_parser.clear()
+        self.nmea_parser2.clear()
+        self.nmea_parser3.clear()
+        self.gga_parser.clear()
+        self._last_gsv_sequence = {1: 0, 2: 0, 3: 0}
         self.statistics.reset()
         self.port1_satellites = {}
         self.port2_satellites = {}
@@ -3737,6 +3760,11 @@ class NMEADataAnalyzer(QMainWindow):
         self._std_enu3_east.reset()  # [新增]
         self._std_enu3_north.reset()  # [新增]
         self._std_enu3_up.reset()  # [新增]
+        self._std_enu1_3_east.reset()
+        self._std_enu1_3_north.reset()
+        self._std_enu1_3_up.reset()
+        self._enu2_outlier_count = 0
+        self._enu3_outlier_count = 0
 
         # 重置串口1 GGA显示
         self.p1_utc_label.setText("-")
@@ -3767,18 +3795,26 @@ class NMEADataAnalyzer(QMainWindow):
         self.p3_gga_nsat = 0  # [新增]
 
         # 重置方向统计
+        for ds in self.direction_stats + self.direction_stats3:
+            ds._active = False
         self._reset_direction_stats()
         self._reset_direction_stats3()
-        self._latest_enu2_east = 0.0
-        self._latest_enu2_north = 0.0
-        self._latest_enu2_up = 0.0
-        self._latest_enu3_east = 0.0  # [新增]
-        self._latest_enu3_north = 0.0  # [新增]
-        self._latest_enu3_up = 0.0  # [新增]
+        self._latest_enu2_east = None
+        self._latest_enu2_north = None
+        self._latest_enu2_up = None
+        self._latest_enu3_east = None
+        self._latest_enu3_north = None
+        self._latest_enu3_up = None
         self._p2_gga_new_epoch = False
         self._p3_gga_new_epoch = False  # [新增]
         self._latest_p2_quality = 0
         self._latest_p3_quality = 0  # [新增]
+        self.gps_week = 0
+        self.gps_sow = 0.0
+        self.p1_ttff_s = self.p2_ttff_s = self.p3_ttff_s = 0.0
+        self.p1_ttff_label.setText("-")
+        self.p2_ttff_label.setText("-")
+        self.p3_ttff_label.setText("-")
 
         self.update_plots()
         self.log_info("统计已重置")
@@ -3797,6 +3833,7 @@ class NMEADataAnalyzer(QMainWindow):
 
     def clear_data_preview(self):
         """清空数据预览"""
+        self._preview_pending.clear()
         self.data_preview.clear()
 
     def clear_log(self):
@@ -3967,7 +4004,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         all_snr_keys = sorted(
             set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
-            key=lambda x: (x[:2], int(x[2:])))
+            key=self._snr_sort_key)
         system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3", "GN": "GNSS"}
 
         section_names = ["二", "三", "四", "五"]
@@ -4016,8 +4053,7 @@ class NMEADataAnalyzer(QMainWindow):
             w("| 星座 | PRN | 信号 | 串口1载噪比均值 | 串口2载噪比均值 | 恶化值1-2 | 串口3载噪比均值 | 恶化值1-3 |")
             w("|------|-----|------|---------------|---------------|-----------|---------------|-----------|")
             for key in all_snr_keys:
-                sys = key[:2]
-                prn = int(key[2:])
+                sys, signal_id, prn = self._snr_key_parts(key)
                 sys_name = system_names.get(sys, sys)
                 signal = self._port1_snr_signals.get(key) or self._port2_snr_signals.get(key) or self._port3_snr_signals.get(key) or '---'
                 a1 = self._port1_snr_avg.get(key)
@@ -4168,7 +4204,7 @@ class NMEADataAnalyzer(QMainWindow):
         ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         sn = self._get_device_sn(direction_stats)
         default_name = f"{file_prefix}_{sn}_{ts_str}.{ext}"
-        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        reports_dir = os.path.join(APP_DIR, 'reports')
         os.makedirs(reports_dir, exist_ok=True)
         default_path = os.path.join(reports_dir, default_name)
 
@@ -4180,7 +4216,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         report_dir = os.path.dirname(file_path)
         if not report_dir:
-            report_dir = os.path.dirname(os.path.abspath(__file__))
+            report_dir = APP_DIR
 
         png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, direction_stats, chart_label2)
         png_map = {di: name for di, name in png_paths} if png_paths else None
@@ -4277,7 +4313,7 @@ class NMEADataAnalyzer(QMainWindow):
         """将当前卫星SNR对比表导出为CSV(UTF-8 BOM, Excel友好)"""
         from PyQt5.QtWidgets import QFileDialog
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+        default_dir = os.path.join(APP_DIR, 'reports')
         os.makedirs(default_dir, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
             self, "导出SNR表", os.path.join(default_dir, f"snr_table_{ts}.csv"),
@@ -4287,7 +4323,7 @@ class NMEADataAnalyzer(QMainWindow):
         try:
             all_keys = sorted(
                 set(self.port1_satellites) | set(self.port2_satellites) | set(self.port3_satellites),
-                key=lambda x: (x[:2], int(x[2:])))
+                key=self._snr_sort_key)
             header = ["星座", "PRN", "信号", "Port1", "Avg1", "Port2", "Avg2",
                       "Delta", "AvgD", "Port3", "Avg3", "Delta2", "AvgD2"]
 
@@ -4312,7 +4348,8 @@ class NMEADataAnalyzer(QMainWindow):
                     signal = (self._port1_snr_signals.get(key)
                               or self._port2_snr_signals.get(key)
                               or self._port3_snr_signals.get(key) or '---')
-                    row = [key[:2], key[2:], signal,
+                    talker, signal_id, prn = self._snr_key_parts(key)
+                    row = [talker, f"{prn:02d}", signal,
                            fmt(s1), fmt(a1), fmt(s2), fmt(a2),
                            fmt(d1, plus=True), fmt(ad, plus=True),
                            fmt(s3), fmt(a3), fmt(d2, plus=True), fmt(ad2, plus=True)]
@@ -4446,12 +4483,21 @@ class NMEADataAnalyzer(QMainWindow):
         path1 = os.path.join(self.auto_log_dir, f"serial1_{ts}.log")
         path2 = os.path.join(self.auto_log_dir, f"serial2_{ts}.log")
         path3 = os.path.join(self.auto_log_dir, f"serial3_{ts}.log")  # [新增]
+        f1 = f2 = f3 = None
         try:
-            self._log_file1 = open(path1, 'w', encoding='utf-8')
-            self._log_file2 = open(path2, 'w', encoding='utf-8')
-            self._log_file3 = open(path3, 'w', encoding='utf-8')  # [新增]
+            f1 = open(path1, 'w', encoding='utf-8')
+            f2 = open(path2, 'w', encoding='utf-8')
+            f3 = open(path3, 'w', encoding='utf-8')
+            self._log_file1, self._log_file2, self._log_file3 = f1, f2, f3
+            self._log_flush_count = {1: 0, 2: 0, 3: 0}
             self.log_info(f"自动日志已开启: {path1}, {path2}, {path3}")  # [修改]
         except Exception as e:
+            for opened in (f1, f2, f3):
+                if opened is not None:
+                    try:
+                        opened.close()
+                    except Exception:
+                        pass
             self.log_error(f"无法创建日志文件: {str(e)}")
             self._log_file1 = None
             self._log_file2 = None
@@ -4484,12 +4530,13 @@ class NMEADataAnalyzer(QMainWindow):
                 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 line = f"[{ts}] {line.strip()}\n"
                 f.write(line)
-                self._log_flush_count += 1
-                if self._log_flush_count >= self._LOG_FLUSH_INTERVAL:
+                self._log_flush_count[port_id] += 1
+                if self._log_flush_count[port_id] >= self._LOG_FLUSH_INTERVAL:
                     f.flush()
-                    self._log_flush_count = 0
-            except:
-                pass
+                    self._log_flush_count[port_id] = 0
+            except Exception as exc:
+                # 避免调用 log_error 形成日志写入递归，仅在控制台保留诊断。
+                print(f"auto log write failed for port {port_id}: {exc}", file=sys.stderr)
 
     def _on_auto_log_toggled(self):
         self.auto_log_enabled = self.auto_log_cb.isChecked()
@@ -4539,6 +4586,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.serial_port2.disconnect()
         self.serial_port3.disconnect()  # [新增]
         self.update_timer.stop()
+        self._preview_timer.stop()
         self._close_auto_log_files()
         event.accept()
 
@@ -4547,7 +4595,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     # 设置应用级任务栏与窗口图标
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'app_icon.png')
+    icon_path = os.path.join(RESOURCE_DIR, 'resources', 'app_icon.png')
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
         

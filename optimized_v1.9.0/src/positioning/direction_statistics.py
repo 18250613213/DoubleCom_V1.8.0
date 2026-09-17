@@ -12,7 +12,7 @@
 """
 
 import math
-from datetime import datetime
+import time
 
 
 class DirectionStatistics:
@@ -32,6 +32,7 @@ class DirectionStatistics:
         self.v_max = 0.0               # 天向垂直误差绝对值最大峰值 (米)
         self.start_time = None         # 当前方向测试启动时间戳
         self.duration = 0.0            # 测试持续总秒数
+        self._elapsed_before_start = 0.0
         self._active = False           # 当前方向是否正在测试中
         self._enu_saved = False        # 是否已保存 ENU 轨迹快照
 
@@ -70,21 +71,18 @@ class DirectionStatistics:
             quality (int): 定位质量指示 (0=未定位, >0=有效定位)。
         """
         self.total_epochs += 1
+        if quality <= 0 or east is None or north is None or up is None:
+            return
+
         h_error = math.sqrt(east ** 2 + north ** 2)
         v_error = abs(up)
+        self.h_max = max(self.h_max, h_error)
+        self.v_max = max(self.v_max, v_error)
 
-        # 跟踪最大峰值误差
-        if h_error > self.h_max:
-            self.h_max = h_error
-        if v_error > self.v_max:
-            self.v_max = v_error
-
-        # 递推统计有效历元均值
-        if quality > 0:
-            self.successful_epochs += 1
-            n = self.successful_epochs
-            self.h_mean = self.h_mean + (h_error - self.h_mean) / n
-            self.v_mean = self.v_mean + (v_error - self.v_mean) / n
+        self.successful_epochs += 1
+        n = self.successful_epochs
+        self.h_mean = self.h_mean + (h_error - self.h_mean) / n
+        self.v_mean = self.v_mean + (v_error - self.v_mean) / n
 
     def save_enu_snapshot(self, t1, e1, n1, u1, t2, e2, n2, u2, t3=None, e3=None, n3=None, u3=None):
         """
@@ -119,6 +117,32 @@ class DirectionStatistics:
             self._enu3_up = []
 
         self._enu_saved = True
+
+    @staticmethod
+    def _append_segment(dst_t, dst_v, src_t, src_v):
+        if not src_v:
+            return
+        base = dst_t[-1] + 1.0 if dst_t else 0.0
+        dst_t.extend(base + i for i in range(len(src_v)))
+        dst_v.extend(src_v)
+
+    def append_enu_snapshot(self, t1, e1, n1, u1, t2, e2, n2, u2,
+                            t3=None, e3=None, n3=None, u3=None):
+        """追加一次继续测试产生的 ENU 片段，暂停期间的数据不会混入统计。"""
+        if not self._enu_saved:
+            self.save_enu_snapshot(t1, e1, n1, u1, t2, e2, n2, u2,
+                                   t3, e3, n3, u3)
+            return
+        self._append_segment(self._enu1_times, self._enu1_east, t1, e1)
+        self._enu1_north.extend(n1)
+        self._enu1_up.extend(u1)
+        self._append_segment(self._enu2_times, self._enu2_east, t2, e2)
+        self._enu2_north.extend(n2)
+        self._enu2_up.extend(u2)
+        if t3 is not None:
+            self._append_segment(self._enu3_times, self._enu3_east, t3, e3)
+            self._enu3_north.extend(n3)
+            self._enu3_up.extend(u3)
 
     def clear_enu(self):
         """清除保存的全部 ENU 轨迹快照。"""
@@ -171,24 +195,35 @@ class DirectionStatistics:
         self.v_max = 0.0
         self.start_time = None
         self.duration = 0.0
+        self._elapsed_before_start = 0.0
         self._active = False
         self.clear_enu()
 
     def start(self):
-        """启动本方向的测试计时。"""
+        """开始或继续本方向测试；已有统计与累计时长保持不变。"""
+        if self._active:
+            return
         self._active = True
-        self.start_time = datetime.now()
+        self.start_time = time.monotonic()
+        self._elapsed_before_start = self.duration
 
     def stop(self):
-        """停止本方向的测试计时并结算总时长。"""
+        """暂停本方向测试并结算累计时长，后续可继续。"""
         if self._active:
             self.update_duration()
+            self._elapsed_before_start = self.duration
             self._active = False
+            self.start_time = None
 
     def update_duration(self):
         """若测试处于进行中，更新已耗费的持续秒数。"""
-        if self._active and self.start_time:
-            self.duration = (datetime.now() - self.start_time).total_seconds()
+        if self._active and self.start_time is not None:
+            self.duration = self._elapsed_before_start + (time.monotonic() - self.start_time)
+
+    def restart(self):
+        """清空当前方向全部统计和快照并立即开始一轮全新测试。"""
+        self.reset()
+        self.start()
 
     def get_duration_str(self):
         """
@@ -233,4 +268,3 @@ class DirectionStatistics:
             'duration': self.get_duration_str(),
             'duration_seconds': self.duration,
         }
-

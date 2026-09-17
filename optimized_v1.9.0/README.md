@@ -1,0 +1,50 @@
+# DoubleCom Optimized V1.9.0
+
+本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
+
+## ENU 参考点约定
+
+三路串口坚持使用各自独立参考点，不共享参考坐标：
+
+- ENU1：串口1前100个有效定位点均值；
+- ENU2：串口2前100个有效定位点均值；
+- ENU3：串口3前100个有效定位点均值。
+
+因此 ENU 指标表示每台设备相对于自身初始参考位置的稳定性与漂移，不表示三台设备之间的绝对坐标偏差。
+
+## 方向测试操作
+
+- 暂停/继续：保留并累计历元、成功率、误差、ENU快照和测试时长；暂停期间的数据不纳入方向测试。
+- 重新测试（清空统计）：清空对应方向的累计统计和ENU快照；如果清空前正在测试，则从零立即重新开始。
+
+## 主要优化
+
+- 修复自动重连成功后重复打开串口的问题；
+- UBX伪同步、异常长度和校验失败后的安全恢复；
+- GSV按完整历元原子提交，淘汰旧卫星并区分多频点；
+- SNR均值按真实历元采样，UI刷新不再重复或漏采；
+- 修复GPS周内秒、无效定位误差和不完整重置；
+- 数据预览批量刷新、SNR仅在数据变化时重绘、柱状图对象复用；
+- 日志文件打开失败时安全关闭句柄，并按端口独立刷新；
+- 支持100倍速端到端自检。
+
+## 验证
+
+```powershell
+python -m compileall -q main.py selftest_cli.py src tests
+python -m unittest discover -s tests -v
+python tests\test_nmea_generator.py
+python selftest_cli.py --minutes 5 --speed 100
+```
+
+## 构建 EXE
+
+```powershell
+python -m PyInstaller --clean --noconfirm `
+  --workpath .build `
+  --distpath release `
+  DoubleCom_Optimized.spec
+```
+
+生成文件：`release/DoubleCom_Optimized_V1.9.0.exe`。
+
