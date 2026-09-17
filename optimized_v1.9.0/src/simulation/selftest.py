@@ -103,8 +103,8 @@ class SelfTestRunner(QObject):
             except Exception:
                 pass
         # 若方向测试正在进行，则停止当前方向
-        if self._dir_started and self.w.direction_stats[0]._active:
-            self.w._toggle_single_direction(0)
+        if self._dir_started and self.w.direction_stats[0].is_active:
+            self.w._terminate_direction_test(2, 0)
         self.w.log_info("自检被用户取消, 提前结束")
         # 延迟 200ms 执行最终结算
         QTimer.singleShot(200, self._finalize)
@@ -244,23 +244,23 @@ class SelfTestRunner(QObject):
         # 自动触发方向测试
         if self._direction and not self._dir_started:
             if min(s.sim_time() for s in self._sims) >= DIR_START_EPOCH and w.enu2_ref_ready:
-                w._toggle_single_direction(0)
-                self._dir_started = True
-                w.log_info("自检: 方向1测试已自动启动")
+                self._dir_started = w._start_direction_test(2, 0)
+                if self._dir_started:
+                    w.log_info("自检: 方向1测试已自动启动")
 
         # 判断三路是否全部回放完成
         if self._finished_sims >= len(self._sims):
             self._monitor.stop()
-            if self._dir_started and w.direction_stats[0]._active:
-                w._toggle_single_direction(0)
+            if self._dir_started and w.direction_stats[0].is_active:
+                w._terminate_direction_test(2, 0)
             QTimer.singleShot(800, self._finalize)
             return
 
         # 看门狗超时熔断机制 (预期时长 + 60秒冗余)
         if elapsed > expected + 60:
             self._monitor.stop()
-            if self._dir_started and w.direction_stats[0]._active:
-                w._toggle_single_direction(0)
+            if self._dir_started and w.direction_stats[0].is_active:
+                w._terminate_direction_test(2, 0)
             self._timeout = True
             w.log_error("自检超时(看门狗触发), 提前结束")
             QTimer.singleShot(200, self._finalize)

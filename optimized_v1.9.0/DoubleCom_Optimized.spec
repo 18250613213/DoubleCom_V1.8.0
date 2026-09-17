@@ -21,7 +21,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='DoubleCom_Optimized_V1.9.0',
+    name='DoubleCom_Optimized_V1.9.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -34,4 +34,3 @@ exe = EXE(
     entitlements_file=None,
     icon='resources/app_icon.ico',
 )
-

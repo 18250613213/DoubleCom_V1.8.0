@@ -34,6 +34,8 @@ class DirectionStatistics:
         self.duration = 0.0            # 测试持续总秒数
         self._elapsed_before_start = 0.0
         self._active = False           # 当前方向是否正在测试中
+        self._started_once = False     # 是否已启动过，用于区分“未开始”和“已暂停”
+        self._terminated = False       # 是否已正式终止；重置前禁止继续
         self._enu_saved = False        # 是否已保存 ENU 轨迹快照
 
         # 串口 1 (基准参考机) ENU 轨迹快照
@@ -197,23 +199,64 @@ class DirectionStatistics:
         self.duration = 0.0
         self._elapsed_before_start = 0.0
         self._active = False
+        self._started_once = False
+        self._terminated = False
         self.clear_enu()
 
     def start(self):
-        """开始或继续本方向测试；已有统计与累计时长保持不变。"""
-        if self._active:
-            return
+        """开始或继续本方向测试；终止后必须先重置。"""
+        if self._active or self._terminated:
+            return False
         self._active = True
+        self._started_once = True
         self.start_time = time.monotonic()
         self._elapsed_before_start = self.duration
+        return True
+
+    def pause(self):
+        """暂停本方向测试并结算累计时长，后续可继续。"""
+        if not self._active:
+            return False
+        self.update_duration()
+        self._elapsed_before_start = self.duration
+        self._active = False
+        self.start_time = None
+        return True
 
     def stop(self):
-        """暂停本方向测试并结算累计时长，后续可继续。"""
+        """兼容旧调用：停止等同于暂停，不会清空或锁定统计。"""
+        return self.pause()
+
+    def terminate(self):
+        """正式终止本方向测试，保留累计结果并禁止继续，直至 reset。"""
+        if self._terminated or not self._started_once:
+            return False
         if self._active:
-            self.update_duration()
-            self._elapsed_before_start = self.duration
-            self._active = False
-            self.start_time = None
+            self.pause()
+        self._terminated = True
+        return True
+
+    @property
+    def is_active(self):
+        return self._active
+
+    @property
+    def is_terminated(self):
+        return self._terminated
+
+    @property
+    def has_started(self):
+        return self._started_once
+
+    @property
+    def state(self):
+        if self._terminated:
+            return "terminated"
+        if self._active:
+            return "running"
+        if self._started_once:
+            return "paused"
+        return "idle"
 
     def update_duration(self):
         """若测试处于进行中，更新已耗费的持续秒数。"""
