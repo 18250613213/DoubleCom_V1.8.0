@@ -1,4 +1,4 @@
-# DoubleCom Optimized V1.9.1
+# DoubleCom Optimized V1.9.2
 
 本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
 
@@ -31,6 +31,7 @@
 - 日志文件打开失败时安全关闭句柄，并按端口独立刷新；
 - 放大系统全局操作和测试报告导出区域的文字与控件；
 - 将实时串口信息流迁移到独立标签页；
+- 将系统运行与调试日志迁移到独立标签页，并放大日志与串口信息流字体；
 - 四个方向均采用独立的启动、暂停、继续和终止控制；
 - 支持100倍速端到端自检。
 
@@ -52,4 +53,4 @@ python -m PyInstaller --clean --noconfirm `
   DoubleCom_Optimized.spec
 ```
 
-生成文件：`release/DoubleCom_Optimized_V1.9.1.exe`。
+生成文件：`release/DoubleCom_Optimized_V1.9.2.exe`。

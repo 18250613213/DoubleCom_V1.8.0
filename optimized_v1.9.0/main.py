@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -670,14 +670,14 @@ class NMEADataAnalyzer(QMainWindow):
            - 3 串口实时 GGA 定位状态卡片 (UTC/经纬高/解状态/星数/TTFF)；
            - 全局 ENU 空间直角坐标基准源配置区 (自动基准 / 动态瞬时 / 手动输入)；
            - 3 路实时 ENU 误差显示与滑动窗口标准差统计；
-           - 系统运行与调试日志窗口；
            - 实验测试基本信息录入 (地点/型号/天线阵列/干扰模式/方位/高度)；
            - 全局控制按钮栏 (清空/重置/日志导出/多路报告导出/一键全链路自检)；
         3. 串口实时数据流 (stream_tab)：独立承载原始语句滚动、暂停、过滤与清空操作；
-        4. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
-        5. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
-        6. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
-        7. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
+        4. 系统运行日志 (log_tab)：独立展示连接、解析、异常与操作历史；
+        5. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
+        6. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
+        7. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
+        8. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
         """
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -911,24 +911,30 @@ class NMEADataAnalyzer(QMainWindow):
         stream_layout.setContentsMargins(8, 8, 8, 8)
         self.preview_box = QGroupBox("实时串口信息流")
         preview_box = self.preview_box
+        preview_font = QFont(preview_box.font())
+        preview_font.setPointSize(15)
+        preview_font.setBold(True)
+        preview_box.setFont(preview_font)
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(10, 10, 10, 10)
 
         preview_ctrl_row = QHBoxLayout()
         self.pause_preview_cb = QCheckBox("⏸ 暂停滚动 (Pause)")
         self.pause_preview_cb.setToolTip("勾选后暂停界面滚动输出，便于鼠标选中、检查和复制语句。后台数据解析与文件记录照常进行。")
-        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 14px;")
+        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 15px;")
         preview_ctrl_row.addWidget(self.pause_preview_cb)
 
         preview_ctrl_row.addSpacing(10)
-        preview_ctrl_row.addWidget(QLabel("协议过滤:"))
+        self.preview_filter_label = QLabel("协议过滤:")
+        self.preview_filter_label.setStyleSheet("font-size: 15px;")
+        preview_ctrl_row.addWidget(self.preview_filter_label)
         self.preview_filter_combo = QComboBox()
         self.preview_filter_combo.addItems(["全部", "仅 GGA", "仅 GSV", "仅 RMC", "仅 UBX"])
-        self.preview_filter_combo.setStyleSheet("font-size: 14px; padding: 4px 8px;")
+        self.preview_filter_combo.setStyleSheet("font-size: 15px; padding: 5px 9px;")
         preview_ctrl_row.addWidget(self.preview_filter_combo)
 
         self.clear_preview_btn = QPushButton("清空预览")
-        self.clear_preview_btn.setStyleSheet("padding: 5px 12px; font-size: 14px;")
+        self.clear_preview_btn.setStyleSheet("padding: 6px 12px; font-size: 15px;")
         self.clear_preview_btn.clicked.connect(self.clear_data_preview)
         preview_ctrl_row.addWidget(self.clear_preview_btn)
 
@@ -937,7 +943,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 13px; background-color: #fafafa;")
+        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 15px; background-color: #fafafa;")
         self.data_preview.setPlaceholderText("数据预览区域...")
         self.data_preview.setMinimumHeight(400)
         preview_layout.addWidget(self.data_preview)
@@ -1231,13 +1237,24 @@ class NMEADataAnalyzer(QMainWindow):
         control_layout.addWidget(enu_std_box)
 
         # -------------------------------------------------------------------------
-        # 6. 系统运行与调试日志窗口 (展示连接、解析、异常与操作历史)
+        # 独立系统运行日志标签页 (展示连接、解析、异常与操作历史)
         # -------------------------------------------------------------------------
+        self.log_tab = QWidget()
+        log_tab_layout = QVBoxLayout(self.log_tab)
+        log_tab_layout.setContentsMargins(8, 8, 8, 8)
+        self.log_box = QGroupBox("系统运行与调试日志")
+        log_box_font = QFont(self.log_box.font())
+        log_box_font.setPointSize(15)
+        log_box_font.setBold(True)
+        self.log_box.setFont(log_box_font)
+        log_layout = QVBoxLayout(self.log_box)
+        log_layout.setContentsMargins(10, 10, 10, 10)
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
-        self.log_window.setStyleSheet("font-family: Consolas; font-size: 11px;")
-        self.log_window.setMaximumHeight(150)
-        control_layout.addWidget(self.log_window)
+        self.log_window.setStyleSheet("font-family: Consolas; font-size: 14px;")
+        self.log_window.setMinimumHeight(400)
+        log_layout.addWidget(self.log_window)
+        log_tab_layout.addWidget(self.log_box)
 
         # -------------------------------------------------------------------------
         # 7. 测试基本信息录入区 (用于导出试验报告与 PDF 报表的元数据配置)
@@ -1460,6 +1477,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.tab_widget.addTab(control_tab, "功能与控制面板")
         self.tab_widget.addTab(table_tab, "表格视图")
         self.tab_widget.addTab(self.stream_tab, "串口实时数据流")
+        self.tab_widget.addTab(self.log_tab, "系统运行日志")
         
         # =========================================================================
         # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
