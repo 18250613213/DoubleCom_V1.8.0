@@ -34,6 +34,31 @@ class UIDirectionControlTests(unittest.TestCase):
         stream_tab = self.window.tab_widget.widget(titles.index("串口实时数据流"))
         self.assertTrue(stream_tab.isAncestorOf(self.window.data_preview))
 
+    def test_system_log_has_its_own_readable_main_tab(self):
+        titles = [
+            self.window.tab_widget.tabText(i)
+            for i in range(self.window.tab_widget.count())
+        ]
+        self.assertIn("系统运行日志", titles)
+        log_tab = self.window.tab_widget.widget(titles.index("系统运行日志"))
+        control_tab = self.window.tab_widget.widget(titles.index("功能与控制面板"))
+        self.assertTrue(log_tab.isAncestorOf(self.window.log_window))
+        self.assertFalse(control_tab.isAncestorOf(self.window.log_window))
+        self.assertGreaterEqual(self.window.log_window.font().pixelSize(), 14)
+        self.assertGreaterEqual(self.window.log_window.minimumHeight(), 400)
+
+    def test_serial_stream_uses_larger_readable_fonts(self):
+        for widget in (
+            self.window.preview_box,
+            self.window.pause_preview_cb,
+            self.window.preview_filter_combo,
+            self.window.clear_preview_btn,
+            self.window.data_preview,
+        ):
+            font = widget.font()
+            rendered_size = font.pointSizeF() if font.pointSizeF() > 0 else font.pixelSize()
+            self.assertGreaterEqual(rendered_size, 15)
+
     def test_global_action_area_uses_readable_fonts(self):
         def rendered_size(widget):
             font = widget.font()
