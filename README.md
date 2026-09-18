@@ -1,4 +1,4 @@
-# DoubleCom Optimized V1.9.3
+# DoubleCom Optimized V1.9.4
 
 本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
 
@@ -35,6 +35,9 @@
 - 将测试基本信息、报告导出和一键自检迁移到独立标签页；
 - 移除方向测试汇总表，放大各方向独立统计卡片文字；
 - 四个方向均采用独立的启动、暂停、继续和终止控制；
+- ENU 异常值门槛提高为“绝对偏差大于 8 米且同时大于 10σ”，保留 30 点起步和 200 点滑动窗口；
+- “数据与日志”操作按钮移除图标并放大文字；
+- “测试信息与报告”增加统计方法说明，明确 ENU、SNR 和方向测试指标口径；
 - 支持100倍速端到端自检。
 
 ## 验证
@@ -55,4 +58,4 @@ python -m PyInstaller --clean --noconfirm `
   DoubleCom_Optimized.spec
 ```
 
-生成文件：`release/DoubleCom_Optimized_V1.9.3.exe`。
+生成文件：`release/DoubleCom_Optimized_V1.9.4.exe`。

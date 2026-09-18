@@ -11,7 +11,7 @@
   2. 串口 2 / 串口 3 (干扰测试机 1 / 2):
      - GGA 分别采用 $GPGGA 与 $BDGGA。
      - 注入米级高斯噪声抖动 (σ_E/N = 1.0m, σ_U = 1.5m)。
-     - 注入周期性单历元异常尖峰跳变 (水平方向 +15m，天向 +18m，超过 8σ 且远超 5m 阈值)，
+     - 注入周期性单历元异常尖峰跳变 (水平方向 +15m，天向 +18m，用于验证 10σ 与 8m 双重门槛)，
        用于检验系统核心的滑动窗口异常值动态剔除算法 (Outlier Rejection)。
      - 模拟中间阶段连续 5 个历元的失锁脱锁间隙 (Quality = 0)。
   3. 多星系统 GSV 报文:
@@ -266,4 +266,3 @@ def generate_port_timeline(port_id, minutes=60, seed=42):
     # 按仿真时间严格排序
     timeline.sort(key=lambda e: e[0])
     return timeline
-

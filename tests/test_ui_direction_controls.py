@@ -10,7 +10,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from PyQt5.QtCore import QPoint
 from PyQt5.QtWidgets import QApplication, QTableWidget
 
-from main import NMEADataAnalyzer
+from main import NMEADataAnalyzer, SlidingWindowStd
 from src.simulation.selftest import SelfTestRunner
 
 
@@ -120,6 +120,45 @@ class UIDirectionControlTests(unittest.TestCase):
         for control in self.window.action_controls:
             self.assertGreaterEqual(rendered_size(control), 14)
             self.assertGreaterEqual(control.minimumHeight(), 32)
+
+    def test_data_and_log_buttons_have_no_icons_and_use_larger_fonts(self):
+        buttons = (
+            self.window.clear_data_btn,
+            self.window.reset_stats_btn,
+            self.window.clear_log_btn,
+            self.window.save_all_log_btn,
+        )
+        self.assertEqual(
+            [button.text() for button in buttons],
+            ["清空数据", "重置统计", "清除日志", "保存全部日志"],
+        )
+        for button in buttons:
+            font = button.font()
+            rendered_size = font.pointSizeF() if font.pointSizeF() > 0 else font.pixelSize()
+            self.assertGreaterEqual(rendered_size, 16)
+            self.assertGreaterEqual(button.minimumHeight(), 40)
+
+    def test_enu_outlier_filter_uses_higher_dual_threshold(self):
+        unit_sigma = SlidingWindowStd(200)
+        half_sigma = SlidingWindowStd(200)
+        for index in range(30):
+            unit_sigma.add(-1.0 if index % 2 == 0 else 1.0)
+            half_sigma.add(-0.5 if index % 2 == 0 else 0.5)
+
+        self.assertFalse(self.window._is_enu_outlier(unit_sigma, 9.5))
+        self.assertTrue(self.window._is_enu_outlier(unit_sigma, 10.5))
+        self.assertFalse(self.window._is_enu_outlier(half_sigma, 7.9))
+        self.assertFalse(self.window._is_enu_outlier(half_sigma, 8.0))
+        self.assertTrue(self.window._is_enu_outlier(half_sigma, 8.1))
+
+    def test_statistics_methods_are_visible_on_report_tab(self):
+        self.assertTrue(hasattr(self.window, "statistics_method_box"))
+        self.assertTrue(hasattr(self.window, "statistics_method_text"))
+        self.assertTrue(
+            self.window.test_report_tab.isAncestorOf(self.window.statistics_method_box)
+        )
+        self.assertTrue(self.window.statistics_method_text.isReadOnly())
+        self.assertGreaterEqual(self.window.statistics_method_text.minimumHeight(), 260)
 
     def test_every_direction_has_four_independent_controls(self):
         expected_keys = {"start_btn", "pause_btn", "resume_btn", "terminate_btn"}

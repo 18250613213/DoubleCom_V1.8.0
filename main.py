@@ -11,7 +11,7 @@ DoubleCom - 多串口 GNSS 实时数据分析与抗干扰测试系统
      - 将三维大地经纬高坐标 (WGS84 LLA) 转换为地心地固直角坐标 (ECEF)。
      - 结合基准原点，通过正交投影矩阵实时投影至站心局部坐标系 (East, North, Up)。
   3. 智能抗尖峰异常值动态剔除算法 (Outlier Rejection):
-     - 基于定长滑动窗口递推维护标准差 (1-Sigma)，通过动态 8-Sigma 阈值拦截因多径或干扰造成的虚假野值。
+     - 基于定长滑动窗口递推维护标准差 (1-Sigma)，仅在偏差同时超过 8 米与动态 10-Sigma 阈值时剔除野值。
   4. 四方向转台抗干扰测试与自动启停:
      - 支持在 4 个测试角度（0°/90°/180°/270°）下独立统计历元数、定位成功率、水平/高程极值与均值。
      - 支持基于时间（秒）或历元数（点数）的自动停止条件。
@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -479,8 +479,8 @@ class NMEADataAnalyzer(QMainWindow):
         # 5. 异常值动态检测与剔除参数 (Outlier Filter)
         # ----------------------------------------------------
         self.ENU_STD_WINDOW = 200                             # 滑动标准差计算窗口宽度 (点数)
-        self.ENU_OUTLIER_SIGMA = 8.0                          # 离群值判定倍数 (偏差 > 8*Sigma 触发候选)
-        self.ENU_OUTLIER_MIN_DELTA = 5.0                      # 最小绝对偏差门限 (偏差必须同时 > 5.0 米才剔除，防止静止极小标准差误杀)
+        self.ENU_OUTLIER_SIGMA = 10.0                         # 离群值判定倍数 (偏差 > 10*Sigma 触发候选)
+        self.ENU_OUTLIER_MIN_DELTA = 8.0                      # 最小绝对偏差门限 (偏差必须同时 > 8.0 米才剔除，减少有效变化误杀)
         self.ENU_OUTLIER_MIN_SAMPLES = 30                     # 滑动窗口最少起步样本数 (不足 30 点时不执行剔除)
         self._enu2_outlier_count = 0                          # 串口 2 累计剔除异常点计数
         self._enu3_outlier_count = 0                          # 串口 3 累计剔除异常点计数
@@ -1362,38 +1362,38 @@ class NMEADataAnalyzer(QMainWindow):
         row1.setSpacing(8)
 
         lbl_sec1 = QLabel("数据与日志:")
-        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
+        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 16px;")
         row1.addWidget(lbl_sec1)
 
         # 清空数据：重置接收队列与全部统计缓存
-        self.clear_data_btn = QPushButton("🗑 清空数据")
+        self.clear_data_btn = QPushButton("清空数据")
         self.clear_data_btn.setMinimumWidth(95)
         self.clear_data_btn.setToolTip("清空数据预览区与三个串口的底层接收队列, 并重置全部统计累计值")
         self.clear_data_btn.setStyleSheet("""
-            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
+            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
             QPushButton:hover { background-color: #fde8e8; border-color: #f05252; }
         """)
 
         # 重置统计：仅清除统计累计量，保留已有数据帧
-        self.reset_stats_btn = QPushButton("↺ 重置统计")
+        self.reset_stats_btn = QPushButton("重置统计")
         self.reset_stats_btn.setMinimumWidth(95)
         self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR递推均值/方向统计等), 保留已有串口数据流缓存")
         self.reset_stats_btn.setStyleSheet("""
-            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
+            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
             QPushButton:hover { background-color: #e0e7ff; border-color: #818cf8; }
         """)
 
         # 清除日志：重置界面窗口文本
-        self.clear_log_btn = QPushButton("🧹 清除日志")
+        self.clear_log_btn = QPushButton("清除日志")
         self.clear_log_btn.setMinimumWidth(95)
         self.clear_log_btn.setToolTip("清空界面日志窗口显示内容(不影响本地自动落盘日志文件)")
-        self.clear_log_btn.setStyleSheet("padding: 7px 12px; font-size: 14px;")
+        self.clear_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
 
         # 保存全部原始日志
-        self.save_all_log_btn = QPushButton("💾 保存全部日志")
+        self.save_all_log_btn = QPushButton("保存全部日志")
         self.save_all_log_btn.setMinimumWidth(115)
         self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
-        self.save_all_log_btn.setStyleSheet("padding: 7px 12px; font-size: 14px;")
+        self.save_all_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
 
         row1.addWidget(self.clear_data_btn)
         row1.addWidget(self.reset_stats_btn)
@@ -1405,7 +1405,7 @@ class NMEADataAnalyzer(QMainWindow):
         # 自动落盘日志复选框 (默认勾选)
         self.auto_log_cb = QCheckBox("自动保存原始日志")
         self.auto_log_cb.setChecked(True)
-        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 14px;")
+        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 16px;")
         self.auto_log_cb.setToolTip("勾选后将三个串口收到的原始数据按时间戳实时自动保存到 log/ 目录")
         row1.addWidget(self.auto_log_cb)
 
@@ -1468,6 +1468,40 @@ class NMEADataAnalyzer(QMainWindow):
 
         report_layout.addLayout(row2)
         test_report_layout.addWidget(self.report_group)
+
+        # 统计口径说明：与实时算法保持一致，便于测试人员解释报表指标。
+        self.statistics_method_box = QGroupBox("统计方法说明")
+        method_box_font = QFont(self.statistics_method_box.font())
+        method_box_font.setPointSize(15)
+        method_box_font.setBold(True)
+        self.statistics_method_box.setFont(method_box_font)
+        method_layout = QVBoxLayout(self.statistics_method_box)
+        method_layout.setContentsMargins(10, 12, 10, 10)
+        self.statistics_method_text = QTextEdit()
+        self.statistics_method_text.setReadOnly(True)
+        self.statistics_method_text.setMinimumHeight(260)
+        self.statistics_method_text.setStyleSheet(
+            "QTextEdit { font-size: 14px; line-height: 1.45; "
+            "background: #fbfcfd; border: 1px solid #d5d8dc; padding: 8px; }"
+        )
+        self.statistics_method_text.setHtml("""
+            <ol style="margin-top: 2px;">
+              <li><b>ENU 独立参考点：</b>ENU1、ENU2、ENU3 默认分别使用各自前 100 个有效 GGA
+                  定位点的经度、纬度和高程均值建立参考点，三路参考点互不共用。</li>
+              <li><b>ENU 滑动标准差：</b>每个 E/N/U 分量只保留最近最多 200 个已接纳样本，
+                  使用总体标准差 σ = √[Σ(xᵢ − x̄)² / n]；样本少于 3 个时显示为 0。</li>
+              <li><b>ENU 异常值剔除：</b>累计至少 30 个已接纳样本后，仅当新值相对窗口均值的
+                  绝对偏差同时大于 8 m 且大于 10σ 时才剔除。被剔除值不进入曲线、窗口和后续统计。</li>
+              <li><b>单星 SNR 均值：</b>按真实完整 GSV 历元递推，x̄ₙ = x̄ₙ₋₁ +
+                  (xₙ − x̄ₙ₋₁) / n；按导航系统、卫星号和信号频点分别累计，界面刷新不重复计数。</li>
+              <li><b>串口 SNR 差值均值：</b>同星同频点配对后计算 Δ₂ = SNR₂ − SNR₁、
+                  Δ₃ = SNR₃ − SNR₁，再按真实历元分别递推求均值。</li>
+              <li><b>方向测试：</b>水平误差 H = √(E² + N²)，高程误差 V = |U|；有效定位历元计为成功，
+                  成功率 = 成功历元 / 总历元 × 100%。H/V 均值只统计成功历元，累计时长不包含暂停时段。</li>
+            </ol>
+        """)
+        method_layout.addWidget(self.statistics_method_text)
+        test_report_layout.addWidget(self.statistics_method_box)
         test_report_layout.addStretch()
         test_report_content.setMinimumHeight(test_report_layout.sizeHint().height())
         self.test_report_scroll.setWidget(test_report_content)
@@ -1478,9 +1512,9 @@ class NMEADataAnalyzer(QMainWindow):
         ]
         for control in self.action_controls:
             control_font = QFont(control.font())
-            control_font.setPointSize(14)
+            control_font.setPointSize(16)
             control.setFont(control_font)
-            control.setMinimumHeight(34)
+            control.setMinimumHeight(40)
         self.report_controls = [
             lbl_sec2, self.export_report2_btn, self.export_pdf2_btn,
             self.export_report3_btn, self.export_pdf3_btn, self.selftest_btn,
@@ -2825,7 +2859,7 @@ class NMEADataAnalyzer(QMainWindow):
         mean = std_calc.mean
         std = std_calc.std
         delta = abs(value - mean)
-        if delta < self.ENU_OUTLIER_MIN_DELTA:
+        if delta <= self.ENU_OUTLIER_MIN_DELTA:
             return False
         return std > 0 and delta > self.ENU_OUTLIER_SIGMA * std
 
