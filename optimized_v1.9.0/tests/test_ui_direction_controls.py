@@ -7,7 +7,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QPoint
+from PyQt5.QtWidgets import QApplication, QTableWidget
 
 from main import NMEADataAnalyzer
 from src.simulation.selftest import SelfTestRunner
@@ -46,6 +47,57 @@ class UIDirectionControlTests(unittest.TestCase):
         self.assertFalse(control_tab.isAncestorOf(self.window.log_window))
         self.assertGreaterEqual(self.window.log_window.font().pixelSize(), 14)
         self.assertGreaterEqual(self.window.log_window.minimumHeight(), 400)
+
+    def test_test_information_reports_and_selftest_share_a_separate_tab(self):
+        titles = [
+            self.window.tab_widget.tabText(i)
+            for i in range(self.window.tab_widget.count())
+        ]
+        self.assertIn("测试信息与报告", titles)
+        report_tab = self.window.tab_widget.widget(titles.index("测试信息与报告"))
+        control_tab = self.window.tab_widget.widget(titles.index("功能与控制面板"))
+        for widget in (
+            self.window.test_location_input,
+            self.window.dut_model_input,
+            self.window.export_report2_btn,
+            self.window.export_pdf2_btn,
+            self.window.export_report3_btn,
+            self.window.export_pdf3_btn,
+            self.window.selftest_btn,
+        ):
+            self.assertTrue(report_tab.isAncestorOf(widget))
+            self.assertFalse(control_tab.isAncestorOf(widget))
+
+        self.window.tab_widget.setCurrentWidget(report_tab)
+        self.app.processEvents()
+        selftest_pos = self.window.selftest_btn.mapTo(
+            self.window.test_report_scroll.viewport(), QPoint(0, 0))
+        self.assertLessEqual(
+            selftest_pos.x() + self.window.selftest_btn.width(),
+            self.window.test_report_scroll.viewport().width(),
+        )
+
+    def test_direction_page_has_only_per_direction_statistics_without_summary_tables(self):
+        titles = [
+            self.window.tab_widget.tabText(i)
+            for i in range(self.window.tab_widget.count())
+        ]
+        direction_tab = self.window.tab_widget.widget(titles.index("方向测试"))
+        self.assertEqual(direction_tab.findChildren(QTableWidget), [])
+
+    def test_per_direction_statistics_use_readable_fonts(self):
+        for boxes in (self.window.dir_stat_boxes, self.window.dir_stat_boxes3):
+            for controls in boxes:
+                box_font = controls["box"].font()
+                box_size = box_font.pointSizeF() if box_font.pointSizeF() > 0 else box_font.pixelSize()
+                self.assertGreaterEqual(box_size, 16)
+                for key in (
+                    "duration", "epoch", "h", "v", "state",
+                    "start_btn", "pause_btn", "resume_btn", "terminate_btn",
+                ):
+                    font = controls[key].font()
+                    rendered_size = font.pointSizeF() if font.pointSizeF() > 0 else font.pixelSize()
+                    self.assertGreaterEqual(rendered_size, 14)
 
     def test_serial_stream_uses_larger_readable_fonts(self):
         for widget in (

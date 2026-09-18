@@ -1,4 +1,4 @@
-# DoubleCom Optimized V1.9.2
+# DoubleCom Optimized V1.9.3
 
 本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
 
@@ -32,6 +32,8 @@
 - 放大系统全局操作和测试报告导出区域的文字与控件；
 - 将实时串口信息流迁移到独立标签页；
 - 将系统运行与调试日志迁移到独立标签页，并放大日志与串口信息流字体；
+- 将测试基本信息、报告导出和一键自检迁移到独立标签页；
+- 移除方向测试汇总表，放大各方向独立统计卡片文字；
 - 四个方向均采用独立的启动、暂停、继续和终止控制；
 - 支持100倍速端到端自检。
 
@@ -53,4 +55,4 @@ python -m PyInstaller --clean --noconfirm `
   DoubleCom_Optimized.spec
 ```
 
-生成文件：`release/DoubleCom_Optimized_V1.9.2.exe`。
+生成文件：`release/DoubleCom_Optimized_V1.9.3.exe`。

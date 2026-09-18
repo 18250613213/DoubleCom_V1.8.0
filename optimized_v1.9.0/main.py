@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -1259,7 +1259,19 @@ class NMEADataAnalyzer(QMainWindow):
         # -------------------------------------------------------------------------
         # 7. 测试基本信息录入区 (用于导出试验报告与 PDF 报表的元数据配置)
         # -------------------------------------------------------------------------
-        info_group = QGroupBox("测试基本信息")
+        self.test_report_tab = QWidget()
+        test_report_tab_layout = QVBoxLayout(self.test_report_tab)
+        test_report_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.test_report_scroll = QScrollArea()
+        self.test_report_scroll.setWidgetResizable(True)
+        self.test_report_scroll.setFrameShape(QFrame.NoFrame)
+        test_report_content = QWidget()
+        test_report_layout = QVBoxLayout(test_report_content)
+        test_report_layout.setContentsMargins(10, 10, 10, 10)
+        test_report_layout.setSpacing(12)
+
+        self.info_group = QGroupBox("测试基本信息")
+        info_group = self.info_group
         info_layout = QGridLayout(info_group)
 
         # 测试地点
@@ -1306,15 +1318,15 @@ class NMEADataAnalyzer(QMainWindow):
         self.antenna_height_input.setPlaceholderText("例如: 1.5 m")
         info_layout.addWidget(self.antenna_height_input, 3, 1)
 
-        control_layout.addWidget(info_group)
+        test_report_layout.addWidget(info_group)
 
         # 控制面板拉伸比例分配: 仅GGA状态卡片可纵向伸缩，其余保持紧凑自适应
         control_layout.setStretch(1, 1)
 
         # -------------------------------------------------------------------------
-        # 8. 全局操作与导出控制中心 (功能卡片化双行整合: 数据维护 / 报告导出 / 自动化自检)
+        # 8. 全局数据与日志操作中心
         # -------------------------------------------------------------------------
-        self.action_box = QGroupBox("系统全局操作与测试报告导出")
+        self.action_box = QGroupBox("系统全局操作")
         action_box = self.action_box
         action_box_font = QFont(action_box.font())
         action_box_font.setPointSize(15)
@@ -1400,20 +1412,20 @@ class NMEADataAnalyzer(QMainWindow):
         row1.addStretch()
         action_layout.addLayout(row1)
 
-        # 细微分割线
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        line.setStyleSheet("color: #e5e7eb; background-color: #e5e7eb; max-height: 1px;")
-        action_layout.addWidget(line)
-
-        # 第 2 行: 试验报告导出与全链路脱机自动化自检
-        row2 = QHBoxLayout()
+        # 独立报告导出与全链路脱机自动化自检区
+        self.report_group = QGroupBox("测试报告导出与系统自检")
+        report_group_font = QFont(self.report_group.font())
+        report_group_font.setPointSize(15)
+        report_group_font.setBold(True)
+        self.report_group.setFont(report_group_font)
+        report_layout = QVBoxLayout(self.report_group)
+        report_layout.setContentsMargins(10, 12, 10, 10)
+        row2 = QGridLayout()
         row2.setSpacing(8)
 
         lbl_sec2 = QLabel("报告与自检:")
         lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
-        row2.addWidget(lbl_sec2)
+        row2.addWidget(lbl_sec2, 0, 0, 2, 1)
 
         # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report2_btn = QPushButton("📄 导出串口2报告 (MD)")
@@ -1447,26 +1459,37 @@ class NMEADataAnalyzer(QMainWindow):
         """)
         self.selftest_btn.setToolTip("无需真实串口: 使用随机生成的模拟导航数据(时长/倍率/种子可配)\n对解析/ENU/SNR/TTFF/方向测试/报告导出全链路进行自动化测试并输出验证清单")
 
-        row2.addWidget(self.export_report2_btn)
-        row2.addWidget(self.export_pdf2_btn)
-        row2.addWidget(self.export_report3_btn)
-        row2.addWidget(self.export_pdf3_btn)
-        row2.addSpacing(10)
-        row2.addWidget(self.selftest_btn)
-        row2.addStretch()
+        row2.addWidget(self.export_report2_btn, 0, 1)
+        row2.addWidget(self.export_pdf2_btn, 0, 2)
+        row2.addWidget(self.export_report3_btn, 1, 1)
+        row2.addWidget(self.export_pdf3_btn, 1, 2)
+        row2.addWidget(self.selftest_btn, 2, 1, 1, 2)
+        row2.setColumnStretch(3, 1)
 
-        action_layout.addLayout(row2)
+        report_layout.addLayout(row2)
+        test_report_layout.addWidget(self.report_group)
+        test_report_layout.addStretch()
+        test_report_content.setMinimumHeight(test_report_layout.sizeHint().height())
+        self.test_report_scroll.setWidget(test_report_content)
+        test_report_tab_layout.addWidget(self.test_report_scroll)
         self.action_controls = [
             lbl_sec1, self.clear_data_btn, self.reset_stats_btn,
             self.clear_log_btn, self.save_all_log_btn, self.auto_log_cb,
-            lbl_sec2, self.export_report2_btn, self.export_pdf2_btn,
-            self.export_report3_btn, self.export_pdf3_btn, self.selftest_btn,
         ]
         for control in self.action_controls:
             control_font = QFont(control.font())
             control_font.setPointSize(14)
             control.setFont(control_font)
             control.setMinimumHeight(34)
+        self.report_controls = [
+            lbl_sec2, self.export_report2_btn, self.export_pdf2_btn,
+            self.export_report3_btn, self.export_pdf3_btn, self.selftest_btn,
+        ]
+        for control in self.report_controls:
+            control_font = QFont(control.font())
+            control_font.setPointSize(14)
+            control.setFont(control_font)
+            control.setMinimumHeight(36)
         control_layout.addWidget(action_box)
 
         # 组装滚动容器到控制面板页面中
@@ -1478,6 +1501,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.tab_widget.addTab(table_tab, "表格视图")
         self.tab_widget.addTab(self.stream_tab, "串口实时数据流")
         self.tab_widget.addTab(self.log_tab, "系统运行日志")
+        self.tab_widget.addTab(self.test_report_tab, "测试信息与报告")
         
         # =========================================================================
         # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
@@ -3013,55 +3037,37 @@ class NMEADataAnalyzer(QMainWindow):
         sn_row.addStretch()
         tab_layout.addLayout(sn_row)
 
-        # 方向测试汇总对比表（4方向关键指标一眼对比）
-        summary = QTableWidget(4, 8)
-        summary.setHorizontalHeaderLabels(
-            ["方向", "测试时长", "总历元", "成功率", "水平均值(m)",
-             "水平最大(m)", "垂直均值(m)", "垂直最大(m)"])
-        summary.verticalHeader().setVisible(False)
-        summary.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        summary.setSelectionMode(QAbstractItemView.NoSelection)
-        summary.setAlternatingRowColors(True)
-        summary.setMaximumHeight(170)
-        summary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        summary.horizontalHeader().setStretchLastSection(True)
-        for r in range(4):
-            for c in range(8):
-                summary.setItem(r, c, QTableWidgetItem(""))
-            summary.item(r, 0).setText(f"方向{r + 1}")
-        tab_layout.addWidget(summary)
-        if is_com3:
-            self.dir_summary_table3 = summary
-        else:
-            self.dir_summary_table = summary
-
         stats_grid = QGridLayout()
         stat_boxes = []
 
         for i in range(4):
             box = QGroupBox(f"方向{i + 1}")
-            box.setMinimumHeight(208)
-            box.setStyleSheet("QGroupBox { font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 14px; } QGroupBox::title { background-color: #ecf0f1; padding: 2px 10px; border-radius: 3px; }")
+            box.setMinimumHeight(230)
+            box_font = QFont(box.font())
+            box_font.setPointSize(16)
+            box_font.setBold(True)
+            box.setFont(box_font)
+            box.setStyleSheet("QGroupBox { font-size: 16px; font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 16px; } QGroupBox::title { background-color: #ecf0f1; padding: 3px 10px; border-radius: 3px; font-size: 16px; }")
             box_layout = QVBoxLayout(box)
 
             duration_label = QLabel("测试时长: 00:00:00")
-            duration_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2980b9;")
+            duration_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2980b9;")
             box_layout.addWidget(duration_label)
 
             epoch_label = QLabel("总历元: 0 | 成功: 0 | 成功率: 0.0%")
-            epoch_label.setStyleSheet("font-size: 12px; color: #555;")
+            epoch_label.setStyleSheet("font-size: 14px; color: #555;")
             box_layout.addWidget(epoch_label)
 
             h_label = QLabel("水平误差 均值: -- m | 最大: -- m")
-            h_label.setStyleSheet("font-size: 12px; color: #e74c3c;")
+            h_label.setStyleSheet("font-size: 14px; color: #e74c3c;")
             box_layout.addWidget(h_label)
 
             v_label = QLabel("垂直误差 均值: -- m | 最大: -- m")
-            v_label.setStyleSheet("font-size: 12px; color: #27ae60;")
+            v_label.setStyleSheet("font-size: 14px; color: #27ae60;")
             box_layout.addWidget(v_label)
 
             state_label = QLabel("状态: 未开始")
-            state_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #7f8c8d;")
+            state_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #7f8c8d;")
             box_layout.addWidget(state_label)
 
             controls_layout = QGridLayout()
@@ -3081,7 +3087,7 @@ class NMEADataAnalyzer(QMainWindow):
                 button.setMinimumHeight(32)
                 button.setStyleSheet(
                     f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
-                    "padding: 5px 10px; border-radius: 4px; font-size: 13px; } "
+                    "padding: 6px 10px; border-radius: 4px; font-size: 14px; } "
                     "QPushButton:disabled { background-color: #bdc3c7; color: #ecf0f1; }"
                 )
             pause_btn.setEnabled(False)
@@ -3294,7 +3300,7 @@ class NMEADataAnalyzer(QMainWindow):
         text, color = states[ds.state]
         controls['state'].setText(text)
         controls['state'].setStyleSheet(
-            f"font-size: 13px; font-weight: bold; color: {color};")
+            f"font-size: 14px; font-weight: bold; color: {color};")
         controls['start_btn'].setEnabled(ds.state == 'idle')
         controls['pause_btn'].setEnabled(ds.state == 'running')
         controls['resume_btn'].setEnabled(ds.state == 'paused')
@@ -3514,26 +3520,7 @@ class NMEADataAnalyzer(QMainWindow):
                         self._refresh_direction_controls(port_id, i)
                         self.log_info(f"方向{i + 1} 自动停止 ({reason})")
 
-    def _refresh_dir_summary(self, table, direction_stats):
-        """刷新方向测试汇总对比表"""
-        for i in range(4):
-            s = direction_stats[i].get_stats()
-            values = [
-                s['duration'],
-                str(s['total_epochs']),
-                f"{s['success_rate']:.1f}%",
-                f"{s['h_mean']:.3f}",
-                f"{s['h_max']:.3f}",
-                f"{s['v_mean']:.3f}",
-                f"{s['v_max']:.3f}",
-            ]
-            for c, v in enumerate(values, start=1):
-                table.item(i, c).setText(v)
-
     def _update_direction_stats_display(self):
-        # 方向测试汇总表
-        self._refresh_dir_summary(self.dir_summary_table, self.direction_stats)
-        self._refresh_dir_summary(self.dir_summary_table3, self.direction_stats3)
         # 串口2方向测试显示
         for i in range(4):
             ds = self.direction_stats[i]
