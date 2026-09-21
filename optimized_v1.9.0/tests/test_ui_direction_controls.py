@@ -3,17 +3,12 @@ import sys
 import time
 import unittest
 
-import pyqtgraph as pg
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from PyQt5.QtCore import QPoint
-from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QGroupBox, QLineEdit,
-    QPushButton, QSpinBox, QTableWidget,
-)
+from PyQt5.QtWidgets import QApplication, QTableWidget
 
 from main import NMEADataAnalyzer, SlidingWindowStd
 from src.simulation.selftest import SelfTestRunner
@@ -50,10 +45,8 @@ class UIDirectionControlTests(unittest.TestCase):
         control_tab = self.window.tab_widget.widget(titles.index("功能与控制面板"))
         self.assertTrue(log_tab.isAncestorOf(self.window.log_window))
         self.assertFalse(control_tab.isAncestorOf(self.window.log_window))
-        log_font = self.window.log_window.font()
-        log_size = log_font.pointSizeF() if log_font.pointSizeF() > 0 else log_font.pixelSize()
-        self.assertGreaterEqual(log_size, 14)
-        self.assertGreaterEqual(self.window.log_window.minimumHeight(), 240)
+        self.assertGreaterEqual(self.window.log_window.font().pixelSize(), 14)
+        self.assertGreaterEqual(self.window.log_window.minimumHeight(), 400)
 
     def test_test_information_reports_and_selftest_share_a_separate_tab(self):
         titles = [
@@ -127,111 +120,6 @@ class UIDirectionControlTests(unittest.TestCase):
         for control in self.window.action_controls:
             self.assertGreaterEqual(rendered_size(control), 14)
             self.assertGreaterEqual(control.minimumHeight(), 32)
-
-    def test_global_typography_is_readable_on_a_laptop(self):
-        self.assertGreaterEqual(self.window.font().pointSizeF(), 12)
-        self.assertGreaterEqual(self.window.tab_widget.font().pointSizeF(), 13)
-        self.assertGreaterEqual(self.window.snr_table.font().pointSizeF(), 12)
-        self.assertGreaterEqual(self.window.data_preview.font().pointSizeF(), 14)
-        self.assertGreaterEqual(self.window.log_window.font().pointSizeF(), 14)
-
-        readable_classes = (QGroupBox, QPushButton, QComboBox, QLineEdit,
-                            QSpinBox, QDoubleSpinBox)
-        too_small = []
-        for widget_class in readable_classes:
-            for widget in self.window.findChildren(widget_class):
-                if widget.font().pointSizeF() < 12:
-                    too_small.append(
-                        f"{widget.metaObject().className()}:{widget.objectName() or widget.toolTip()[:24]}"
-                    )
-        self.assertEqual([], too_small)
-
-    def test_interactive_controls_have_laptop_friendly_touch_heights(self):
-        compact_controls = (QPushButton, QComboBox, QLineEdit,
-                            QSpinBox, QDoubleSpinBox)
-        too_short = []
-        for widget_class in compact_controls:
-            for widget in self.window.findChildren(widget_class):
-                if (widget_class is QLineEdit and
-                        isinstance(widget.parentWidget(), (QSpinBox, QDoubleSpinBox))):
-                    continue
-                if widget.minimumHeight() < 32:
-                    too_short.append(
-                        f"{widget.metaObject().className()}:{widget.objectName() or widget.toolTip()[:24]}"
-                    )
-        self.assertEqual([], too_short)
-
-    def test_all_plot_axes_use_readable_fonts(self):
-        plots = self.window.findChildren(pg.PlotWidget)
-        self.assertGreater(len(plots), 0)
-        for plot in plots:
-            for axis_name in ("left", "bottom"):
-                axis = plot.getAxis(axis_name)
-                tick_font = axis.style.get("tickFont")
-                self.assertIsNotNone(tick_font)
-                self.assertGreaterEqual(tick_font.pointSizeF(), 10)
-                self.assertGreaterEqual(axis.label.font().pointSizeF(), 11)
-
-    def test_primary_pages_fit_a_1366_by_768_laptop_without_horizontal_scroll(self):
-        self.window.showNormal()
-        self.window.resize(1366, 768)
-        self.app.processEvents()
-        try:
-            self.assertLessEqual(
-                self.window.width(), 1366,
-                "content minimum width must not force a laptop window wider than 1366px",
-            )
-            self.assertFalse(self.window.tab_widget.usesScrollButtons())
-            margins = self.window.centralWidget().layout().contentsMargins()
-            self.assertLessEqual(margins.left(), 8)
-            self.assertLessEqual(margins.right(), 8)
-
-            for tab_name, scroll in (
-                ("功能与控制面板", self.window.control_scroll),
-                ("测试信息与报告", self.window.test_report_scroll),
-            ):
-                titles = [
-                    self.window.tab_widget.tabText(i)
-                    for i in range(self.window.tab_widget.count())
-                ]
-                self.window.tab_widget.setCurrentIndex(titles.index(tab_name))
-                self.app.processEvents()
-                self.assertEqual(
-                    scroll.horizontalScrollBar().maximum(), 0,
-                    f"{tab_name} should not require horizontal scrolling at 1366px",
-                )
-        finally:
-            self.window.showMaximized()
-            self.app.processEvents()
-
-    def test_primary_pages_fit_a_125_percent_scaled_laptop_work_area(self):
-        # 1366×768 at Windows 125% scaling, minus a typical taskbar, leaves
-        # approximately 1093×580 logical pixels for the maximized application.
-        self.window.showNormal()
-        self.window.resize(1093, 580)
-        self.app.processEvents()
-        try:
-            self.assertLessEqual(self.window.width(), 1093)
-            self.assertLessEqual(self.window.height(), 580)
-
-            titles = [
-                self.window.tab_widget.tabText(i)
-                for i in range(self.window.tab_widget.count())
-            ]
-            for tab_name in titles:
-                self.window.tab_widget.setCurrentIndex(titles.index(tab_name))
-                self.app.processEvents()
-                self.assertLessEqual(self.window.width(), 1093, tab_name)
-                self.assertLessEqual(self.window.height(), 580, tab_name)
-
-            for scroll in (self.window.control_scroll, self.window.test_report_scroll):
-                self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
-
-            self.assertGreaterEqual(self.window.data_preview.height(), 240)
-            self.assertGreaterEqual(self.window.log_window.height(), 240)
-        finally:
-            self.window.showMaximized()
-            self.app.processEvents()
 
     def test_data_and_log_buttons_have_no_icons_and_use_larger_fonts(self):
         buttons = (

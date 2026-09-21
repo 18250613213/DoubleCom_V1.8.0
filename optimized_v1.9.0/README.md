@@ -1,4 +1,4 @@
-# DoubleCom Optimized V1.9.5
+# DoubleCom Optimized V1.9.4
 
 本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
 
@@ -38,10 +38,6 @@
 - ENU 异常值门槛提高为“绝对偏差大于 8 米且同时大于 10σ”，保留 30 点起步和 200 点滑动窗口；
 - “数据与日志”操作按钮移除图标并放大文字；
 - “测试信息与报告”增加统计方法说明，明确 ENU、SNR 和方向测试指标口径；
-- 以普通笔记本 1366×768、Windows 100%–125% 缩放为界面基准；
-- 统一正文、标签页、分组标题、关键数据、日志及图表坐标轴的字体层级；
-- 统一按钮和输入控件的最小高度，避免高 DPI 下文字裁切；
-- 压缩外边距与空白，SNR 工具栏改为双行自适应布局，主要页面不再被内容强制撑宽；
 - 支持100倍速端到端自检。
 
 ## 验证
@@ -62,4 +58,4 @@ python -m PyInstaller --clean --noconfirm `
   DoubleCom_Optimized.spec
 ```
 
-生成文件：`release/DoubleCom_Optimized_V1.9.5.exe`。
+生成文件：`release/DoubleCom_Optimized_V1.9.4.exe`。
