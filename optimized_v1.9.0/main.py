@@ -80,7 +80,12 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
+
+# 普通笔记本（约 1366×768、Windows 100%–125% 缩放）的界面字号基线。
+UI_FONT_FAMILY = "Microsoft YaHei UI"
+UI_BODY_FONT_PT = 12
+UI_TAB_FONT_PT = 13
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -299,7 +304,7 @@ class SNRBarDelegate(QStyledItemDelegate):
             text_rect = QRect(rect.left() + 2, rect.top(), rect.width() - 54, rect.height())
             text_color = index.data(Qt.ForegroundRole) or QColor("#cdd6f4")
             painter.setPen(QColor(text_color) if not isinstance(text_color, QColor) else text_color)
-            painter.setFont(QFont("Consolas", 11))
+            painter.setFont(QFont("Consolas", 12))
             painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignRight, txt)
             
             # 微型进度条槽（右侧 44px 宽，9px 高）
@@ -341,7 +346,7 @@ class SNRBarDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(badge_rect, 4, 4)
             
             painter.setPen(QColor("#11111b"))
-            font = QFont("Consolas", 10, QFont.Bold)
+            font = QFont("Consolas", 11, QFont.Bold)
             painter.setFont(font)
             painter.drawText(badge_rect, Qt.AlignCenter, txt)
             
@@ -354,7 +359,7 @@ class SNRBarDelegate(QStyledItemDelegate):
             if font:
                 painter.setFont(font)
             else:
-                painter.setFont(QFont("Consolas", 11))
+                painter.setFont(QFont("Consolas", 12))
                 
             align = index.data(Qt.TextAlignmentRole) or (Qt.AlignVCenter | Qt.AlignCenter)
             padded_rect = QRect(rect.left() + 4, rect.top(), rect.width() - 8, rect.height())
@@ -374,7 +379,8 @@ class NMEADataAnalyzer(QMainWindow):
         """初始化主窗口组件、数据结构、内部算法模块与定时器。"""
         super().__init__()
         self.setWindowTitle(f"NMEA 数据实时分析系统 V{APP_VERSION}")
-        self.setGeometry(100, 100, 1500, 1000)
+        self.setGeometry(40, 30, 1366, 768)
+        self.setFont(QFont(UI_FONT_FAMILY, UI_BODY_FONT_PT))
         self.showMaximized()
 
         # 加载并设置程序窗口图标
@@ -573,28 +579,35 @@ class NMEADataAnalyzer(QMainWindow):
         self._DATA_COUNT_INTERVAL = 10
         
         self.setStyleSheet("""
+            QWidget {
+                font-family: "Microsoft YaHei UI";
+                font-size: 12pt;
+            }
             QGroupBox {
                 font-weight: bold;
+                font-size: 13pt;
                 border: 1px solid #bdc3c7;
                 border-radius: 5px;
-                margin-top: 12px;
-                padding-top: 12px;
+                margin-top: 10px;
+                padding-top: 10px;
                 color: #2c3e50;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 2px 8px;
+                left: 10px;
+                padding: 2px 7px;
                 background-color: #ecf0f1;
                 border-radius: 3px;
                 color: #2c3e50;
+                font-size: 13pt;
             }
             QPushButton {
                 border: 1px solid #bdc3c7;
                 border-radius: 4px;
-                padding: 4px 12px;
+                padding: 4px 10px;
                 background-color: #f8f9fa;
-                font-size: 12px;
+                font-size: 12pt;
+                min-height: 32px;
             }
             QPushButton:hover {
                 background-color: #e8f0fe;
@@ -612,14 +625,32 @@ class NMEADataAnalyzer(QMainWindow):
                 border-radius: 4px;
                 background-color: #fafafa;
             }
-            QComboBox {
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
                 border: 1px solid #bdc3c7;
                 border-radius: 3px;
-                padding: 2px 6px;
+                padding: 3px 6px;
                 background-color: white;
+                font-size: 12pt;
+                min-height: 32px;
             }
             QComboBox:hover {
                 border-color: #4a90d9;
+            }
+            QCheckBox, QRadioButton {
+                font-size: 12pt;
+                spacing: 6px;
+            }
+            QTabBar::tab {
+                font-size: 13pt;
+                font-weight: bold;
+                min-height: 32px;
+                padding: 5px 9px;
+            }
+            QTableWidget, QHeaderView::section {
+                font-size: 12pt;
+            }
+            QStatusBar, QStatusBar QLabel {
+                font-size: 11pt;
             }
         """)
 
@@ -682,22 +713,28 @@ class NMEADataAnalyzer(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(6, 6, 6, 4)
+        main_layout.setSpacing(4)
         
         # 创建QTabWidget框架，承载多维业务分析与控制视图
         self.tab_widget = QTabWidget()
+        self.tab_widget.setFont(QFont(UI_FONT_FAMILY, UI_TAB_FONT_PT))
+        self.tab_widget.setUsesScrollButtons(False)
+        self.tab_widget.setElideMode(Qt.ElideNone)
         
         # =========================================================================
         # 标签页 1：表格视图 (GSV 载噪比对比矩阵看板)
         # =========================================================================
         table_tab = QWidget()
         table_layout = QVBoxLayout(table_tab)
+        table_layout.setContentsMargins(6, 6, 6, 6)
         table_layout.setSpacing(6)
         
         # -------------------------------------------------------------------------
         # 1. 顶部卫星态势摘要看板 (4 项核心 KPI Cards)
         # -------------------------------------------------------------------------
         kpi_row = QHBoxLayout()
-        kpi_row.setSpacing(10)
+        kpi_row.setSpacing(6)
 
         def _create_kpi_card(title_text, val_text="--", val_color="#89b4fa"):
             frame = QFrame()
@@ -712,9 +749,9 @@ class NMEADataAnalyzer(QMainWindow):
             lay.setContentsMargins(12, 8, 12, 8)
             lay.setSpacing(4)
             t_lbl = QLabel(title_text)
-            t_lbl.setStyleSheet("font-size: 13px; color: #a6adc8; font-weight: bold;")
+            t_lbl.setStyleSheet("font-size: 12pt; color: #a6adc8; font-weight: bold;")
             v_lbl = QLabel(val_text)
-            v_lbl.setStyleSheet(f"font-size: 17px; color: {val_color}; font-weight: bold; font-family: Consolas, 'Segoe UI', monospace;")
+            v_lbl.setStyleSheet(f"font-size: 16pt; color: {val_color}; font-weight: bold; font-family: Consolas, 'Segoe UI', monospace;")
             lay.addWidget(t_lbl)
             lay.addWidget(v_lbl)
             return frame, v_lbl
@@ -736,7 +773,7 @@ class NMEADataAnalyzer(QMainWindow):
         snr_box = QGroupBox("卫星信噪比 (GSV) 载噪比矩阵对比看板")
         snr_box.setStyleSheet("""
             QGroupBox {
-                font-size: 14px;
+                font-size: 13pt;
                 font-weight: bold;
                 border: 1px solid #bdc3c7;
                 border-radius: 5px;
@@ -751,7 +788,7 @@ class NMEADataAnalyzer(QMainWindow):
                 background-color: #ecf0f1;
                 border-radius: 3px;
                 color: #1a252f;
-                font-size: 14px;
+                font-size: 13pt;
                 font-weight: bold;
             }
         """)
@@ -759,13 +796,17 @@ class NMEADataAnalyzer(QMainWindow):
         snr_layout.setContentsMargins(6, 8, 6, 6)
         snr_layout.setSpacing(6)
 
-        toolbar_row = QHBoxLayout()
-        toolbar_row.setSpacing(6)
+        toolbar_layout = QVBoxLayout()
+        toolbar_layout.setSpacing(4)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        option_row = QHBoxLayout()
+        option_row.setSpacing(8)
 
         # 星座过滤单选按钮组
         lbl_filter = QLabel("星座筛选:")
-        lbl_filter.setStyleSheet("font-size: 15px; font-weight: bold;")
-        toolbar_row.addWidget(lbl_filter)
+        lbl_filter.setStyleSheet("font-size: 13pt; font-weight: bold;")
+        filter_row.addWidget(lbl_filter)
         self.snr_filter_group = QButtonGroup(self)
         self.snr_filter_all = QPushButton("全部")
         self.snr_filter_bds = QPushButton("🇨🇳 北斗(BDS)")
@@ -775,7 +816,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         filter_btn_style = """
             QPushButton {
-                padding: 5px 12px; font-size: 13px; border: 1px solid #45475a;
+                padding: 5px 10px; font-size: 12pt; border: 1px solid #45475a;
                 border-radius: 4px; background-color: #313244; color: #cdd6f4;
             }
             QPushButton:checked {
@@ -789,34 +830,32 @@ class NMEADataAnalyzer(QMainWindow):
             btn.setCheckable(True)
             btn.setStyleSheet(filter_btn_style)
             self.snr_filter_group.addButton(btn, idx)
-            toolbar_row.addWidget(btn)
+            filter_row.addWidget(btn)
         self.snr_filter_all.setChecked(True)
-
-        toolbar_row.addSpacing(10)
+        filter_row.addStretch()
+        toolbar_layout.addLayout(filter_row)
 
         # 仅显示受扰恶化星复选框
         self.snr_filter_warn_cb = QCheckBox("仅显示受扰星 (|Δ| ≥ 10 dB)")
-        self.snr_filter_warn_cb.setStyleSheet("font-weight: bold; color: #fab387; font-size: 15px;")
-        toolbar_row.addWidget(self.snr_filter_warn_cb)
-
-        toolbar_row.addSpacing(10)
+        self.snr_filter_warn_cb.setStyleSheet("font-weight: bold; color: #fab387; font-size: 13pt;")
+        option_row.addWidget(self.snr_filter_warn_cb)
 
         # PRN 快速搜索框
         self.snr_search_edit = QLineEdit()
         self.snr_search_edit.setPlaceholderText("搜索 PRN (如 01, 03)...")
         self.snr_search_edit.setMaximumWidth(160)
-        self.snr_search_edit.setStyleSheet("padding: 4px 8px; font-size: 13px; border: 1px solid #45475a; border-radius: 4px; background: white;")
-        toolbar_row.addWidget(self.snr_search_edit)
-
-        toolbar_row.addStretch()
+        self.snr_search_edit.setStyleSheet("padding: 4px 8px; font-size: 12pt; border: 1px solid #45475a; border-radius: 4px; background: white;")
+        option_row.addWidget(self.snr_search_edit)
+        option_row.addStretch()
 
         # CSV 导出按钮
         self.export_snr_btn = QPushButton("导出SNR表(CSV)")
         self.export_snr_btn.setToolTip("将当前卫星载噪比对比表(含三口瞬时值/均值/差值)导出为CSV文件")
-        self.export_snr_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; font-size: 13px; padding: 5px 14px; border-radius: 4px; } QPushButton:hover { background-color: #2ecc71; }")
-        toolbar_row.addWidget(self.export_snr_btn)
+        self.export_snr_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; font-size: 12pt; padding: 5px 12px; border-radius: 4px; } QPushButton:hover { background-color: #2ecc71; }")
+        option_row.addWidget(self.export_snr_btn)
 
-        snr_layout.addLayout(toolbar_row)
+        toolbar_layout.addLayout(option_row)
+        snr_layout.addLayout(toolbar_layout)
 
         # -------------------------------------------------------------------------
         # 3. 原生交互式 QTableWidget 核心表格
@@ -831,7 +870,7 @@ class NMEADataAnalyzer(QMainWindow):
         ]
         self.snr_table.setHorizontalHeaderLabels(SNR_HEADERS)
         self.snr_table.verticalHeader().setVisible(False)
-        self.snr_table.verticalHeader().setDefaultSectionSize(28)
+        self.snr_table.verticalHeader().setDefaultSectionSize(34)
         self.snr_table.setSortingEnabled(True)
         self.snr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.snr_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -840,6 +879,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 列宽与对齐设置 (适应放大后的 14px 字体与进度条)
         header = self.snr_table.horizontalHeader()
+        header.setMinimumHeight(38)
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
         self.snr_table.setColumnWidth(0, 70)   # 星座
@@ -863,7 +903,7 @@ class NMEADataAnalyzer(QMainWindow):
                 color: #cdd6f4;
                 gridline-color: #313244;
                 font-family: Consolas, 'Segoe UI', monospace;
-                font-size: 14px;
+                font-size: 13pt;
                 border: 1px solid #313244;
                 border-radius: 4px;
             }
@@ -871,7 +911,7 @@ class NMEADataAnalyzer(QMainWindow):
                 background-color: #313244;
                 color: #d8dee9;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 12pt;
                 padding: 5px 6px;
                 border: 1px solid #434c5e;
             }
@@ -896,7 +936,8 @@ class NMEADataAnalyzer(QMainWindow):
             "恶化差值: <span style='color:#fab387;font-weight:bold;'>|Δ|≥10dB 橙色预警</span> &nbsp;·&nbsp; "
             "<span style='color:#f38ba8;font-weight:bold;'>|Δ|≥15dB 红色告警</span>"
         )
-        legend_lbl.setStyleSheet("font-size: 13px; color: #a6adc8;")
+        legend_lbl.setWordWrap(True)
+        legend_lbl.setStyleSheet("font-size: 12pt; color: #a6adc8;")
         legend_row.addWidget(legend_lbl)
         legend_row.addStretch()
         snr_layout.addLayout(legend_row)
@@ -915,26 +956,29 @@ class NMEADataAnalyzer(QMainWindow):
         preview_font.setPointSize(15)
         preview_font.setBold(True)
         preview_box.setFont(preview_font)
+        preview_box.setStyleSheet(
+            "QGroupBox { font-size: 15pt; } QGroupBox::title { font-size: 15pt; }"
+        )
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(10, 10, 10, 10)
 
         preview_ctrl_row = QHBoxLayout()
         self.pause_preview_cb = QCheckBox("⏸ 暂停滚动 (Pause)")
         self.pause_preview_cb.setToolTip("勾选后暂停界面滚动输出，便于鼠标选中、检查和复制语句。后台数据解析与文件记录照常进行。")
-        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 15px;")
+        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 15pt;")
         preview_ctrl_row.addWidget(self.pause_preview_cb)
 
         preview_ctrl_row.addSpacing(10)
         self.preview_filter_label = QLabel("协议过滤:")
-        self.preview_filter_label.setStyleSheet("font-size: 15px;")
+        self.preview_filter_label.setStyleSheet("font-size: 15pt;")
         preview_ctrl_row.addWidget(self.preview_filter_label)
         self.preview_filter_combo = QComboBox()
         self.preview_filter_combo.addItems(["全部", "仅 GGA", "仅 GSV", "仅 RMC", "仅 UBX"])
-        self.preview_filter_combo.setStyleSheet("font-size: 15px; padding: 5px 9px;")
+        self.preview_filter_combo.setStyleSheet("font-size: 15pt; padding: 4px 8px;")
         preview_ctrl_row.addWidget(self.preview_filter_combo)
 
         self.clear_preview_btn = QPushButton("清空预览")
-        self.clear_preview_btn.setStyleSheet("padding: 6px 12px; font-size: 15px;")
+        self.clear_preview_btn.setStyleSheet("padding: 5px 10px; font-size: 15pt;")
         self.clear_preview_btn.clicked.connect(self.clear_data_preview)
         preview_ctrl_row.addWidget(self.clear_preview_btn)
 
@@ -943,7 +987,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 15px; background-color: #fafafa;")
+        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 15pt; background-color: #fafafa;")
         self.data_preview.setPlaceholderText("数据预览区域...")
         self.data_preview.setMinimumHeight(400)
         preview_layout.addWidget(self.data_preview)
@@ -967,8 +1011,8 @@ class NMEADataAnalyzer(QMainWindow):
 
         control_content_widget = QWidget()
         control_layout = QVBoxLayout(control_content_widget)
-        control_layout.setContentsMargins(8, 8, 8, 8)
-        control_layout.setSpacing(8)
+        control_layout.setContentsMargins(6, 6, 6, 6)
+        control_layout.setSpacing(6)
         
         # -------------------------------------------------------------------------
         # 1. 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
@@ -1251,7 +1295,7 @@ class NMEADataAnalyzer(QMainWindow):
         log_layout.setContentsMargins(10, 10, 10, 10)
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
-        self.log_window.setStyleSheet("font-family: Consolas; font-size: 14px;")
+        self.log_window.setStyleSheet("font-family: Consolas; font-size: 14pt;")
         self.log_window.setMinimumHeight(400)
         log_layout.addWidget(self.log_window)
         log_tab_layout.addWidget(self.log_box)
@@ -1267,8 +1311,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.test_report_scroll.setFrameShape(QFrame.NoFrame)
         test_report_content = QWidget()
         test_report_layout = QVBoxLayout(test_report_content)
-        test_report_layout.setContentsMargins(10, 10, 10, 10)
-        test_report_layout.setSpacing(12)
+        test_report_layout.setContentsMargins(8, 8, 8, 8)
+        test_report_layout.setSpacing(8)
 
         self.info_group = QGroupBox("测试基本信息")
         info_group = self.info_group
@@ -1335,7 +1379,7 @@ class NMEADataAnalyzer(QMainWindow):
         action_box.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
-                font-size: 15px;
+                font-size: 15pt;
                 border: 1px solid #bdc3c7;
                 border-radius: 6px;
                 margin-top: 10px;
@@ -1350,19 +1394,19 @@ class NMEADataAnalyzer(QMainWindow):
                 border-radius: 3px;
                 color: #2c3e50;
                 font-weight: bold;
-                font-size: 16px;
+                font-size: 16pt;
             }
         """)
         action_layout = QVBoxLayout(action_box)
-        action_layout.setContentsMargins(10, 8, 10, 8)
-        action_layout.setSpacing(8)
+        action_layout.setContentsMargins(8, 6, 8, 6)
+        action_layout.setSpacing(6)
 
         # 第 1 行: 数据缓存维护与日志管理
         row1 = QHBoxLayout()
         row1.setSpacing(8)
 
         lbl_sec1 = QLabel("数据与日志:")
-        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 16px;")
+        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 16pt;")
         row1.addWidget(lbl_sec1)
 
         # 清空数据：重置接收队列与全部统计缓存
@@ -1370,7 +1414,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.clear_data_btn.setMinimumWidth(95)
         self.clear_data_btn.setToolTip("清空数据预览区与三个串口的底层接收队列, 并重置全部统计累计值")
         self.clear_data_btn.setStyleSheet("""
-            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
+            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 6px 12px; border-radius: 4px; font-size: 16pt; }
             QPushButton:hover { background-color: #fde8e8; border-color: #f05252; }
         """)
 
@@ -1379,7 +1423,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.reset_stats_btn.setMinimumWidth(95)
         self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR递推均值/方向统计等), 保留已有串口数据流缓存")
         self.reset_stats_btn.setStyleSheet("""
-            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
+            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 6px 12px; border-radius: 4px; font-size: 16pt; }
             QPushButton:hover { background-color: #e0e7ff; border-color: #818cf8; }
         """)
 
@@ -1387,13 +1431,13 @@ class NMEADataAnalyzer(QMainWindow):
         self.clear_log_btn = QPushButton("清除日志")
         self.clear_log_btn.setMinimumWidth(95)
         self.clear_log_btn.setToolTip("清空界面日志窗口显示内容(不影响本地自动落盘日志文件)")
-        self.clear_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
+        self.clear_log_btn.setStyleSheet("padding: 6px 12px; font-size: 16pt;")
 
         # 保存全部原始日志
         self.save_all_log_btn = QPushButton("保存全部日志")
         self.save_all_log_btn.setMinimumWidth(115)
         self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
-        self.save_all_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
+        self.save_all_log_btn.setStyleSheet("padding: 6px 12px; font-size: 16pt;")
 
         row1.addWidget(self.clear_data_btn)
         row1.addWidget(self.reset_stats_btn)
@@ -1405,7 +1449,7 @@ class NMEADataAnalyzer(QMainWindow):
         # 自动落盘日志复选框 (默认勾选)
         self.auto_log_cb = QCheckBox("自动保存原始日志")
         self.auto_log_cb.setChecked(True)
-        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 16px;")
+        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 16pt;")
         self.auto_log_cb.setToolTip("勾选后将三个串口收到的原始数据按时间戳实时自动保存到 log/ 目录")
         row1.addWidget(self.auto_log_cb)
 
@@ -1419,41 +1463,41 @@ class NMEADataAnalyzer(QMainWindow):
         report_group_font.setBold(True)
         self.report_group.setFont(report_group_font)
         report_layout = QVBoxLayout(self.report_group)
-        report_layout.setContentsMargins(10, 12, 10, 10)
+        report_layout.setContentsMargins(8, 10, 8, 8)
         row2 = QGridLayout()
         row2.setSpacing(8)
 
         lbl_sec2 = QLabel("报告与自检:")
-        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
+        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 13pt;")
         row2.addWidget(lbl_sec2, 0, 0, 2, 1)
 
         # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report2_btn = QPushButton("📄 导出串口2报告 (MD)")
         self.export_report2_btn.setMinimumWidth(155)
-        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 6px 10px; border-radius: 4px; font-size: 13pt; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_report2_btn.setToolTip("将串口2受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
 
         self.export_pdf2_btn = QPushButton("📑 导出串口2报告 (PDF)")
         self.export_pdf2_btn.setMinimumWidth(155)
-        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 6px 10px; border-radius: 4px; font-size: 13pt; } QPushButton:hover { background-color: #3498db; }")
         self.export_pdf2_btn.setToolTip("将串口2受测机数据导出为带高清散点图的专业 PDF 测试报告")
 
         # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
         self.export_report3_btn = QPushButton("📄 导出串口3报告 (MD)")
         self.export_report3_btn.setMinimumWidth(155)
-        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 6px 10px; border-radius: 4px; font-size: 13pt; } QPushButton:hover { background-color: #2ecc71; }")
         self.export_report3_btn.setToolTip("将串口3受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
 
         self.export_pdf3_btn = QPushButton("📑 导出串口3报告 (PDF)")
         self.export_pdf3_btn.setMinimumWidth(155)
-        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 6px 10px; border-radius: 4px; font-size: 13pt; } QPushButton:hover { background-color: #3498db; }")
         self.export_pdf3_btn.setToolTip("将串口3受测机数据导出为带高清散点图的专业 PDF 测试报告")
 
         # 一键自检按钮（脱机闭环仿真测试）
         self.selftest_btn = QPushButton("🚀 一键自检 (无串口)")
         self.selftest_btn.setMinimumWidth(165)
         self.selftest_btn.setStyleSheet("""
-            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
+            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 6px 10px; border-radius: 4px; font-size: 13pt; }
             QPushButton:hover { background-color: #9b59b6; }
             QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
         """)
@@ -1481,7 +1525,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.statistics_method_text.setReadOnly(True)
         self.statistics_method_text.setMinimumHeight(260)
         self.statistics_method_text.setStyleSheet(
-            "QTextEdit { font-size: 14px; line-height: 1.45; "
+            "QTextEdit { font-size: 13pt; line-height: 1.45; "
             "background: #fbfcfd; border: 1px solid #d5d8dc; padding: 8px; }"
         )
         self.statistics_method_text.setHtml("""
@@ -1546,9 +1590,9 @@ class NMEADataAnalyzer(QMainWindow):
         # 顶部标题提示行
         title_row = QHBoxLayout()
         title_label12 = QLabel("ENU1 (无干扰) vs ENU2 (干扰测试)")
-        title_label12.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_label12.setStyleSheet("font-weight: bold; font-size: 13pt; color: #2c3e50;")
         title_label13 = QLabel("ENU1 (无干扰) vs ENU3 (干扰测试2)")
-        title_label13.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_label13.setStyleSheet("font-weight: bold; font-size: 13pt; color: #2c3e50;")
         title_row.addWidget(title_label12)
         title_row.addSpacing(40)
         title_row.addWidget(title_label13)
@@ -1661,7 +1705,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 串口1连接状态指示灯与文字
         self.port1_indicator = QLabel("串口1: ● 未连接")
-        self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
         self.status_bar.addWidget(self.port1_indicator)
 
         sep1 = QLabel("|")
@@ -1670,7 +1714,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 串口2连接状态指示灯与文字
         self.port2_indicator = QLabel("串口2: ● 未连接")
-        self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
         self.status_bar.addWidget(self.port2_indicator)
 
         sep3 = QLabel("|")
@@ -1679,7 +1723,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 串口3连接状态指示灯与文字
         self.port3_indicator = QLabel("串口3: ● 未连接")
-        self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
         self.status_bar.addWidget(self.port3_indicator)
 
         sep4 = QLabel("|")
@@ -1688,7 +1732,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 数据接收速率指示器（每2秒统计滑动窗口内接收的 行/s，便于即时发现串口假死或波特率不匹配）
         self.rate_label = QLabel("速率: 1:-- | 2:-- | 3:-- 行/s")
-        self.rate_label.setStyleSheet("font-size: 12px; color: #666; padding: 0 6px;")
+        self.rate_label.setStyleSheet("font-size: 11pt; color: #666; padding: 0 4px;")
         self.status_bar.addPermanentWidget(self.rate_label)
 
         # 全链路脱机自检进度条与取消控制按钮（自检模式激活时动态显示）
@@ -1706,8 +1750,32 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 累计处理的 NMEA/UBX 数据行数统计
         self.data_count_label = QLabel("已读取: 0 行")
-        self.data_count_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.data_count_label.setStyleSheet("font-size: 11pt; color: #666;")
         self.status_bar.addPermanentWidget(self.data_count_label)
+
+        # 图表文字不受 QWidget 样式表控制，需统一设置坐标轴刻度与标题字体。
+        self._apply_plot_typography()
+        self._apply_control_metrics()
+
+    def _apply_plot_typography(self):
+        tick_font = QFont(UI_FONT_FAMILY, 10)
+        label_font = QFont(UI_FONT_FAMILY, 11)
+        for plot in self.findChildren(pg.PlotWidget):
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                axis.setStyle(tickFont=tick_font)
+                axis.label.setFont(label_font)
+
+    def _apply_control_metrics(self):
+        """统一交互控件高度，保证笔记本高 DPI 下文字不会被上下裁切。"""
+        control_types = (QPushButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox)
+        for control_type in control_types:
+            for control in self.findChildren(control_type):
+                if (control_type is QLineEdit and
+                        isinstance(control.parentWidget(), (QSpinBox, QDoubleSpinBox))):
+                    continue
+                minimum = 34 if control_type is QPushButton else 32
+                control.setMinimumHeight(max(control.minimumHeight(), minimum))
     
     def setup_connections(self):
         # 串口1
@@ -1864,7 +1932,7 @@ class NMEADataAnalyzer(QMainWindow):
 
         if connected:
             indicator.setText(f"{prefix}: ● 已连接")
-            indicator.setStyleSheet("color: green; font-weight: bold; font-size: 12px; padding: 0 10px;")
+            indicator.setStyleSheet("color: green; font-weight: bold; font-size: 12pt; padding: 0 7px;")
             status_label.setText("已连接")
             status_label.setStyleSheet("color: green; font-weight: bold;")
             connect_btn.setEnabled(False)
@@ -1872,7 +1940,7 @@ class NMEADataAnalyzer(QMainWindow):
             self.log_info(f"{prefix} 连接成功")
         else:
             indicator.setText(f"{prefix}: ● 未连接")
-            indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12px; padding: 0 10px;")
+            indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
             status_label.setText("未连接")
             status_label.setStyleSheet("color: red; font-weight: bold;")
             connect_btn.setEnabled(True)
@@ -2455,7 +2523,7 @@ class NMEADataAnalyzer(QMainWindow):
             item_prn.setTextAlignment(Qt.AlignCenter)
             if is_warn:
                 item_prn.setData(Qt.ForegroundRole, QColor("#f38ba8"))
-                item_prn.setFont(QFont("Consolas", 11, QFont.Bold))
+                item_prn.setFont(QFont("Consolas", 12, QFont.Bold))
             self.snr_table.setItem(row, 1, item_prn)
 
             # Col 2: 信号
@@ -2494,11 +2562,11 @@ class NMEADataAnalyzer(QMainWindow):
                 if abs(d1) >= 15:
                     item_d1.setData(Qt.BackgroundRole, QColor("#5e3737"))
                     item_d1.setData(Qt.ForegroundRole, QColor("#f38ba8"))
-                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                    item_d1.setFont(QFont("Consolas", 12, QFont.Bold))
                 elif abs(d1) >= 10:
                     item_d1.setData(Qt.BackgroundRole, QColor("#5e4531"))
                     item_d1.setData(Qt.ForegroundRole, QColor("#fab387"))
-                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                    item_d1.setFont(QFont("Consolas", 12, QFont.Bold))
                 elif abs(d1) >= 3:
                     item_d1.setData(Qt.BackgroundRole, QColor("#5d5436"))
                     item_d1.setData(Qt.ForegroundRole, QColor("#eceff4"))
@@ -2533,11 +2601,11 @@ class NMEADataAnalyzer(QMainWindow):
                 if abs(d2) >= 15:
                     item_d2.setData(Qt.BackgroundRole, QColor("#5e3737"))
                     item_d2.setData(Qt.ForegroundRole, QColor("#f38ba8"))
-                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                    item_d2.setFont(QFont("Consolas", 12, QFont.Bold))
                 elif abs(d2) >= 10:
                     item_d2.setData(Qt.BackgroundRole, QColor("#5e4531"))
                     item_d2.setData(Qt.ForegroundRole, QColor("#fab387"))
-                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                    item_d2.setFont(QFont("Consolas", 12, QFont.Bold))
                 elif abs(d2) >= 3:
                     item_d2.setData(Qt.BackgroundRole, QColor("#5d5436"))
                     item_d2.setData(Qt.ForegroundRole, QColor("#eceff4"))
@@ -3000,25 +3068,25 @@ class NMEADataAnalyzer(QMainWindow):
         enu_ref_layout.addLayout(manual_row)
         enu_ref_labels = QHBoxLayout()
         self.enu1_ref_label = QLabel("ENU1 基准: 未设置")
-        self.enu1_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu1_ref_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu1_ref_label)
         self.enu1_points_label = QLabel("")
-        self.enu1_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu1_points_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu1_points_label)
         enu_ref_labels.addStretch()
         self.enu2_ref_label = QLabel("ENU2 基准: 未设置")
-        self.enu2_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu2_ref_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu2_ref_label)
         self.enu2_points_label = QLabel("")
-        self.enu2_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu2_points_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu2_points_label)
         enu_ref_labels.addStretch()
         # [新增] ENU3基准点状态标签
         self.enu3_ref_label = QLabel("ENU3 基准: 未设置")
-        self.enu3_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu3_ref_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu3_ref_label)
         self.enu3_points_label = QLabel("")
-        self.enu3_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        self.enu3_points_label.setStyleSheet("color: #666; font-size: 12pt;")
         enu_ref_labels.addWidget(self.enu3_points_label)
         enu_ref_labels.addStretch()
         enu_ref_layout.addLayout(enu_ref_labels)
@@ -3027,6 +3095,7 @@ class NMEADataAnalyzer(QMainWindow):
     def _create_direction_tab(self):
         main_tab = QWidget()
         layout = QVBoxLayout(main_tab)
+        layout.setContentsMargins(6, 6, 6, 6)
 
         # 方向测试子标签：串口2和串口3分开
         dir_sub_tabs = QTabWidget()
@@ -3048,6 +3117,8 @@ class NMEADataAnalyzer(QMainWindow):
         direction_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         content_widget = QWidget()
         tab_layout = QVBoxLayout(content_widget)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        tab_layout.setSpacing(8)
 
         is_com3 = (port_id == 3)
 
@@ -3081,27 +3152,27 @@ class NMEADataAnalyzer(QMainWindow):
             box_font.setPointSize(16)
             box_font.setBold(True)
             box.setFont(box_font)
-            box.setStyleSheet("QGroupBox { font-size: 16px; font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 16px; } QGroupBox::title { background-color: #ecf0f1; padding: 3px 10px; border-radius: 3px; font-size: 16px; }")
+            box.setStyleSheet("QGroupBox { font-size: 16pt; font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 14px; } QGroupBox::title { background-color: #ecf0f1; padding: 3px 9px; border-radius: 3px; font-size: 16pt; }")
             box_layout = QVBoxLayout(box)
 
             duration_label = QLabel("测试时长: 00:00:00")
-            duration_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2980b9;")
+            duration_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #2980b9;")
             box_layout.addWidget(duration_label)
 
             epoch_label = QLabel("总历元: 0 | 成功: 0 | 成功率: 0.0%")
-            epoch_label.setStyleSheet("font-size: 14px; color: #555;")
+            epoch_label.setStyleSheet("font-size: 14pt; color: #555;")
             box_layout.addWidget(epoch_label)
 
             h_label = QLabel("水平误差 均值: -- m | 最大: -- m")
-            h_label.setStyleSheet("font-size: 14px; color: #e74c3c;")
+            h_label.setStyleSheet("font-size: 14pt; color: #e74c3c;")
             box_layout.addWidget(h_label)
 
             v_label = QLabel("垂直误差 均值: -- m | 最大: -- m")
-            v_label.setStyleSheet("font-size: 14px; color: #27ae60;")
+            v_label.setStyleSheet("font-size: 14pt; color: #27ae60;")
             box_layout.addWidget(v_label)
 
             state_label = QLabel("状态: 未开始")
-            state_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #7f8c8d;")
+            state_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #7f8c8d;")
             box_layout.addWidget(state_label)
 
             controls_layout = QGridLayout()
@@ -3121,7 +3192,7 @@ class NMEADataAnalyzer(QMainWindow):
                 button.setMinimumHeight(32)
                 button.setStyleSheet(
                     f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
-                    "padding: 6px 10px; border-radius: 4px; font-size: 14px; } "
+                    "padding: 5px 9px; border-radius: 4px; font-size: 14pt; } "
                     "QPushButton:disabled { background-color: #bdc3c7; color: #ecf0f1; }"
                 )
             pause_btn.setEnabled(False)
@@ -3162,7 +3233,7 @@ class NMEADataAnalyzer(QMainWindow):
         auto_stop_row = QHBoxLayout()
         if is_com3:
             stop_cb = QCheckBox("启用自动停止")
-            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setStyleSheet("font-size: 12pt; font-weight: bold;")
             stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
             stop_cb.stateChanged.connect(lambda state: setattr(self, '_dir3_auto_stop_enabled', state == Qt.Checked))
             auto_stop_row.addWidget(stop_cb)
@@ -3181,7 +3252,7 @@ class NMEADataAnalyzer(QMainWindow):
             auto_stop_row.addWidget(epoch_spin)
         else:
             stop_cb = QCheckBox("启用自动停止")
-            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setStyleSheet("font-size: 12pt; font-weight: bold;")
             stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
             stop_cb.stateChanged.connect(self._on_auto_stop_toggled)
             auto_stop_row.addWidget(stop_cb)
@@ -3208,7 +3279,7 @@ class NMEADataAnalyzer(QMainWindow):
         h_chart.setLabel('left', '水平误差', units='m')
         h_chart.setLabel('bottom', '方向')
         h_chart.showGrid(y=True)
-        h_chart.setMaximumHeight(220)
+        h_chart.setMaximumHeight(190)
         charts_layout.addWidget(h_chart)
 
         v_chart = pg.PlotWidget()
@@ -3216,7 +3287,7 @@ class NMEADataAnalyzer(QMainWindow):
         v_chart.setLabel('left', '垂直误差', units='m')
         v_chart.setLabel('bottom', '方向')
         v_chart.showGrid(y=True)
-        v_chart.setMaximumHeight(220)
+        v_chart.setMaximumHeight(190)
         charts_layout.addWidget(v_chart)
         tab_layout.addLayout(charts_layout)
 
@@ -3334,7 +3405,7 @@ class NMEADataAnalyzer(QMainWindow):
         text, color = states[ds.state]
         controls['state'].setText(text)
         controls['state'].setStyleSheet(
-            f"font-size: 14px; font-weight: bold; color: {color};")
+            f"font-size: 14pt; font-weight: bold; color: {color};")
         controls['start_btn'].setEnabled(ds.state == 'idle')
         controls['pause_btn'].setEnabled(ds.state == 'running')
         controls['resume_btn'].setEnabled(ds.state == 'paused')
