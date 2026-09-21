@@ -53,7 +53,7 @@ class UIDirectionControlTests(unittest.TestCase):
         log_font = self.window.log_window.font()
         log_size = log_font.pointSizeF() if log_font.pointSizeF() > 0 else log_font.pixelSize()
         self.assertGreaterEqual(log_size, 14)
-        self.assertGreaterEqual(self.window.log_window.minimumHeight(), 400)
+        self.assertGreaterEqual(self.window.log_window.minimumHeight(), 240)
 
     def test_test_information_reports_and_selftest_share_a_separate_tab(self):
         titles = [
@@ -200,6 +200,35 @@ class UIDirectionControlTests(unittest.TestCase):
                     scroll.horizontalScrollBar().maximum(), 0,
                     f"{tab_name} should not require horizontal scrolling at 1366px",
                 )
+        finally:
+            self.window.showMaximized()
+            self.app.processEvents()
+
+    def test_primary_pages_fit_a_125_percent_scaled_laptop_work_area(self):
+        # 1366×768 at Windows 125% scaling, minus a typical taskbar, leaves
+        # approximately 1093×580 logical pixels for the maximized application.
+        self.window.showNormal()
+        self.window.resize(1093, 580)
+        self.app.processEvents()
+        try:
+            self.assertLessEqual(self.window.width(), 1093)
+            self.assertLessEqual(self.window.height(), 580)
+
+            titles = [
+                self.window.tab_widget.tabText(i)
+                for i in range(self.window.tab_widget.count())
+            ]
+            for tab_name in titles:
+                self.window.tab_widget.setCurrentIndex(titles.index(tab_name))
+                self.app.processEvents()
+                self.assertLessEqual(self.window.width(), 1093, tab_name)
+                self.assertLessEqual(self.window.height(), 580, tab_name)
+
+            for scroll in (self.window.control_scroll, self.window.test_report_scroll):
+                self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+
+            self.assertGreaterEqual(self.window.data_preview.height(), 240)
+            self.assertGreaterEqual(self.window.log_window.height(), 240)
         finally:
             self.window.showMaximized()
             self.app.processEvents()

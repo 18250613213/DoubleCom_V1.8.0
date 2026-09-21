@@ -733,8 +733,9 @@ class NMEADataAnalyzer(QMainWindow):
         # -------------------------------------------------------------------------
         # 1. 顶部卫星态势摘要看板 (4 项核心 KPI Cards)
         # -------------------------------------------------------------------------
-        kpi_row = QHBoxLayout()
-        kpi_row.setSpacing(6)
+        kpi_grid = QGridLayout()
+        kpi_grid.setHorizontalSpacing(6)
+        kpi_grid.setVerticalSpacing(6)
 
         def _create_kpi_card(title_text, val_text="--", val_color="#89b4fa"):
             frame = QFrame()
@@ -761,11 +762,13 @@ class NMEADataAnalyzer(QMainWindow):
         kpi_card3, self.kpi_warn_label = _create_kpi_card("受干扰恶化星数 (|Δ| ≥ 10dB)", "-- 颗 (占比 --%)", "#fab387")
         kpi_card4, self.kpi_maxdrop_label = _create_kpi_card("最大受扰压制深度", "--", "#f38ba8")
 
-        kpi_row.addWidget(kpi_card1)
-        kpi_row.addWidget(kpi_card2)
-        kpi_row.addWidget(kpi_card3)
-        kpi_row.addWidget(kpi_card4)
-        table_layout.addLayout(kpi_row)
+        kpi_grid.addWidget(kpi_card1, 0, 0)
+        kpi_grid.addWidget(kpi_card2, 0, 1)
+        kpi_grid.addWidget(kpi_card3, 1, 0)
+        kpi_grid.addWidget(kpi_card4, 1, 1)
+        kpi_grid.setColumnStretch(0, 1)
+        kpi_grid.setColumnStretch(1, 1)
+        table_layout.addLayout(kpi_grid)
 
         # -------------------------------------------------------------------------
         # 2. 交互式多维过滤工具栏 (Toolbar)
@@ -989,7 +992,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.data_preview.setReadOnly(True)
         self.data_preview.setStyleSheet("font-family: Consolas; font-size: 15pt; background-color: #fafafa;")
         self.data_preview.setPlaceholderText("数据预览区域...")
-        self.data_preview.setMinimumHeight(400)
+        self.data_preview.setMinimumHeight(240)
         preview_layout.addWidget(self.data_preview)
 
         stream_layout.addWidget(preview_box)
@@ -1296,7 +1299,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
         self.log_window.setStyleSheet("font-family: Consolas; font-size: 14pt;")
-        self.log_window.setMinimumHeight(400)
+        self.log_window.setMinimumHeight(240)
         log_layout.addWidget(self.log_window)
         log_tab_layout.addWidget(self.log_box)
 
@@ -1704,8 +1707,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.setStatusBar(self.status_bar)
 
         # 串口1连接状态指示灯与文字
-        self.port1_indicator = QLabel("串口1: ● 未连接")
-        self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
+        self.port1_indicator = QLabel("P1 ● 未连接")
+        self.port1_indicator.setToolTip("串口1连接状态")
+        self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 11pt; padding: 0 4px;")
         self.status_bar.addWidget(self.port1_indicator)
 
         sep1 = QLabel("|")
@@ -1713,8 +1717,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.status_bar.addWidget(sep1)
 
         # 串口2连接状态指示灯与文字
-        self.port2_indicator = QLabel("串口2: ● 未连接")
-        self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
+        self.port2_indicator = QLabel("P2 ● 未连接")
+        self.port2_indicator.setToolTip("串口2连接状态")
+        self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 11pt; padding: 0 4px;")
         self.status_bar.addWidget(self.port2_indicator)
 
         sep3 = QLabel("|")
@@ -1722,8 +1727,9 @@ class NMEADataAnalyzer(QMainWindow):
         self.status_bar.addWidget(sep3)
 
         # 串口3连接状态指示灯与文字
-        self.port3_indicator = QLabel("串口3: ● 未连接")
-        self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
+        self.port3_indicator = QLabel("P3 ● 未连接")
+        self.port3_indicator.setToolTip("串口3连接状态")
+        self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 11pt; padding: 0 4px;")
         self.status_bar.addWidget(self.port3_indicator)
 
         sep4 = QLabel("|")
@@ -1731,7 +1737,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.status_bar.addWidget(sep4)
 
         # 数据接收速率指示器（每2秒统计滑动窗口内接收的 行/s，便于即时发现串口假死或波特率不匹配）
-        self.rate_label = QLabel("速率: 1:-- | 2:-- | 3:-- 行/s")
+        self.rate_label = QLabel("速率 1:--  2:--  3:--")
+        self.rate_label.setToolTip("三路串口实时接收速率（行/秒）")
         self.rate_label.setStyleSheet("font-size: 11pt; color: #666; padding: 0 4px;")
         self.status_bar.addPermanentWidget(self.rate_label)
 
@@ -1749,7 +1756,8 @@ class NMEADataAnalyzer(QMainWindow):
         self.status_bar.addPermanentWidget(self.selftest_cancel_btn)
 
         # 累计处理的 NMEA/UBX 数据行数统计
-        self.data_count_label = QLabel("已读取: 0 行")
+        self.data_count_label = QLabel("读取 0")
+        self.data_count_label.setToolTip("累计读取数据行数")
         self.data_count_label.setStyleSheet("font-size: 11pt; color: #666;")
         self.status_bar.addPermanentWidget(self.data_count_label)
 
@@ -1930,17 +1938,18 @@ class NMEADataAnalyzer(QMainWindow):
             disconnect_btn = self.port3_disconnect_btn
             prefix = "串口3"
 
+        short_prefix = f"P{port_id}"
         if connected:
-            indicator.setText(f"{prefix}: ● 已连接")
-            indicator.setStyleSheet("color: green; font-weight: bold; font-size: 12pt; padding: 0 7px;")
+            indicator.setText(f"{short_prefix} ● 已连接")
+            indicator.setStyleSheet("color: green; font-weight: bold; font-size: 11pt; padding: 0 4px;")
             status_label.setText("已连接")
             status_label.setStyleSheet("color: green; font-weight: bold;")
             connect_btn.setEnabled(False)
             disconnect_btn.setEnabled(True)
             self.log_info(f"{prefix} 连接成功")
         else:
-            indicator.setText(f"{prefix}: ● 未连接")
-            indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12pt; padding: 0 7px;")
+            indicator.setText(f"{short_prefix} ● 未连接")
+            indicator.setStyleSheet("color: red; font-weight: bold; font-size: 11pt; padding: 0 4px;")
             status_label.setText("未连接")
             status_label.setStyleSheet("color: red; font-weight: bold;")
             connect_btn.setEnabled(True)
@@ -2045,7 +2054,7 @@ class NMEADataAnalyzer(QMainWindow):
             self._data_count_update += 1
             if self._data_count_update >= self._DATA_COUNT_INTERVAL:
                 total = len(self.serial2_save_buffer) + len(self.serial_save_buffer) + len(self.serial3_save_buffer)
-                self.data_count_label.setText(f"已读取: {total} 行")
+                self.data_count_label.setText(f"读取 {total}")
                 self._data_count_update = 0
 
             decoded = self.nmea_parser2.decode_line(data) if self.nmea_parser2 else None
@@ -2122,7 +2131,7 @@ class NMEADataAnalyzer(QMainWindow):
             self._data_count_update += 1
             if self._data_count_update >= self._DATA_COUNT_INTERVAL:
                 total = len(self.serial3_save_buffer) + len(self.serial2_save_buffer) + len(self.serial_save_buffer)
-                self.data_count_label.setText(f"已读取: {total} 行")
+                self.data_count_label.setText(f"读取 {total}")
                 self._data_count_update = 0
 
             decoded = self.nmea_parser3.decode_line(data) if self.nmea_parser3 else None
@@ -2199,7 +2208,7 @@ class NMEADataAnalyzer(QMainWindow):
             self._write_auto_log(1, data)
             self._data_count_update += 1
             if self._data_count_update >= self._DATA_COUNT_INTERVAL:
-                self.data_count_label.setText(f"已读取: {len(self.serial_save_buffer) + len(self.serial2_save_buffer) + len(self.serial3_save_buffer)} 行")
+                self.data_count_label.setText(f"读取 {len(self.serial_save_buffer) + len(self.serial2_save_buffer) + len(self.serial3_save_buffer)}")
                 self._data_count_update = 0
 
         if self.current_parser:
@@ -4020,7 +4029,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.serial_save_buffer = deque(maxlen=40000)
         self.serial2_save_buffer = deque(maxlen=40000)
         self.serial3_save_buffer = deque(maxlen=40000)  # [新增]
-        self.data_count_label.setText("已读取: 0 行")
+        self.data_count_label.setText("读取 0")
         self.reset_all_stats()
         if self.auto_log_enabled:
             self._open_auto_log_files()
@@ -4653,7 +4662,7 @@ class NMEADataAnalyzer(QMainWindow):
             self._rate_last[pid] = cnt
             parts.append(f"{pid}:{rate:.1f}")
         self._rate_t0 = now
-        self.rate_label.setText(f"速率: {' | '.join(parts)} 行/s")
+        self.rate_label.setText(f"速率 {'  '.join(parts)}")
 
     def _on_selftest_finished(self, ok, results):
         self.selftest_btn.setEnabled(True)
