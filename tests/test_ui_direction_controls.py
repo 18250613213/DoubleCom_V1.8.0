@@ -10,7 +10,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from PyQt5.QtCore import QPoint
 from PyQt5.QtWidgets import QApplication, QTableWidget
 
-from main import NMEADataAnalyzer, SlidingWindowStd
+from main import APP_VERSION, NMEADataAnalyzer, SlidingWindowStd
 from src.simulation.selftest import SelfTestRunner
 
 
@@ -25,6 +25,9 @@ class UIDirectionControlTests(unittest.TestCase):
         cls.window.close()
         cls.window.deleteLater()
         cls.app.processEvents()
+
+    def test_release_version_is_v1_9_4_1(self):
+        self.assertEqual(APP_VERSION, "1.9.4.1")
 
     def test_serial_stream_has_its_own_main_tab(self):
         titles = [
@@ -150,6 +153,203 @@ class UIDirectionControlTests(unittest.TestCase):
         self.assertFalse(self.window._is_enu_outlier(half_sigma, 7.9))
         self.assertFalse(self.window._is_enu_outlier(half_sigma, 8.0))
         self.assertTrue(self.window._is_enu_outlier(half_sigma, 8.1))
+
+    def test_plot_refresh_uses_a_separate_one_second_timer(self):
+        self.assertEqual(self.window.update_timer.interval(), 250)
+        self.assertEqual(self.window.plot_timer.interval(), 1000)
+        self.assertIsNot(self.window.plot_timer, self.window.update_timer)
+
+    def test_connecting_starts_both_runtime_and_plot_timers(self):
+        manager = self.window.serial_port1
+        original_connect = manager.connect
+        self.window.update_timer.stop()
+        self.window.plot_timer.stop()
+        self.window.port1_combo.addItem("__TEST_PORT__")
+        self.window.port1_combo.setCurrentText("__TEST_PORT__")
+        manager.connect = lambda _port, _baud: True
+        try:
+            self.window.connect_serial(1)
+            self.assertTrue(self.window.update_timer.isActive())
+            self.assertTrue(self.window.plot_timer.isActive())
+        finally:
+            self.window.update_timer.stop()
+            self.window.plot_timer.stop()
+            manager.connect = original_connect
+            index = self.window.port1_combo.findText("__TEST_PORT__")
+            if index >= 0:
+                self.window.port1_combo.removeItem(index)
+
+    def test_live_enu_chart_refreshes_only_when_visible_and_dirty(self):
+        titles = [
+            self.window.tab_widget.tabText(i)
+            for i in range(self.window.tab_widget.count())
+        ]
+        control_tab = self.window.tab_widget.widget(titles.index("功能与控制面板"))
+        self.window.tab_widget.setCurrentWidget(control_tab)
+        self.app.processEvents()
+
+        calls = []
+        original_refresh = self.window._refresh_enu_charts
+        self.window._refresh_enu_charts = lambda: calls.append("refresh")
+        try:
+            self.window._enu_plot_dirty = True
+            self.window._refresh_visible_plots()
+            self.assertEqual(calls, [])
+
+            self.window.tab_widget.setCurrentWidget(self.window.enu_comp_tab)
+            self.app.processEvents()
+            self.assertEqual(calls, ["refresh"])
+
+            self.window._refresh_visible_plots()
+            self.assertEqual(calls, ["refresh"])
+        finally:
+            self.window._refresh_enu_charts = original_refresh
+            self.window.tab_widget.setCurrentWidget(control_tab)
+
+    def test_quarter_second_runtime_update_does_not_redraw_enu_curves(self):
+        calls = []
+        original_refresh = self.window._refresh_enu_charts
+        self.window._refresh_enu_charts = lambda: calls.append("refresh")
+        try:
+            self.window.update_plots()
+            self.assertEqual(calls, [])
+        finally:
+            self.window._refresh_enu_charts = original_refresh
+
+    def test_quarter_second_runtime_update_does_not_redraw_direction_charts(self):
+        calls = []
+        original_summary2 = self.window._update_direction_charts
+        original_summary3 = self.window._update_direction_charts3
+        original_enu = self.window._update_direction_enu_charts
+        self.window._update_direction_charts = lambda: calls.append("summary2")
+        self.window._update_direction_charts3 = lambda: calls.append("summary3")
+        self.window._update_direction_enu_charts = lambda: calls.append("enu")
+        try:
+            self.window.update_plots()
+            self.assertEqual(calls, [])
+        finally:
+            self.window._update_direction_charts = original_summary2
+            self.window._update_direction_charts3 = original_summary3
+            self.window._update_direction_enu_charts = original_enu
+
+    def test_direction_charts_refresh_only_on_their_visible_page(self):
+        calls = []
+        original_summary2 = self.window._update_direction_charts
+        original_summary3 = self.window._update_direction_charts3
+        original_enu = self.window._update_direction_enu_charts
+        self.window._update_direction_charts = lambda: calls.append("summary2")
+        self.window._update_direction_charts3 = lambda: calls.append("summary3")
+        self.window._update_direction_enu_charts = lambda: calls.append("enu")
+        try:
+            self.window._direction_summary_dirty = True
+            self.window.tab_widget.setCurrentWidget(self.window.direction_tab)
+            self.app.processEvents()
+            self.assertEqual(calls, ["summary2", "summary3"])
+
+            self.window._refresh_visible_plots()
+            self.assertEqual(calls, ["summary2", "summary3"])
+
+            self.window._direction_enu_dirty = True
+            self.window.tab_widget.setCurrentWidget(self.window.dir_enu_tab)
+            self.app.processEvents()
+            self.assertEqual(calls, ["summary2", "summary3", "enu"])
+        finally:
+            self.window._update_direction_charts = original_summary2
+            self.window._update_direction_charts3 = original_summary3
+            self.window._update_direction_enu_charts = original_enu
+
+    def test_direction_data_marks_visible_charts_dirty(self):
+        self.window._reset_direction_stats()
+        self.window._start_direction_test(2, 0)
+        try:
+            self.window._direction_summary_dirty = False
+            self.window._do_feed_direction_stats(
+                1.0, 2.0, 3.0, 4,
+                self.window.direction_stats,
+                self.window.dir_stat_boxes,
+                False, 0, 0,
+            )
+            self.assertTrue(self.window._direction_summary_dirty)
+
+            self.window.enu1_times[:] = [0.0]
+            self.window.enu1_east_data[:] = [0.1]
+            self.window.enu1_north_data[:] = [0.2]
+            self.window.enu1_up_data[:] = [0.3]
+            self.window.enu2_times[:] = [0.0]
+            self.window.enu2_east_data[:] = [1.1]
+            self.window.enu2_north_data[:] = [1.2]
+            self.window.enu2_up_data[:] = [1.3]
+            self.window._direction_enu_dirty = False
+            self.window._save_enu_for_direction(0)
+            self.assertTrue(self.window._direction_enu_dirty)
+        finally:
+            self.window._reset_direction_stats()
+
+    def test_reset_marks_direction_charts_dirty(self):
+        self.window._direction_summary_dirty = False
+        self.window._direction_enu_dirty = False
+        self.window._reset_direction_stats()
+        self.assertTrue(self.window._direction_summary_dirty)
+        self.assertTrue(self.window._direction_enu_dirty)
+
+    def test_accepted_enu_sample_marks_live_plot_dirty(self):
+        self.window._enu_plot_dirty = False
+        try:
+            self.window._feed_fixed_enu1()
+            self.assertTrue(self.window._enu_plot_dirty)
+        finally:
+            self.window._reset_enu_chart_data(1)
+
+    def test_pausing_live_plot_keeps_enu_collection_running(self):
+        self.assertTrue(
+            self.window.enu_comp_tab.isAncestorOf(self.window.plot_pause_btn)
+        )
+        self.window.tab_widget.setCurrentWidget(self.window.enu_comp_tab)
+        self.app.processEvents()
+
+        calls = []
+        original_refresh = self.window._refresh_enu_charts
+        self.window._refresh_enu_charts = lambda: calls.append("refresh")
+        before = len(self.window.enu1_times)
+        try:
+            self.window.plot_pause_btn.click()
+            self.assertTrue(self.window._plot_paused)
+            self.assertEqual(self.window.plot_pause_btn.text(), "继续实时绘图")
+
+            self.window._feed_fixed_enu1()
+            self.assertEqual(len(self.window.enu1_times), before + 1)
+            self.window._refresh_visible_plots()
+            self.assertEqual(calls, [])
+
+            self.window.plot_pause_btn.click()
+            self.assertFalse(self.window._plot_paused)
+            self.assertEqual(self.window.plot_pause_btn.text(), "暂停实时绘图")
+            self.assertEqual(calls, ["refresh"])
+        finally:
+            self.window._refresh_enu_charts = original_refresh
+            if getattr(self.window, "_plot_paused", False):
+                self.window.plot_pause_btn.click()
+            self.window._reset_enu_chart_data(1)
+
+    def test_live_enu_curves_clip_to_view_without_downsampling(self):
+        curves = (
+            self.window.enu1_east_curve,
+            self.window.enu2_east_curve,
+            self.window.enu1_north_curve,
+            self.window.enu2_north_curve,
+            self.window.enu1_up_curve,
+            self.window.enu2_up_curve,
+            self.window.enu1_13_east_curve,
+            self.window.enu3_east_curve,
+            self.window.enu1_13_north_curve,
+            self.window.enu3_north_curve,
+            self.window.enu1_13_up_curve,
+            self.window.enu3_up_curve,
+        )
+        for curve in curves:
+            self.assertTrue(curve.opts.get("clipToView"))
+            self.assertFalse(curve.opts.get("autoDownsample"))
+            self.assertEqual(curve.opts.get("downsample"), 1)
 
     def test_statistics_methods_are_visible_on_report_tab(self):
         self.assertTrue(hasattr(self.window, "statistics_method_box"))

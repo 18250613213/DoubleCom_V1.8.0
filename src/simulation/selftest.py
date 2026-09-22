@@ -199,6 +199,7 @@ class SelfTestRunner(QObject):
 
         # 启动主界面图表定时更新与虚拟串口回放
         w.update_timer.start()
+        w.plot_timer.start()
         for s in self._sims:
             s.start_sim()
         self._monitor.start()
@@ -287,6 +288,7 @@ class SelfTestRunner(QObject):
         if not any(m.serial_port is not None for m in
                    (w.serial_port1, w.serial_port2, w.serial_port3)):
             w.update_timer.stop()
+            w.plot_timer.stop()
 
     def _finalize(self):
         """自检最终结算流程: 执行各项校验、写出自检报告文件、恢复环境并广播完成信号。"""

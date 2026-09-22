@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.4.1"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -487,6 +487,10 @@ class NMEADataAnalyzer(QMainWindow):
 
         # 绘图曲线最大缓存点数 (4Hz × 1800s = 7200点，保留约 30 分钟连续轨迹)
         self.ENU_MAX_POINTS = 7200
+        self._enu_plot_dirty = True
+        self._direction_summary_dirty = True
+        self._direction_enu_dirty = True
+        self._plot_paused = False
 
         # 各轴滑动窗口标准差计算器 (基于 SlidingWindowStd 实现 O(1) 递推)
         self._std_enu1_east = SlidingWindowStd(self.ENU_STD_WINDOW)
@@ -637,6 +641,11 @@ class NMEADataAnalyzer(QMainWindow):
         self.update_timer.timeout.connect(self.update_plots)
         self._update_frame_count = 0
         self._last_snr_data = None
+
+        # 曲线渲染使用独立的低频定时器，数据解析与统计仍由 update_timer 驱动。
+        self.plot_timer = QTimer(self)
+        self.plot_timer.setInterval(1000)
+        self.plot_timer.timeout.connect(self._refresh_visible_plots)
 
         # 数据速率统计（状态栏实时显示 行/s, 便于发现串口断流/卡死）
         self._rate_counters = {}
@@ -1540,8 +1549,8 @@ class NMEADataAnalyzer(QMainWindow):
         # =========================================================================
         # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
         # =========================================================================
-        enu_comp_tab = QWidget()
-        enu_comp_layout = QVBoxLayout(enu_comp_tab)
+        self.enu_comp_tab = QWidget()
+        enu_comp_layout = QVBoxLayout(self.enu_comp_tab)
 
         # 顶部标题提示行
         title_row = QHBoxLayout()
@@ -1553,6 +1562,12 @@ class NMEADataAnalyzer(QMainWindow):
         title_row.addSpacing(40)
         title_row.addWidget(title_label13)
         title_row.addStretch()
+        self.plot_status_label = QLabel("状态: 实时绘图中")
+        self.plot_status_label.setStyleSheet("font-weight: bold; color: #27ae60;")
+        title_row.addWidget(self.plot_status_label)
+        self.plot_pause_btn = QPushButton("暂停实时绘图")
+        self.plot_pause_btn.setToolTip("仅暂停界面曲线刷新；串口接收、ENU计算、统计和报告数据继续累计。")
+        title_row.addWidget(self.plot_pause_btn)
         enu_comp_layout.addLayout(title_row)
 
         # 双列对称布局 (左侧 COM1 vs COM2, 右侧 COM1 vs COM3)
@@ -1630,22 +1645,34 @@ class NMEADataAnalyzer(QMainWindow):
         self.enu3_up_curve = self.enu_comp13_up_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
         right_col.addWidget(self.enu_comp13_up_plot)
 
+        # 仅裁剪视口外的曲线片段；不启用降采样，保持 V1.9.4 的完整显示点数。
+        self._live_enu_curves = (
+            self.enu1_east_curve, self.enu2_east_curve,
+            self.enu1_north_curve, self.enu2_north_curve,
+            self.enu1_up_curve, self.enu2_up_curve,
+            self.enu1_13_east_curve, self.enu3_east_curve,
+            self.enu1_13_north_curve, self.enu3_north_curve,
+            self.enu1_13_up_curve, self.enu3_up_curve,
+        )
+        for curve in self._live_enu_curves:
+            curve.setClipToView(True)
+
         enu_comp_cols.addLayout(right_col)
 
         enu_comp_layout.addLayout(enu_comp_cols)
-        self.tab_widget.addTab(enu_comp_tab, "ENU 误差对比")
+        self.tab_widget.addTab(self.enu_comp_tab, "ENU 误差对比")
         
         # =========================================================================
         # 标签页 4：方向测试 (转台测试各方向统计汇总与控制面板)
         # =========================================================================
-        direction_tab = self._create_direction_tab()
-        self.tab_widget.addTab(direction_tab, "方向测试")
+        self.direction_tab = self._create_direction_tab()
+        self.tab_widget.addTab(self.direction_tab, "方向测试")
 
         # =========================================================================
         # 标签页 5：各方向 ENU 误差对比 (四向 ENU 曲线多子图)
         # =========================================================================
-        dir_enu_tab = self._create_dir_enu_tab()
-        self.tab_widget.addTab(dir_enu_tab, "方向ENU对比")
+        self.dir_enu_tab = self._create_dir_enu_tab()
+        self.tab_widget.addTab(self.dir_enu_tab, "方向ENU对比")
         
         # 将QTabWidget添加到主窗口垂直布局中
         main_layout.addWidget(self.tab_widget)
@@ -1710,6 +1737,10 @@ class NMEADataAnalyzer(QMainWindow):
         self.status_bar.addPermanentWidget(self.data_count_label)
     
     def setup_connections(self):
+        self.tab_widget.currentChanged.connect(
+            lambda _index: self._refresh_visible_plots(force=True))
+        self.plot_pause_btn.clicked.connect(self._toggle_plot_paused)
+
         # 串口1
         self.port1_refresh_btn.clicked.connect(lambda: self.refresh_serial_ports(1))
         self.port1_connect_btn.clicked.connect(lambda: self.connect_serial(1))
@@ -1829,6 +1860,7 @@ class NMEADataAnalyzer(QMainWindow):
             self.current_parser = self.nmea_parser
 
         self.update_timer.start()
+        self.plot_timer.start()
 
     def disconnect_serial(self, port_id=1):
         if port_id == 1:
@@ -1841,6 +1873,7 @@ class NMEADataAnalyzer(QMainWindow):
         # [新增] 三个串口均断开时停止定时器
         if not self.serial_port1.serial_port and not self.serial_port2.serial_port and not self.serial_port3.serial_port:
             self.update_timer.stop()
+            self.plot_timer.stop()
 
     def update_connection_status(self, connected, port_id):
         if port_id == 1:
@@ -2252,6 +2285,44 @@ class NMEADataAnalyzer(QMainWindow):
         self._update_enu_display()
         self._update_direction_stats_display()
 
+    def _refresh_visible_plots(self, force=False):
+        """仅刷新当前可见且内容已变化的图表页面。"""
+        if self._plot_paused:
+            return
+        current = self.tab_widget.currentWidget()
+        if current is self.enu_comp_tab:
+            if not force and not self._enu_plot_dirty:
+                return
+            self._refresh_enu_charts()
+            self._enu_plot_dirty = False
+            return
+        if current is self.direction_tab:
+            if not force and not self._direction_summary_dirty:
+                return
+            self._update_direction_charts()
+            self._update_direction_charts3()
+            self._direction_summary_dirty = False
+            return
+        if current is self.dir_enu_tab:
+            if not force and not self._direction_enu_dirty:
+                return
+            # 保留 V1.9.4 的完整 4 方向、双端口、全点数绘图逻辑。
+            self._update_direction_enu_charts()
+            self._direction_enu_dirty = False
+
+    def _toggle_plot_paused(self):
+        """暂停或恢复曲线渲染，不影响数据采集与统计。"""
+        self._plot_paused = not self._plot_paused
+        if self._plot_paused:
+            self.plot_pause_btn.setText("继续实时绘图")
+            self.plot_status_label.setText("状态: 绘图已暂停，数据继续累计")
+            self.plot_status_label.setStyleSheet("font-weight: bold; color: #f39c12;")
+            return
+        self.plot_pause_btn.setText("暂停实时绘图")
+        self.plot_status_label.setText("状态: 实时绘图中")
+        self.plot_status_label.setStyleSheet("font-weight: bold; color: #27ae60;")
+        self._refresh_visible_plots(force=True)
+
     # SNR表各星座徽章配色（Nord深色主题）
     _SYS_BADGES = {
         'GP': ('GPS', '#81a1c1'), 'GL': ('GLO', '#b48ead'), 'GA': ('GAL', '#a3be8c'),
@@ -2628,6 +2699,7 @@ class NMEADataAnalyzer(QMainWindow):
             del self.enu1_3_east_data[:excess]
             del self.enu1_3_north_data[:excess]
             del self.enu1_3_up_data[:excess]
+        self._enu_plot_dirty = True
 
     def _feed_real_enu1(self, lat, lon, alt):
         """按串口1自己的独立参考点计算真实 ENU1，并同步到两组对比曲线。"""
@@ -2804,7 +2876,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.log_info(f"ENU手动基准已设置: {lat:.8f}°, {lon:.8f}°, {alt:.3f}m")
 
     def _update_enu_display(self):
-        self._refresh_enu_charts()
+        """更新 ENU 统计逻辑；曲线由独立的低频绘图定时器负责。"""
         self._feed_direction_stats()
         self._feed_direction_stats3()
         self._update_enu_std()
@@ -2954,6 +3026,7 @@ class NMEADataAnalyzer(QMainWindow):
             del east_data[:len(east_data) - self.ENU_MAX_POINTS]
             del north_data[:len(north_data) - self.ENU_MAX_POINTS]
             del up_data[:len(up_data) - self.ENU_MAX_POINTS]
+        self._enu_plot_dirty = True
 
     def _create_enu_ref_box(self):
         """ENU基准值设置（全局控制, 影响所有串口的ENU误差计算）"""
@@ -3462,6 +3535,7 @@ class NMEADataAnalyzer(QMainWindow):
                     enu1_t, enu1_e, enu1_n, enu1_u,
                     enu2_t, enu2_e, enu2_n, enu2_u)
                 self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {len(enu2_e)}点)")
+            self._direction_enu_dirty = True
 
     def _reset_enu_chart_data(self, port=0):
         """重置ENU图表数据。port: 1=ENU1参考, 2=ENU2(串口2), 3=ENU3(串口3), 0=全部"""
@@ -3536,6 +3610,7 @@ class NMEADataAnalyzer(QMainWindow):
             ds = direction_stats[i]
             if ds._active:
                 ds.add_epoch(east, north, up, quality)
+                self._direction_summary_dirty = True
                 if auto_stop_enabled:
                     stopped = False
                     if auto_stop_sec > 0 and ds.duration >= auto_stop_sec:
@@ -3569,7 +3644,6 @@ class NMEADataAnalyzer(QMainWindow):
                 f"水平误差 均值: {stats['h_mean']:.3f} m | 最大: {stats['h_max']:.3f} m")
             labels['v'].setText(
                 f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
-        self._update_direction_charts()
         # 串口3方向测试显示
         for i in range(4):
             ds = self.direction_stats3[i]
@@ -3584,8 +3658,6 @@ class NMEADataAnalyzer(QMainWindow):
                 f"水平误差 均值: {stats['h_mean']:.3f} m | 最大: {stats['h_max']:.3f} m")
             labels['v'].setText(
                 f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
-        self._update_direction_charts3()
-        self._update_direction_enu_charts()
 
     def _update_direction_charts(self):
         x = [1, 2, 3, 4]
@@ -3756,8 +3828,10 @@ class NMEADataAnalyzer(QMainWindow):
             self.direction_stats[i].reset()
             self._refresh_direction_controls(2, i)
         self._dir_enu_active_index = -1
-        self._update_direction_charts()
+        self._direction_summary_dirty = True
+        self._direction_enu_dirty = True
         self._update_direction_stats_display()
+        self._refresh_visible_plots()
         self.log_info("串口2方向测试已重新开始准备：全部统计和时长已清空")
 
     def _reset_direction_stats3(self):
@@ -3766,8 +3840,10 @@ class NMEADataAnalyzer(QMainWindow):
             self.direction_stats3[i].reset()
             self._refresh_direction_controls(3, i)
         self._dir3_enu_active_index = -1
-        self._update_direction_charts3()
+        self._direction_summary_dirty = True
+        self._direction_enu_dirty = True
         self._update_direction_stats_display()
+        self._refresh_visible_plots()
         self.log_info("串口3方向测试已重新开始准备：全部统计和时长已清空")
 
     def reset_all_stats(self):
@@ -4709,6 +4785,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.serial_port2.disconnect()
         self.serial_port3.disconnect()  # [新增]
         self.update_timer.stop()
+        self.plot_timer.stop()
         self._preview_timer.stop()
         self._close_auto_log_files()
         event.accept()
