@@ -206,6 +206,27 @@ class UIDirectionControlTests(unittest.TestCase):
             self.window._refresh_enu_charts = original_refresh
             self.window.tab_widget.setCurrentWidget(control_tab)
 
+    def test_switching_to_clean_plot_tab_does_not_redraw(self):
+        titles = [
+            self.window.tab_widget.tabText(i)
+            for i in range(self.window.tab_widget.count())
+        ]
+        control_tab = self.window.tab_widget.widget(titles.index("功能与控制面板"))
+        self.window.tab_widget.setCurrentWidget(control_tab)
+        self.app.processEvents()
+
+        calls = []
+        original_refresh = self.window._refresh_enu_charts
+        self.window._refresh_enu_charts = lambda: calls.append("refresh")
+        try:
+            self.window._enu_plot_dirty = False
+            self.window.tab_widget.setCurrentWidget(self.window.enu_comp_tab)
+            self.app.processEvents()
+            self.assertEqual(calls, [])
+        finally:
+            self.window._refresh_enu_charts = original_refresh
+            self.window.tab_widget.setCurrentWidget(control_tab)
+
     def test_quarter_second_runtime_update_does_not_redraw_enu_curves(self):
         calls = []
         original_refresh = self.window._refresh_enu_charts

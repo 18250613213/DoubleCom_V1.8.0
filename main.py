@@ -1738,7 +1738,7 @@ class NMEADataAnalyzer(QMainWindow):
     
     def setup_connections(self):
         self.tab_widget.currentChanged.connect(
-            lambda _index: self._refresh_visible_plots(force=True))
+            lambda _index: self._refresh_visible_plots())
         self.plot_pause_btn.clicked.connect(self._toggle_plot_paused)
 
         # 串口1
@@ -2321,7 +2321,7 @@ class NMEADataAnalyzer(QMainWindow):
         self.plot_pause_btn.setText("暂停实时绘图")
         self.plot_status_label.setText("状态: 实时绘图中")
         self.plot_status_label.setStyleSheet("font-weight: bold; color: #27ae60;")
-        self._refresh_visible_plots(force=True)
+        self._refresh_visible_plots()
 
     # SNR表各星座徽章配色（Nord深色主题）
     _SYS_BADGES = {
