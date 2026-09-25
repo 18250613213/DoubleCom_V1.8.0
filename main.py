@@ -80,7 +80,7 @@ TALKER_TO_SYSTEM = {
 }
 
 # 当前系统软件发布版本号
-APP_VERSION = "1.9.4.1"
+APP_VERSION = "1.9.4.2"
 
 
 # --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
@@ -1481,16 +1481,20 @@ class NMEADataAnalyzer(QMainWindow):
         # 统计口径说明：与实时算法保持一致，便于测试人员解释报表指标。
         self.statistics_method_box = QGroupBox("统计方法说明")
         method_box_font = QFont(self.statistics_method_box.font())
-        method_box_font.setPointSize(15)
+        method_box_font.setPointSize(17)
         method_box_font.setBold(True)
         self.statistics_method_box.setFont(method_box_font)
         method_layout = QVBoxLayout(self.statistics_method_box)
         method_layout.setContentsMargins(10, 12, 10, 10)
         self.statistics_method_text = QTextEdit()
         self.statistics_method_text.setReadOnly(True)
-        self.statistics_method_text.setMinimumHeight(260)
+        method_text_font = QFont(self.statistics_method_text.font())
+        method_text_font.setPointSize(16)
+        self.statistics_method_text.setFont(method_text_font)
+        self.statistics_method_text.document().setDefaultFont(method_text_font)
+        self.statistics_method_text.setMinimumHeight(380)
         self.statistics_method_text.setStyleSheet(
-            "QTextEdit { font-size: 14px; line-height: 1.45; "
+            "QTextEdit { line-height: 1.45; "
             "background: #fbfcfd; border: 1px solid #d5d8dc; padding: 8px; }"
         )
         self.statistics_method_text.setHtml("""

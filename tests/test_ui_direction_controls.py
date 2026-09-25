@@ -26,8 +26,8 @@ class UIDirectionControlTests(unittest.TestCase):
         cls.window.deleteLater()
         cls.app.processEvents()
 
-    def test_release_version_is_v1_9_4_1(self):
-        self.assertEqual(APP_VERSION, "1.9.4.1")
+    def test_release_version_is_v1_9_4_2(self):
+        self.assertEqual(APP_VERSION, "1.9.4.2")
 
     def test_serial_stream_has_its_own_main_tab(self):
         titles = [
@@ -380,6 +380,10 @@ class UIDirectionControlTests(unittest.TestCase):
         )
         self.assertTrue(self.window.statistics_method_text.isReadOnly())
         self.assertGreaterEqual(self.window.statistics_method_text.minimumHeight(), 260)
+
+    def test_statistics_methods_use_readable_text_size(self):
+        text = self.window.statistics_method_text
+        self.assertGreaterEqual(text.document().defaultFont().pointSizeF(), 16)
 
     def test_every_direction_has_four_independent_controls(self):
         expected_keys = {"start_btn", "pause_btn", "resume_btn", "terminate_btn"}

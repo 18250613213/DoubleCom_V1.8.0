@@ -1,4 +1,4 @@
-# DoubleCom Optimized V1.9.4.1
+# DoubleCom Optimized V1.9.4.2
 
 本目录是从 V1.8.0 独立迁移出的优化版本。根目录原始源码保持不变。
 
@@ -43,6 +43,7 @@
 - ENU及方向图表仅在对应标签页可见且数据发生变化时重绘；
 - ENU对比页增加“暂停/继续实时绘图”，暂停期间串口、统计和报告数据继续累计；
 - 实时ENU曲线启用可视区域裁剪，但不减少显示点数；方向ENU仍保留全部方向、全部曲线和完整点数。
+- “统计方法说明”标题与正文放大至 17pt 与 16pt，并扩大说明区域高度。
 
 ## 验证
 
@@ -62,4 +63,4 @@ python -m PyInstaller --clean --noconfirm `
   DoubleCom_Optimized.spec
 ```
 
-生成文件：`release/DoubleCom_Optimized_V1.9.4.1.exe`。
+生成文件：`release/DoubleCom_Optimized_V1.9.4.2.exe`。

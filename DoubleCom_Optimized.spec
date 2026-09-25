@@ -21,7 +21,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='DoubleCom_Optimized_V1.9.4.1',
+    name='DoubleCom_Optimized_V1.9.4.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
