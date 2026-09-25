@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QDialog, QFormLayout, QProgressBar,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
     QFrame, QStyledItemDelegate, QStyle, QMenu, QAction,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QRect, QRectF
 from PyQt5.QtGui import QTextCursor, QTextDocument, QPainter, QColor, QFont, QPen, QBrush, QIcon
@@ -921,7 +922,21 @@ class NMEADataAnalyzer(QMainWindow):
         # 标签页 2：功能与控制面板 (串口管理、状态监视、ENU配置与报告导出)
         # =========================================================================
         control_tab = QWidget()
-        control_layout = QVBoxLayout(control_tab)
+        control_tab_layout = QVBoxLayout(control_tab)
+        control_tab_layout.setContentsMargins(0, 0, 0, 0)
+        control_tab_layout.setSpacing(0)
+
+        # 加装 QScrollArea 容器，防止在小分辨率或笔记本高DPI屏幕下界面内容被垂直挤压截断
+        self.control_scroll = QScrollArea()
+        self.control_scroll.setWidgetResizable(True)
+        self.control_scroll.setFrameShape(QFrame.NoFrame)
+        self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        control_content_widget = QWidget()
+        control_layout = QVBoxLayout(control_content_widget)
+        control_layout.setContentsMargins(8, 8, 8, 8)
+        control_layout.setSpacing(8)
         
         # -------------------------------------------------------------------------
         # 1. 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
@@ -1254,68 +1269,149 @@ class NMEADataAnalyzer(QMainWindow):
         control_layout.setStretch(1, 1)
 
         # -------------------------------------------------------------------------
-        # 8. 全局操作与导出控制按钮栏
+        # 8. 全局操作与导出控制中心 (功能卡片化双行整合: 数据维护 / 报告导出 / 自动化自检)
         # -------------------------------------------------------------------------
-        bottom_layout = QHBoxLayout()
+        action_box = QGroupBox("系统全局操作与测试报告导出")
+        action_box.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 13px;
+                border: 1px solid #bdc3c7;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 14px;
+                background-color: #fafbfc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 10px;
+                background-color: #ecf0f1;
+                border-radius: 3px;
+                color: #2c3e50;
+                font-weight: bold;
+            }
+        """)
+        action_layout = QVBoxLayout(action_box)
+        action_layout.setContentsMargins(10, 8, 10, 8)
+        action_layout.setSpacing(8)
+
+        # 第 1 行: 数据缓存维护与日志管理
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+
+        lbl_sec1 = QLabel("数据与日志:")
+        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 12px;")
+        row1.addWidget(lbl_sec1)
+
         # 清空数据：重置接收队列与全部统计缓存
-        self.clear_data_btn = QPushButton("清空数据")
-        self.clear_data_btn.setMinimumWidth(100)
-        self.clear_data_btn.setToolTip("清空预览与三个串口的数据缓存, 并重置全部统计")
+        self.clear_data_btn = QPushButton("🗑 清空数据")
+        self.clear_data_btn.setMinimumWidth(95)
+        self.clear_data_btn.setToolTip("清空数据预览区与三个串口的底层接收队列, 并重置全部统计累计值")
+        self.clear_data_btn.setStyleSheet("""
+            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background-color: #fde8e8; border-color: #f05252; }
+        """)
 
         # 重置统计：仅清除统计累计量，保留已有数据帧
-        self.reset_stats_btn = QPushButton("重置统计")
-        self.reset_stats_btn.setMinimumWidth(100)
-        self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR均值/方向统计等), 不清空数据缓存")
+        self.reset_stats_btn = QPushButton("↺ 重置统计")
+        self.reset_stats_btn.setMinimumWidth(95)
+        self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR递推均值/方向统计等), 保留已有串口数据流缓存")
+        self.reset_stats_btn.setStyleSheet("""
+            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background-color: #e0e7ff; border-color: #818cf8; }
+        """)
 
         # 清除日志：重置界面窗口文本
-        self.clear_log_btn = QPushButton("清除日志")
-        self.clear_log_btn.setMinimumWidth(100)
-        self.clear_log_btn.setToolTip("清空界面日志窗口显示(不影响自动落盘日志文件)")
+        self.clear_log_btn = QPushButton("🧹 清除日志")
+        self.clear_log_btn.setMinimumWidth(95)
+        self.clear_log_btn.setToolTip("清空界面日志窗口显示内容(不影响本地自动落盘日志文件)")
+        self.clear_log_btn.setStyleSheet("padding: 5px 10px; font-size: 12px;")
 
         # 保存全部原始日志
-        self.save_all_log_btn = QPushButton("保存全部日志")
-        self.save_all_log_btn.setMinimumWidth(110)
+        self.save_all_log_btn = QPushButton("💾 保存全部日志")
+        self.save_all_log_btn.setMinimumWidth(115)
         self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
+        self.save_all_log_btn.setStyleSheet("padding: 5px 10px; font-size: 12px;")
 
-        # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
-        self.export_report2_btn = QPushButton("导出串口2测试报告")
-        self.export_report2_btn.setMinimumWidth(140)
-        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
-        self.export_pdf2_btn = QPushButton("导出串口2PDF报告")
-        self.export_pdf2_btn.setMinimumWidth(140)
-        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
+        row1.addWidget(self.clear_data_btn)
+        row1.addWidget(self.reset_stats_btn)
+        row1.addWidget(self.clear_log_btn)
+        row1.addWidget(self.save_all_log_btn)
 
-        # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
-        self.export_report3_btn = QPushButton("导出串口3测试报告")
-        self.export_report3_btn.setMinimumWidth(140)
-        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
-        self.export_pdf3_btn = QPushButton("导出串口3PDF报告")
-        self.export_pdf3_btn.setMinimumWidth(140)
-        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; } QPushButton:hover { background-color: #3498db; }")
-
-        # 一键自检按钮（脱机闭环仿真测试）
-        self.selftest_btn = QPushButton("一键自检(无串口)")
-        self.selftest_btn.setMinimumWidth(130)
-        self.selftest_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
-        self.selftest_btn.setToolTip("无需真实串口: 使用随机生成的模拟导航数据(时长/倍率/种子可配)\n对解析/ENU/SNR/TTFF/方向测试/报告导出全链路进行自动化测试并输出验证清单")
-
-        bottom_layout.addWidget(self.clear_data_btn)
-        bottom_layout.addWidget(self.reset_stats_btn)
-        bottom_layout.addWidget(self.clear_log_btn)
-        bottom_layout.addWidget(self.save_all_log_btn)
-        bottom_layout.addWidget(self.export_report2_btn)
-        bottom_layout.addWidget(self.export_pdf2_btn)
-        bottom_layout.addWidget(self.export_report3_btn)
-        bottom_layout.addWidget(self.export_pdf3_btn)
-        bottom_layout.addWidget(self.selftest_btn)
+        row1.addSpacing(16)
 
         # 自动落盘日志复选框 (默认勾选)
-        self.auto_log_cb = QCheckBox("自动保存日志")
+        self.auto_log_cb = QCheckBox("自动保存原始日志")
         self.auto_log_cb.setChecked(True)
-        bottom_layout.addWidget(self.auto_log_cb)
-        bottom_layout.addStretch()
+        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 12px;")
+        self.auto_log_cb.setToolTip("勾选后将三个串口收到的原始数据按时间戳实时自动保存到 log/ 目录")
+        row1.addWidget(self.auto_log_cb)
 
-        control_layout.addLayout(bottom_layout)
+        row1.addStretch()
+        action_layout.addLayout(row1)
+
+        # 细微分割线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setStyleSheet("color: #e5e7eb; background-color: #e5e7eb; max-height: 1px;")
+        action_layout.addWidget(line)
+
+        # 第 2 行: 试验报告导出与全链路脱机自动化自检
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+
+        lbl_sec2 = QLabel("报告与自检:")
+        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 12px;")
+        row2.addWidget(lbl_sec2)
+
+        # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
+        self.export_report2_btn = QPushButton("📄 导出串口2报告 (MD)")
+        self.export_report2_btn.setMinimumWidth(135)
+        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report2_btn.setToolTip("将串口2受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
+
+        self.export_pdf2_btn = QPushButton("📑 导出串口2报告 (PDF)")
+        self.export_pdf2_btn.setMinimumWidth(135)
+        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf2_btn.setToolTip("将串口2受测机数据导出为带高清散点图的专业 PDF 测试报告")
+
+        # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
+        self.export_report3_btn = QPushButton("📄 导出串口3报告 (MD)")
+        self.export_report3_btn.setMinimumWidth(135)
+        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report3_btn.setToolTip("将串口3受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
+
+        self.export_pdf3_btn = QPushButton("📑 导出串口3报告 (PDF)")
+        self.export_pdf3_btn.setMinimumWidth(135)
+        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 5px 10px; border-radius: 4px; font-size: 12px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf3_btn.setToolTip("将串口3受测机数据导出为带高清散点图的专业 PDF 测试报告")
+
+        # 一键自检按钮（脱机闭环仿真测试）
+        self.selftest_btn = QPushButton("🚀 一键自检 (无串口)")
+        self.selftest_btn.setMinimumWidth(140)
+        self.selftest_btn.setStyleSheet("""
+            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background-color: #9b59b6; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
+        """)
+        self.selftest_btn.setToolTip("无需真实串口: 使用随机生成的模拟导航数据(时长/倍率/种子可配)\n对解析/ENU/SNR/TTFF/方向测试/报告导出全链路进行自动化测试并输出验证清单")
+
+        row2.addWidget(self.export_report2_btn)
+        row2.addWidget(self.export_pdf2_btn)
+        row2.addWidget(self.export_report3_btn)
+        row2.addWidget(self.export_pdf3_btn)
+        row2.addSpacing(10)
+        row2.addWidget(self.selftest_btn)
+        row2.addStretch()
+
+        action_layout.addLayout(row2)
+        control_layout.addWidget(action_box)
+
+        # 组装滚动容器到控制面板页面中
+        self.control_scroll.setWidget(control_content_widget)
+        control_tab_layout.addWidget(self.control_scroll)
         
         # 默认展示控制面板(高频操作), 表格视图次之
         self.tab_widget.addTab(control_tab, "功能与控制面板")

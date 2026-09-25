@@ -1,0 +1,4727 @@
+"""
+DoubleCom - 多串口 GNSS 实时数据分析与抗干扰测试系统
+
+系统核心功能与业务架构:
+  1. 三路串口并发接入与多协议解析:
+     - 串口 1 (基准参考机): 连接未受干扰的高精度接收机，输出厘米级参考坐标，实时解算站心基准。
+     - 串口 2 (干扰测试机 1): 连接受干扰设备/抗干扰天线 1，实时评估干扰下的定位跳变、失锁与 SNR 衰减。
+     - 串口 3 (干扰测试机 2): 连接对比设备/抗干扰天线 2，支持双干扰天线横向比对或多频点对比测试。
+     - 协议兼容: 支持 NMEA-0183 文本语句 (GGA, RMC, GSV, GSA) 与 u-blox 二进制 UBX 协议 (NAV-STATUS)。
+  2. 坐标转换与 ENU 局部站心误差解算:
+     - 将三维大地经纬高坐标 (WGS84 LLA) 转换为地心地固直角坐标 (ECEF)。
+     - 结合基准原点，通过正交投影矩阵实时投影至站心局部坐标系 (East, North, Up)。
+  3. 智能抗尖峰异常值动态剔除算法 (Outlier Rejection):
+     - 基于定长滑动窗口递推维护标准差 (1-Sigma)，仅在偏差同时超过 8 米与动态 10-Sigma 阈值时剔除野值。
+  4. 四方向转台抗干扰测试与自动启停:
+     - 支持在 4 个测试角度（0°/90°/180°/270°）下独立统计历元数、定位成功率、水平/高程极值与均值。
+     - 支持基于时间（秒）或历元数（点数）的自动停止条件。
+  5. 自动化测试报告导出:
+     - 一键渲染高质量 ENU 轨迹图、误差分布散点图，生成包含详细指标的 Markdown、HTML 及 PDF 报告。
+  6. 内置全仿真闭环一键自检引擎 (Self-Test Engine)。
+"""
+
+import sys
+import os
+import math
+import signal
+import time
+from datetime import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QComboBox, QPushButton, QLabel, QTextEdit,
+    QMessageBox, QDoubleSpinBox, QSpinBox, QStatusBar,
+    QGridLayout, QRadioButton, QButtonGroup, QCheckBox, QTabWidget,
+    QLineEdit, QDialog, QFormLayout, QProgressBar,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
+    QFrame, QStyledItemDelegate, QStyle, QMenu, QAction,
+    QScrollArea,
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QRect, QRectF
+from PyQt5.QtGui import QTextCursor, QTextDocument, QPainter, QColor, QFont, QPen, QBrush, QIcon
+from PyQt5.QtPrintSupport import QPrinter
+import re
+
+import pyqtgraph as pg
+import pyqtgraph.exporters
+from pyqtgraph.exporters import ImageExporter
+
+from src.communication.serial_manager import SerialManager
+from src.nmea.nmea_parser import NMEAParser
+from src.nmea.nmea_gga_parser import NMEAGGAParser
+from src.positioning.statistics_accumulator import MultiDimensionStatistics
+from src.positioning.direction_statistics import DirectionStatistics
+from src.protocol.ubx_parser import parse_ubx_frame
+
+from collections import deque
+
+# 打包后资源位于 PyInstaller 临时目录，日志和报告写到 EXE 所在目录。
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+RESOURCE_DIR = getattr(sys, '_MEIPASS', SOURCE_DIR)
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else SOURCE_DIR
+
+# --- NMEA 4.10+ 标准各导航系统信号频点编号到名称的映射表 ---
+# 字典键: 'G'(GPS), 'R'(GLONASS), 'E'(Galileo), 'B'(BeiDou)
+SIGNAL_NAMES = {
+    'G': {0: 'ALL', 1: 'L1C', 2: 'L1P', 3: 'L1M', 4: 'L2P', 5: 'L2C', 6: 'L2C', 7: 'L5I', 8: 'L5Q'},
+    'R': {0: 'ALL', 1: 'G1C', 2: 'G1P', 3: 'G2C', 4: 'G2P'},
+    'E': {0: 'ALL', 1: 'E5A', 2: 'E5B', 3: 'E5AB', 4: 'E6A', 5: 'E6BC', 6: 'L1A', 7: 'L1BC'},
+    'B': {0: 'ALL', 1: 'B1I', 2: 'B1Q', 3: 'B1C', 4: 'B1A', 5: 'B2A', 6: 'B2B', 7: 'B2AB', 8: 'B3', 9: 'B3Q', 10: 'B3A', 11: 'B2I', 12: 'B2Q'},
+}
+
+# NMEA Talker ID 标识符到系统单字符代号的映射表
+TALKER_TO_SYSTEM = {
+    'GP': 'G',  # GPS
+    'GL': 'R',  # GLONASS
+    'GA': 'E',  # Galileo
+    'GB': 'B',  # BeiDou
+    'BD': 'B',  # BeiDou (旧版前缀)
+    'GN': 'G',  # 联合/默认归入 GPS 显示
+}
+
+# 当前系统软件发布版本号
+APP_VERSION = "1.9.4"
+
+
+# --- WGS84 椭球体几何常数 (用于经纬高 LLA -> ECEF -> 站心 ENU 转换) ---
+WGS84_A = 6378137.0             # 椭球长半轴 (Semi-major axis, 米)
+WGS84_F = 1.0 / 298.257223563   # 椭球扁率 (Flattening)
+WGS84_E2 = 2 * WGS84_F - WGS84_F * WGS84_F  # 第一偏心率平方 (First Eccentricity Squared: e^2 = 2f - f^2)
+
+
+class SlidingWindowStd:
+    """
+    定长滑动窗口均值与标准差增量计算器。
+
+    算法原理:
+      采用双端队列 (deque) 维护定长窗口 (window_size)。
+      通过增量维护窗口元素和 sum 与平方和 sum_sq:
+        - 当窗口满时，移除最老元素 old: sum -= old, sum_sq -= old^2
+        - 压入新元素 new: sum += new, sum_sq += new^2
+      计算方差:
+        Var = (sum_sq / n) - (sum / n)^2
+      使得每次添加新数值时，均值与标准差的计算开销均为 O(1) 时间复杂度，
+      极大降低高频刷新下的 CPU 占用。
+    """
+    def __init__(self, window_size=200):
+        """
+        初始化滑动窗口。
+
+        参数:
+            window_size (int): 滑动窗口最大容量点数，默认 200。
+        """
+        self._window = deque(maxlen=window_size)
+        self._sum = 0.0
+        self._sum_sq = 0.0
+
+    def add(self, value):
+        """
+        向滑动窗口追加一个样本值，并在 O(1) 时间内更新一阶和与平方和。
+
+        参数:
+            value (float): 新输入的测量值。
+        """
+        if len(self._window) == self._window.maxlen:
+            old = self._window[0]
+            self._sum -= old
+            self._sum_sq -= old * old
+        self._window.append(value)
+        self._sum += value
+        self._sum_sq += value * value
+
+    def reset(self):
+        """清空窗口队列及累加和。"""
+        self._window.clear()
+        self._sum = 0.0
+        self._sum_sq = 0.0
+
+    @property
+    def mean(self):
+        """
+        获取当前窗口内样本的平均值。
+
+        返回:
+            float: 窗口均值；无数据时返回 0.0。
+        """
+        n = len(self._window)
+        if n == 0:
+            return 0.0
+        return self._sum / n
+
+    @property
+    def std(self):
+        """
+        获取当前窗口内样本的总体标准差。
+
+        返回:
+            float: 总体标准差 (Sigma)；若样本量少于 3 则返回 0.0（避免起步抖动假象）。
+        """
+        n = len(self._window)
+        if n < 3:
+            return 0.0
+        mean = self._sum / n
+        variance = self._sum_sq / n - mean * mean
+        return math.sqrt(max(variance, 0.0))
+
+    def __len__(self):
+        """返回当前窗口内已有样本数量。"""
+        return len(self._window)
+
+
+class RunningAverage:
+    """
+    多键值增量递推平均值跟踪器 (Welford 递推均值算法)。
+
+    用于长周期平滑跟踪各颗卫星的载噪比 (SNR) 均值或信噪比差异 (Delta SNR)。
+    无需在内存中保存历史测量数组即可实现稳定的在线均值更新:
+      avg_n = avg_{n-1} + (x_n - avg_{n-1}) / n
+    """
+    def __init__(self):
+        """初始化存储字典。"""
+        self._data = {}
+
+    def add(self, key, value):
+        """
+        向指定标识键录入一个新观测值并递推更新均值。
+
+        参数:
+            key (any): 跟踪对象标识键 (如 (talker_id, prn))。
+            value (float): 新观测值。
+        """
+        if key not in self._data:
+            self._data[key] = {'avg': float(value), 'n': 1}
+        else:
+            d = self._data[key]
+            d['n'] += 1
+            d['avg'] += (value - d['avg']) / d['n']
+
+    def get(self, key):
+        """
+        获取指定键的当前平滑平均值。
+
+        返回:
+            float 或 None: 存在则返回均值，不存在则返回 None。
+        """
+        if key in self._data:
+            return self._data[key]['avg']
+        return None
+
+    def reset(self):
+        """清空全部键的累计样本和均值。"""
+        self._data.clear()
+
+    def count(self, key):
+        """返回指定键已累计的真实历元样本数。"""
+        return self._data.get(key, {}).get('n', 0)
+
+    def values(self):
+        """
+        导出所有键当前均值的纯键值字典。
+
+        返回:
+            dict: {key: avg_val, ...}
+        """
+        return {key: d['avg'] for key, d in self._data.items()}
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """
+    支持真数值排序与缺失值吸底的表格单元项。
+    
+    标准 QTableWidgetItem 默认基于文本进行字典序排序 (例如 "2.0" 会排在 "10.0" 之后)。
+    本类重载 __lt__，优先通过 Qt.UserRole 取出原始浮点数值进行大小比较，
+    并能够感知表头排序方向 (升序/降序)，无论何种排序方式均将未锁定的缺失值 ('--') 稳定吸底置后。
+    """
+    def __init__(self, text="", value=None):
+        super().__init__(text)
+        if value is not None:
+            self.setData(Qt.UserRole, float(value))
+
+    def __lt__(self, other):
+        v1 = self.data(Qt.UserRole)
+        v2 = other.data(Qt.UserRole) if isinstance(other, QTableWidgetItem) else None
+        
+        # 两个都是有效浮点数时，直接按数值大小比较
+        if v1 is not None and v2 is not None:
+            try:
+                return float(v1) < float(v2)
+            except (ValueError, TypeError):
+                pass
+                
+        # 获取当前表格排序方向（升序或降序）
+        table = self.tableWidget()
+        is_descending = False
+        if table and table.horizontalHeader():
+            is_descending = (table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder)
+            
+        # 保证 None (即 '--' 缺失值) 无论升序还是降序永远排列在表格最底部
+        if v1 is None and v2 is not None:
+            return True if is_descending else False
+        if v1 is not None and v2 is None:
+            return False if is_descending else True
+            
+        return super().__lt__(other)
+
+
+class SNRBarDelegate(QStyledItemDelegate):
+    """
+    卫星载噪比表格原生绘制委托 (u-center 仪器级视觉风格)。
+    
+    功能特性:
+    1. 瞬时载噪比列 (COM1/COM2/COM3 瞬时):
+       - 左侧显示精准浮点数字 (dB-Hz)；
+       - 右侧自绘微型色阶进度柱 (0~50 dB-Hz，绿/青/黄/橙/红五阶平滑过渡)。
+    2. 恶化差值列 (Δ2-1, Δ3-1):
+       - 按受干扰衰减深度分级填充警示背景色 (|Δ|≥15dB 告警红, |Δ|≥10dB 预警橙)；
+       - 关键恶化卫星 PRN 与数值加粗高亮。
+    3. 全局暗黑主题与高对比度斑马纹，彻底消除文本重绘闪烁。
+    """
+    def paint(self, painter, option, index):
+        painter.save()
+        val = index.data(Qt.UserRole)
+        txt = index.data(Qt.DisplayRole) or ""
+        col = index.column()
+        rect = option.rect
+        
+        # 1. 确定单元格背景色
+        custom_bg = index.data(Qt.BackgroundRole)
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(rect, QColor("#45475a"))
+        elif custom_bg:
+            painter.fillRect(rect, QColor(custom_bg) if not isinstance(custom_bg, QColor) else custom_bg)
+        else:
+            # 深色斑马纹背景
+            row_bg = QColor("#1e1e2e") if index.row() % 2 == 0 else QColor("#181825")
+            painter.fillRect(rect, row_bg)
+            
+        # 2. 针对 SNR 瞬时值列 (列 3, 5, 9): 绘制数字 + 微型横向进度条
+        if col in (3, 5, 9) and val is not None and isinstance(val, (int, float)) and val > 0:
+            # 文本区（左侧留白）
+            text_rect = QRect(rect.left() + 2, rect.top(), rect.width() - 54, rect.height())
+            text_color = index.data(Qt.ForegroundRole) or QColor("#cdd6f4")
+            painter.setPen(QColor(text_color) if not isinstance(text_color, QColor) else text_color)
+            painter.setFont(QFont("Consolas", 11))
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignRight, txt)
+            
+            # 微型进度条槽（右侧 44px 宽，9px 高）
+            bar_w = 44
+            bar_h = 9
+            bar_x = rect.right() - bar_w - 5
+            bar_y = rect.top() + (rect.height() - bar_h) // 2
+            
+            # 槽底色
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#313244"))
+            painter.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
+            
+            # 进度填充 (满量程 50 dB-Hz)
+            fill_ratio = max(0.0, min(1.0, float(val) / 50.0))
+            fill_w = int(bar_w * fill_ratio)
+            if fill_w > 0:
+                if val >= 42:
+                    bar_color = QColor("#a6e3a1")  # 优良 (绿)
+                elif val >= 36:
+                    bar_color = QColor("#94e2d5")  # 良好 (青)
+                elif val >= 30:
+                    bar_color = QColor("#f9e2af")  # 一般 (黄)
+                elif val >= 24:
+                    bar_color = QColor("#fab387")  # 较差 (橙)
+                else:
+                    bar_color = QColor("#f38ba8")  # 恶劣 (红)
+                painter.setBrush(bar_color)
+                painter.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 3, 3)
+                
+        # 3. 针对星座徽章列 (列 0): 绘制圆角徽章胶囊
+        elif col == 0 and txt:
+            badge_bg = index.data(Qt.BackgroundRole)
+            if not badge_bg:
+                badge_bg = QColor("#89b4fa")
+            badge_rect = QRect(rect.left() + (rect.width() - 52) // 2, rect.top() + (rect.height() - 22) // 2, 52, 22)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(badge_bg) if not isinstance(badge_bg, QColor) else badge_bg)
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            
+            painter.setPen(QColor("#11111b"))
+            font = QFont("Consolas", 10, QFont.Bold)
+            painter.setFont(font)
+            painter.drawText(badge_rect, Qt.AlignCenter, txt)
+            
+        # 4. 其余常规单元格绘制
+        else:
+            text_color = index.data(Qt.ForegroundRole)
+            painter.setPen(QColor(text_color) if isinstance(text_color, (str, QColor)) else QColor("#cdd6f4"))
+            
+            font = index.data(Qt.FontRole)
+            if font:
+                painter.setFont(font)
+            else:
+                painter.setFont(QFont("Consolas", 11))
+                
+            align = index.data(Qt.TextAlignmentRole) or (Qt.AlignVCenter | Qt.AlignCenter)
+            padded_rect = QRect(rect.left() + 4, rect.top(), rect.width() - 8, rect.height())
+            painter.drawText(padded_rect, align, txt)
+            
+        painter.restore()
+
+
+class NMEADataAnalyzer(QMainWindow):
+    """
+    NMEA 数据实时分析与抗干扰测试主窗口界面类。
+    
+    集成了多路串口通信、多协议解码、三维站心坐标转换、异常值拦截、方向测试与报表导出等全部业务功能。
+    """
+    
+    def __init__(self):
+        """初始化主窗口组件、数据结构、内部算法模块与定时器。"""
+        super().__init__()
+        self.setWindowTitle(f"NMEA 数据实时分析系统 V{APP_VERSION}")
+        self.setGeometry(100, 100, 1500, 1000)
+        self.showMaximized()
+
+        # 加载并设置程序窗口图标
+        icon_path = os.path.join(RESOURCE_DIR, 'resources', 'app_icon.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        # 1. 核心独立算法与解析模块初始化
+        # ----------------------------------------------------
+        self.gga_parser = NMEAGGAParser()                     # GGA 专用解析器
+        self.nmea_parser = NMEAParser()                       # 串口 1 主 NMEA 解析器
+        self.statistics = MultiDimensionStatistics()          # 定位误差多维统计累加器
+
+        # ----------------------------------------------------
+        # 2. 四方向转台测试状态与统计对象 (串口2 与 串口3)
+        # ----------------------------------------------------
+        # 串口 2 方向测试统计对象 (索引 0~3 对应 4 个测试角度，如 0°/90°/180°/270°)
+        self.direction_stats = [DirectionStatistics() for _ in range(4)]
+        self._dir_enu_active_index = -1                       # 当前正在测试的方向索引 (-1 表示未激活)
+        self._dir_auto_stop_enabled = False                   # 是否开启达到阈值后自动停止
+        self._dir_auto_stop_sec = 300                         # 自动停止时长门限 (默认 300 秒)
+        self._dir_auto_stop_epochs = 300                      # 自动停止历元数门限 (默认 300 点)
+
+        # 串口 3 方向测试统计对象
+        self.direction_stats3 = [DirectionStatistics() for _ in range(4)]
+        self._dir3_enu_active_index = -1                      # 串口 3 当前激活方向索引
+        self._dir3_auto_stop_enabled = False                  # 串口 3 自动停止开关
+        self._dir3_auto_stop_sec = 300                        # 串口 3 自动停止时长
+        self._dir3_auto_stop_epochs = 300                     # 串口 3 自动停止历元数
+
+        # 最新历元解算出的 ENU 误差实时值 (米)
+        self._latest_enu2_east = 0.0                          # 串口 2 最新东向误差
+        self._latest_enu2_north = 0.0                         # 串口 2 最新北向误差
+        self._latest_enu2_up = 0.0                            # 串口 2 最新天向误差
+        self._latest_enu3_east = 0.0                          # 串口 3 最新东向误差
+        self._latest_enu3_north = 0.0                         # 串口 3 最新北向误差
+        self._latest_enu3_up = 0.0                            # 串口 3 最新天向误差
+
+        # 新历元到达标志与定位质量
+        self._p2_gga_new_epoch = False                        # 串口 2 新 GGA 历元就绪标记
+        self._latest_p2_quality = 0                           # 串口 2 最新定位质量
+        self._p3_gga_new_epoch = False                        # 串口 3 新 GGA 历元就绪标记
+        self._latest_p3_quality = 0                           # 串口 3 最新定位质量
+
+        # GPS 时间跟踪
+        self.gps_week = 0                                     # 当前 GPS 星期数
+        self.gps_sow = 0.0                                    # 当前 GPS 周内秒 (Seconds of Week)
+
+        # ----------------------------------------------------
+        # 3. 多串口卫星信噪比 (SNR/CN0) 实时与历史数据
+        # ----------------------------------------------------
+        # 键统一为 (talker_id, signal_id, prn)，避免同一卫星多频点互相覆盖。
+        self.port1_satellites = {}
+        self.port2_satellites = {}  # 串口2当前可视星字典: {prn: {'snr': snr, 'system': sys}}
+        self._port1_snr_signals = {}
+        self._port2_snr_signals = {}
+        self.port3_satellites = {}  # 串口3当前可视星字典
+        self._port3_snr_signals = {}
+        self._last_gsv_sequence = {1: 0, 2: 0, 3: 0}
+
+        # ----------------------------------------------------
+        # 4. ENU 误差计算基准参考点与时间序列缓存
+        # ----------------------------------------------------
+        # 串口 1 (基准参考机，无干扰)
+        self.enu1_ref_point = None                            # 基准点大地坐标 (lat, lon, alt)
+        self.enu1_buffer = []                                 # 启动阶段用于取平滑均值的坐标缓冲池
+        self.enu1_buffer_size = 100                           # 自动基准点采集历元数 (100 点约 100 秒)
+        self.enu1_ref_ready = False                           # 基准参考点是否已锁定就绪
+        self.enu_auto_mode = True                             # 是否为自动计算基准点模式 (True=自动均值, False=手动输入)
+        self.enu_instant_mode = False                         # 是否为即时瞬态基准点模式
+        self.enu1_times = []                                  # 串口 1 绘图时间戳数组
+        self.enu1_east_data = []                              # 串口 1 东向误差数组
+        self.enu1_north_data = []                             # 串口 1 北向误差数组
+        self.enu1_up_data = []                                # 串口 1 天向误差数组
+
+        # 串口 3 专用的串口 1 历史副本 (避免串口2与串口3绘制对比图时时间轴相互污染)
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
+
+        # 串口 2 (干扰测试机 1)
+        self.enu2_ref_point = None
+        self.enu2_buffer = []
+        self.enu2_buffer_size = 100
+        self.enu2_ref_ready = False
+        self.enu2_times = []
+        self.enu2_east_data = []
+        self.enu2_north_data = []
+        self.enu2_up_data = []
+
+        # 串口 3 (干扰测试机 2)
+        self.enu3_ref_point = None
+        self.enu3_buffer = []
+        self.enu3_buffer_size = 100
+        self.enu3_ref_ready = False
+        self.enu3_times = []
+        self.enu3_east_data = []
+        self.enu3_north_data = []
+        self.enu3_up_data = []
+
+        # ----------------------------------------------------
+        # 5. 异常值动态检测与剔除参数 (Outlier Filter)
+        # ----------------------------------------------------
+        self.ENU_STD_WINDOW = 200                             # 滑动标准差计算窗口宽度 (点数)
+        self.ENU_OUTLIER_SIGMA = 10.0                         # 离群值判定倍数 (偏差 > 10*Sigma 触发候选)
+        self.ENU_OUTLIER_MIN_DELTA = 8.0                      # 最小绝对偏差门限 (偏差必须同时 > 8.0 米才剔除，减少有效变化误杀)
+        self.ENU_OUTLIER_MIN_SAMPLES = 30                     # 滑动窗口最少起步样本数 (不足 30 点时不执行剔除)
+        self._enu2_outlier_count = 0                          # 串口 2 累计剔除异常点计数
+        self._enu3_outlier_count = 0                          # 串口 3 累计剔除异常点计数
+
+        # 绘图曲线最大缓存点数 (4Hz × 1800s = 7200点，保留约 30 分钟连续轨迹)
+        self.ENU_MAX_POINTS = 7200
+
+        # 各轴滑动窗口标准差计算器 (基于 SlidingWindowStd 实现 O(1) 递推)
+        self._std_enu1_east = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_up = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu2_east = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu2_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu2_up = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_3_east = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_3_north = SlidingWindowStd(self.ENU_STD_WINDOW)
+        self._std_enu1_3_up = SlidingWindowStd(self.ENU_STD_WINDOW)
+
+        # ----------------------------------------------------
+        # 6. 卫星信噪比平滑均值与差值跟踪器
+        # ----------------------------------------------------
+        self._port1_snr_avg = RunningAverage()                # 串口 1 单星 SNR 长期递推均值
+        self._port2_snr_avg = RunningAverage()                # 串口 2 单星 SNR 长期递推均值
+        self._snr_diff_avg = RunningAverage()                 # 串口 2 VS 串口 1 SNR 差值均值
+        self._last_port1_snr = {}                             # 串口 1 上一历元单星 SNR 快照
+        self._last_port2_snr = {}                             # 串口 2 上一历元单星 SNR 快照
+        self._last_snr_diff = {}                              # 上一历元差值快照
+        self._port3_snr_avg = RunningAverage()                # 串口 3 单星 SNR 递推均值
+        self._last_port3_snr = {}
+        self._snr_diff2_avg = RunningAverage()                # 串口 3 VS 串口 1 SNR 差值均值
+        self._last_snr_diff2 = {}
+
+        # ----------------------------------------------------
+        # 7. 简明 GGA 定位状态与 TTFF
+        # ----------------------------------------------------
+        self.port1_gga = None                                 # 串口 1 最新 GGA 简明字典
+        self.port2_gga = None                                 # 串口 2 最新 GGA 简明字典
+        self.port3_gga = None                                 # 串口 3 最新 GGA 简明字典
+        self.p1_gga_nsat = 0                                  # 串口 1 可用卫星数
+        self.p2_gga_nsat = 0                                  # 串口 2 可用卫星数
+        self.p3_gga_nsat = 0                                  # 串口 3 可用卫星数
+        self.p1_utc_ts = ""                                   # 串口 1 UTC 时间文本
+        self.p2_utc_ts = ""                                   # 串口 2 UTC 时间文本
+        self.p3_utc_ts = ""                                   # 串口 3 UTC 时间文本
+
+        self.p1_ttff_s = 0.0                                  # 串口 1 首次定位时间 (秒)
+        self.p2_ttff_s = 0.0                                  # 串口 2 首次定位时间 (秒)
+        self.p3_ttff_s = 0.0                                  # 串口 3 首次定位时间 (秒)
+
+        # 独立串口 NMEA 状态机解析器实例
+        self.nmea_parser2 = NMEAParser()                      # 串口 2 专用解析器
+        self.nmea_parser3 = NMEAParser()                      # 串口 3 专用解析器
+
+        # 改正数计算缓存
+        self.last_gga_data = None
+        self.last_smoothed_data = None
+
+        # ----------------------------------------------------
+        # 8. 通信管理器与内存保护循环队列
+        # ----------------------------------------------------
+        self.current_parser = None
+        self.current_data_source = None
+        self._selftest_runner = None                          # 自检执行器实例
+        self.serial_port1 = SerialManager(port_id=1)          # 串口 1 通信管理器
+        self.serial_port2 = SerialManager(port_id=2)          # 串口 2 通信管理器
+        self.serial_port3 = SerialManager(port_id=3)          # 串口 3 通信管理器
+
+        # 串口数据缓存（限制容量上限为 40000 行，约可缓存数小时，防止无节制占用系统内存）
+        self.serial_save_buffer = deque(maxlen=40000)
+        self.serial2_save_buffer = deque(maxlen=40000)
+        self.serial3_save_buffer = deque(maxlen=40000)
+        self.MAX_SERIAL_BUFFER = 40000
+        
+        # ----------------------------------------------------
+        # 9. 原始数据自动日志落盘配置
+        # ----------------------------------------------------
+        self.auto_log_enabled = True
+        self.auto_log_dir = os.path.join(APP_DIR, "log")
+        os.makedirs(self.auto_log_dir, exist_ok=True)
+        self._log_file1 = None                                # 串口 1 自动日志句柄
+        self._log_file2 = None                                # 串口 2 自动日志句柄
+        self._log_file3 = None                                # 串口 3 自动日志句柄
+        self._log_flush_count = {1: 0, 2: 0, 3: 0}
+        self._LOG_FLUSH_INTERVAL = 50                         # 每写入 50 行强制刷新一次系统磁盘缓冲
+        self._data_count_update = 0
+        self._DATA_COUNT_INTERVAL = 10
+        self._DATA_COUNT_INTERVAL = 10
+        
+        self.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #bdc3c7;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 12px;
+                color: #2c3e50;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 8px;
+                background-color: #ecf0f1;
+                border-radius: 3px;
+                color: #2c3e50;
+            }
+            QPushButton {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                padding: 4px 12px;
+                background-color: #f8f9fa;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #e8f0fe;
+                border-color: #4a90d9;
+            }
+            QPushButton:pressed {
+                background-color: #d0e1fd;
+            }
+            QPushButton:disabled {
+                background-color: #e0e0e0;
+                color: #999;
+            }
+            QTextEdit {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                background-color: #fafafa;
+            }
+            QComboBox {
+                border: 1px solid #bdc3c7;
+                border-radius: 3px;
+                padding: 2px 6px;
+                background-color: white;
+            }
+            QComboBox:hover {
+                border-color: #4a90d9;
+            }
+        """)
+
+        # 初始化 UI
+        self.init_ui()
+        self.setup_connections()
+        self.refresh_serial_ports(1)
+        self.refresh_serial_ports(2)
+        self.refresh_serial_ports(3)  # [新增]
+        self._open_auto_log_files()
+        
+        # 定时器更新（4 Hz，降低UI刷新频率避免长期运行卡顿）
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(250)
+        self.update_timer.timeout.connect(self.update_plots)
+        self._update_frame_count = 0
+        self._last_snr_data = None
+
+        # 数据速率统计（状态栏实时显示 行/s, 便于发现串口断流/卡死）
+        self._rate_counters = {}
+        self._rate_last = {}
+        self._rate_t0 = time.monotonic()
+        self._rate_timer = QTimer()
+        self._rate_timer.setInterval(2000)
+        self._rate_timer.timeout.connect(self._update_rate_label)
+        self._rate_timer.start()
+
+        # 自检进度条UI刷新定时器（自检运行期间启动）
+        self._selftest_ui_timer = QTimer()
+        self._selftest_ui_timer.setInterval(500)
+        self._selftest_ui_timer.timeout.connect(self._on_selftest_ui_tick)
+
+        # 数据预览批量刷新，避免每条串口语句触发一次 QTextEdit 布局。
+        self._preview_pending = deque(maxlen=2000)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(100)
+        self._preview_timer.timeout.connect(self._flush_data_preview)
+        self._preview_timer.start()
+    
+    def init_ui(self):
+        """
+        初始化主程序图形用户界面 (GUI)
+        
+        采用现代化 QTabWidget 多标签页架构，包含以下核心子页面与功能区：
+        1. 表格视图 (table_tab)：实时展示 GSV 载噪比 (SNR) 矩阵对比；
+        2. 功能与控制面板 (control_tab)：
+           - 3 串口统一配置与连接控制网格 (COM1/COM2/COM3)；
+           - 3 串口实时 GGA 定位状态卡片 (UTC/经纬高/解状态/星数/TTFF)；
+           - 全局 ENU 空间直角坐标基准源配置区 (自动基准 / 动态瞬时 / 手动输入)；
+           - 3 路实时 ENU 误差显示与滑动窗口标准差统计；
+           - 实验测试基本信息录入 (地点/型号/天线阵列/干扰模式/方位/高度)；
+           - 全局控制按钮栏 (清空/重置/日志导出/多路报告导出/一键全链路自检)；
+        3. 串口实时数据流 (stream_tab)：独立承载原始语句滚动、暂停、过滤与清空操作；
+        4. 系统运行日志 (log_tab)：独立展示连接、解析、异常与操作历史；
+        5. ENU 误差对比 (enu_comp_tab)：左右双列 PyQtGraph 实时绘制 COM1 vs COM2 与 COM1 vs COM3 三向误差时序；
+        6. 方向测试 (direction_tab)：四向 (东/南/西/北) 转台测试控制面板与指标统计汇总；
+        7. 方向 ENU 对比 (dir_enu_tab)：各方向定位误差散点图与统计指标；
+        8. 底部状态栏 (QStatusBar)：串口连接指示灯、数据吞吐速率 (行/s)、自检进度条与数据行数计数。
+        """
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        
+        # 创建QTabWidget框架，承载多维业务分析与控制视图
+        self.tab_widget = QTabWidget()
+        
+        # =========================================================================
+        # 标签页 1：表格视图 (GSV 载噪比对比矩阵看板)
+        # =========================================================================
+        table_tab = QWidget()
+        table_layout = QVBoxLayout(table_tab)
+        table_layout.setSpacing(6)
+        
+        # -------------------------------------------------------------------------
+        # 1. 顶部卫星态势摘要看板 (4 项核心 KPI Cards)
+        # -------------------------------------------------------------------------
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(10)
+
+        def _create_kpi_card(title_text, val_text="--", val_color="#89b4fa"):
+            frame = QFrame()
+            frame.setStyleSheet("""
+                QFrame {
+                    background-color: #1e1e2e;
+                    border: 1px solid #313244;
+                    border-radius: 6px;
+                }
+            """)
+            lay = QVBoxLayout(frame)
+            lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(4)
+            t_lbl = QLabel(title_text)
+            t_lbl.setStyleSheet("font-size: 13px; color: #a6adc8; font-weight: bold;")
+            v_lbl = QLabel(val_text)
+            v_lbl.setStyleSheet(f"font-size: 17px; color: {val_color}; font-weight: bold; font-family: Consolas, 'Segoe UI', monospace;")
+            lay.addWidget(t_lbl)
+            lay.addWidget(v_lbl)
+            return frame, v_lbl
+
+        kpi_card1, self.kpi_tracked_label = _create_kpi_card("跟踪星数 (P1 / P2 / P3)", "-- / -- / -- 颗", "#a6e3a1")
+        kpi_card2, self.kpi_avgsnr_label = _create_kpi_card("平均载噪比 (P1 / P2 / P3)", "-- / -- / -- dB", "#89b4fa")
+        kpi_card3, self.kpi_warn_label = _create_kpi_card("受干扰恶化星数 (|Δ| ≥ 10dB)", "-- 颗 (占比 --%)", "#fab387")
+        kpi_card4, self.kpi_maxdrop_label = _create_kpi_card("最大受扰压制深度", "--", "#f38ba8")
+
+        kpi_row.addWidget(kpi_card1)
+        kpi_row.addWidget(kpi_card2)
+        kpi_row.addWidget(kpi_card3)
+        kpi_row.addWidget(kpi_card4)
+        table_layout.addLayout(kpi_row)
+
+        # -------------------------------------------------------------------------
+        # 2. 交互式多维过滤工具栏 (Toolbar)
+        # -------------------------------------------------------------------------
+        snr_box = QGroupBox("卫星信噪比 (GSV) 载噪比矩阵对比看板")
+        snr_box.setStyleSheet("""
+            QGroupBox {
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #bdc3c7;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 12px;
+                color: #2c3e50;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 10px;
+                background-color: #ecf0f1;
+                border-radius: 3px;
+                color: #1a252f;
+                font-size: 14px;
+                font-weight: bold;
+            }
+        """)
+        snr_layout = QVBoxLayout(snr_box)
+        snr_layout.setContentsMargins(6, 8, 6, 6)
+        snr_layout.setSpacing(6)
+
+        toolbar_row = QHBoxLayout()
+        toolbar_row.setSpacing(6)
+
+        # 星座过滤单选按钮组
+        lbl_filter = QLabel("星座筛选:")
+        lbl_filter.setStyleSheet("font-size: 15px; font-weight: bold;")
+        toolbar_row.addWidget(lbl_filter)
+        self.snr_filter_group = QButtonGroup(self)
+        self.snr_filter_all = QPushButton("全部")
+        self.snr_filter_bds = QPushButton("🇨🇳 北斗(BDS)")
+        self.snr_filter_gps = QPushButton("🇺🇸 GPS")
+        self.snr_filter_gal = QPushButton("🇪🇺 Galileo")
+        self.snr_filter_glo = QPushButton("🇷🇺 GLONASS")
+
+        filter_btn_style = """
+            QPushButton {
+                padding: 5px 12px; font-size: 13px; border: 1px solid #45475a;
+                border-radius: 4px; background-color: #313244; color: #cdd6f4;
+            }
+            QPushButton:checked {
+                background-color: #89b4fa; color: #11111b; font-weight: bold; border-color: #89b4fa;
+            }
+            QPushButton:hover:!checked {
+                background-color: #45475a;
+            }
+        """
+        for idx, btn in enumerate([self.snr_filter_all, self.snr_filter_bds, self.snr_filter_gps, self.snr_filter_gal, self.snr_filter_glo]):
+            btn.setCheckable(True)
+            btn.setStyleSheet(filter_btn_style)
+            self.snr_filter_group.addButton(btn, idx)
+            toolbar_row.addWidget(btn)
+        self.snr_filter_all.setChecked(True)
+
+        toolbar_row.addSpacing(10)
+
+        # 仅显示受扰恶化星复选框
+        self.snr_filter_warn_cb = QCheckBox("仅显示受扰星 (|Δ| ≥ 10 dB)")
+        self.snr_filter_warn_cb.setStyleSheet("font-weight: bold; color: #fab387; font-size: 15px;")
+        toolbar_row.addWidget(self.snr_filter_warn_cb)
+
+        toolbar_row.addSpacing(10)
+
+        # PRN 快速搜索框
+        self.snr_search_edit = QLineEdit()
+        self.snr_search_edit.setPlaceholderText("搜索 PRN (如 01, 03)...")
+        self.snr_search_edit.setMaximumWidth(160)
+        self.snr_search_edit.setStyleSheet("padding: 4px 8px; font-size: 13px; border: 1px solid #45475a; border-radius: 4px; background: white;")
+        toolbar_row.addWidget(self.snr_search_edit)
+
+        toolbar_row.addStretch()
+
+        # CSV 导出按钮
+        self.export_snr_btn = QPushButton("导出SNR表(CSV)")
+        self.export_snr_btn.setToolTip("将当前卫星载噪比对比表(含三口瞬时值/均值/差值)导出为CSV文件")
+        self.export_snr_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; font-size: 13px; padding: 5px 14px; border-radius: 4px; } QPushButton:hover { background-color: #2ecc71; }")
+        toolbar_row.addWidget(self.export_snr_btn)
+
+        snr_layout.addLayout(toolbar_row)
+
+        # -------------------------------------------------------------------------
+        # 3. 原生交互式 QTableWidget 核心表格
+        # -------------------------------------------------------------------------
+        self.snr_table = QTableWidget()
+        self.snr_table.setColumnCount(13)
+        SNR_HEADERS = [
+            "星座", "PRN", "信号",
+            "串口1 瞬时", "串口1 均值",
+            "串口2 瞬时", "串口2 均值", "Δ (2-1)", "Δ2 均值",
+            "串口3 瞬时", "串口3 均值", "Δ (3-1)", "Δ3 均值"
+        ]
+        self.snr_table.setHorizontalHeaderLabels(SNR_HEADERS)
+        self.snr_table.verticalHeader().setVisible(False)
+        self.snr_table.verticalHeader().setDefaultSectionSize(28)
+        self.snr_table.setSortingEnabled(True)
+        self.snr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.snr_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.snr_table.setItemDelegate(SNRBarDelegate(self.snr_table))
+        self.snr_table.setAlternatingRowColors(True)
+
+        # 列宽与对齐设置 (适应放大后的 14px 字体与进度条)
+        header = self.snr_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        self.snr_table.setColumnWidth(0, 70)   # 星座
+        self.snr_table.setColumnWidth(1, 55)   # PRN
+        self.snr_table.setColumnWidth(2, 70)   # 信号
+        self.snr_table.setColumnWidth(3, 135)  # COM1 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(4, 90)   # COM1 均值
+        self.snr_table.setColumnWidth(5, 135)  # COM2 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(6, 90)   # COM2 均值
+        self.snr_table.setColumnWidth(7, 95)   # Δ(2-1)
+        self.snr_table.setColumnWidth(8, 90)   # Δ2 均值
+        self.snr_table.setColumnWidth(9, 135)  # COM3 瞬时(数字+微型条)
+        self.snr_table.setColumnWidth(10, 90)  # COM3 均值
+        self.snr_table.setColumnWidth(11, 95)  # Δ(3-1)
+        self.snr_table.setColumnWidth(12, 90)  # Δ3 均值
+
+        self.snr_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #181825;
+                alternate-background-color: #1e1e2e;
+                color: #cdd6f4;
+                gridline-color: #313244;
+                font-family: Consolas, 'Segoe UI', monospace;
+                font-size: 14px;
+                border: 1px solid #313244;
+                border-radius: 4px;
+            }
+            QHeaderView::section {
+                background-color: #313244;
+                color: #d8dee9;
+                font-weight: bold;
+                font-size: 13px;
+                padding: 5px 6px;
+                border: 1px solid #434c5e;
+            }
+            QTableWidget::item:selected {
+                background-color: #45475a;
+                color: #ffffff;
+            }
+        """)
+        self.snr_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.snr_table.customContextMenuRequested.connect(self._show_snr_table_context_menu)
+        snr_layout.addWidget(self.snr_table, 1)
+
+        # 底部图例说明行
+        legend_row = QHBoxLayout()
+        legend_lbl = QLabel(
+            "载噪比图例: "
+            "<span style='color:#f38ba8;'>■ &lt;24</span> &nbsp;"
+            "<span style='color:#fab387;'>■ 24~29</span> &nbsp;"
+            "<span style='color:#f9e2af;'>■ 30~35</span> &nbsp;"
+            "<span style='color:#94e2d5;'>■ 36~41</span> &nbsp;"
+            "<span style='color:#a6e3a1;'>■ ≥42 dB-Hz</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            "恶化差值: <span style='color:#fab387;font-weight:bold;'>|Δ|≥10dB 橙色预警</span> &nbsp;·&nbsp; "
+            "<span style='color:#f38ba8;font-weight:bold;'>|Δ|≥15dB 红色告警</span>"
+        )
+        legend_lbl.setStyleSheet("font-size: 13px; color: #a6adc8;")
+        legend_row.addWidget(legend_lbl)
+        legend_row.addStretch()
+        snr_layout.addLayout(legend_row)
+
+        table_layout.addWidget(snr_box, 3)
+
+        # -------------------------------------------------------------------------
+        # 标签页 2：独立原始数据流监视区 (可暂停冻结、带语句协议过滤)
+        # -------------------------------------------------------------------------
+        self.stream_tab = QWidget()
+        stream_layout = QVBoxLayout(self.stream_tab)
+        stream_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_box = QGroupBox("实时串口信息流")
+        preview_box = self.preview_box
+        preview_font = QFont(preview_box.font())
+        preview_font.setPointSize(15)
+        preview_font.setBold(True)
+        preview_box.setFont(preview_font)
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(10, 10, 10, 10)
+
+        preview_ctrl_row = QHBoxLayout()
+        self.pause_preview_cb = QCheckBox("⏸ 暂停滚动 (Pause)")
+        self.pause_preview_cb.setToolTip("勾选后暂停界面滚动输出，便于鼠标选中、检查和复制语句。后台数据解析与文件记录照常进行。")
+        self.pause_preview_cb.setStyleSheet("font-weight: bold; color: #2980b9; font-size: 15px;")
+        preview_ctrl_row.addWidget(self.pause_preview_cb)
+
+        preview_ctrl_row.addSpacing(10)
+        self.preview_filter_label = QLabel("协议过滤:")
+        self.preview_filter_label.setStyleSheet("font-size: 15px;")
+        preview_ctrl_row.addWidget(self.preview_filter_label)
+        self.preview_filter_combo = QComboBox()
+        self.preview_filter_combo.addItems(["全部", "仅 GGA", "仅 GSV", "仅 RMC", "仅 UBX"])
+        self.preview_filter_combo.setStyleSheet("font-size: 15px; padding: 5px 9px;")
+        preview_ctrl_row.addWidget(self.preview_filter_combo)
+
+        self.clear_preview_btn = QPushButton("清空预览")
+        self.clear_preview_btn.setStyleSheet("padding: 6px 12px; font-size: 15px;")
+        self.clear_preview_btn.clicked.connect(self.clear_data_preview)
+        preview_ctrl_row.addWidget(self.clear_preview_btn)
+
+        preview_ctrl_row.addStretch()
+        preview_layout.addLayout(preview_ctrl_row)
+
+        self.data_preview = QTextEdit()
+        self.data_preview.setReadOnly(True)
+        self.data_preview.setStyleSheet("font-family: Consolas; font-size: 15px; background-color: #fafafa;")
+        self.data_preview.setPlaceholderText("数据预览区域...")
+        self.data_preview.setMinimumHeight(400)
+        preview_layout.addWidget(self.data_preview)
+
+        stream_layout.addWidget(preview_box)
+        
+        # =========================================================================
+        # 标签页 3：功能与控制面板 (串口管理、状态监视、ENU配置与报告导出)
+        # =========================================================================
+        control_tab = QWidget()
+        control_tab_layout = QVBoxLayout(control_tab)
+        control_tab_layout.setContentsMargins(0, 0, 0, 0)
+        control_tab_layout.setSpacing(0)
+
+        # 加装 QScrollArea 容器，防止在小分辨率或笔记本高DPI屏幕下界面内容被垂直挤压截断
+        self.control_scroll = QScrollArea()
+        self.control_scroll.setWidgetResizable(True)
+        self.control_scroll.setFrameShape(QFrame.NoFrame)
+        self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        control_content_widget = QWidget()
+        control_layout = QVBoxLayout(control_content_widget)
+        control_layout.setContentsMargins(8, 8, 8, 8)
+        control_layout.setSpacing(8)
+        
+        # -------------------------------------------------------------------------
+        # 1. 串口连接面板：三口合一紧凑网格（行=串口, 列=串口号/波特率/操作/状态）
+        # -------------------------------------------------------------------------
+        BAUD_RATES = ["9600", "19200", "38400", "57600", "115200",
+                      "230400", "460800", "921600"]
+        PORT_NAMES = {1: "串口1 (无干扰)", 2: "串口2 (干扰测试)", 3: "串口3 (干扰测试2)"}
+
+        ports_box = QGroupBox("串口连接")
+        ports_grid = QGridLayout(ports_box)
+        ports_grid.addWidget(QLabel("串口"), 0, 0)
+        ports_grid.addWidget(QLabel("串口号"), 0, 1)
+        ports_grid.addWidget(QLabel("波特率"), 0, 2)
+        ports_grid.addWidget(QLabel("操作"), 0, 3, 1, 3)
+        ports_grid.addWidget(QLabel("状态"), 0, 6)
+
+        # 动态构建三路串口的下拉框、控制按钮与状态标签
+        for pid in (1, 2, 3):
+            row = pid
+            ports_grid.addWidget(QLabel(PORT_NAMES[pid]), row, 0)
+
+            combo = QComboBox()
+            setattr(self, f"port{pid}_combo", combo)
+            ports_grid.addWidget(combo, row, 1)
+
+            baud = QComboBox()
+            baud.addItems(BAUD_RATES)
+            baud.setCurrentText("9600")
+            setattr(self, f"port{pid}_baud", baud)
+            ports_grid.addWidget(baud, row, 2)
+
+            refresh_btn = QPushButton("刷新")
+            connect_btn = QPushButton("连接")
+            disconnect_btn = QPushButton("断开")
+            disconnect_btn.setEnabled(False)
+            setattr(self, f"port{pid}_refresh_btn", refresh_btn)
+            setattr(self, f"port{pid}_connect_btn", connect_btn)
+            setattr(self, f"port{pid}_disconnect_btn", disconnect_btn)
+            btn_row = QHBoxLayout()
+            btn_row.addWidget(refresh_btn)
+            btn_row.addWidget(connect_btn)
+            btn_row.addWidget(disconnect_btn)
+            ports_grid.addLayout(btn_row, row, 3, 1, 3)
+
+            status_label = QLabel("未连接")
+            status_label.setStyleSheet("color: red; font-weight: bold;")
+            setattr(self, f"port{pid}_status_label", status_label)
+            ports_grid.addWidget(status_label, row, 6)
+
+        ports_grid.setColumnStretch(1, 1)
+        control_layout.addWidget(ports_box)
+
+        # -------------------------------------------------------------------------
+        # 2. 三串口 GGA 实时状态面板：串口1（参考基准）、串口2（干扰1）、串口3（干扰2）
+        # -------------------------------------------------------------------------
+        port_stats_layout = QHBoxLayout()
+
+        # 串口1状态卡片 (参考机 / 无干扰基准通道)
+        port1_stats = QGroupBox("串口1 GGA 状态")
+        p1_grid = QGridLayout(port1_stats)
+        p1_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
+        self.p1_utc_label = QLabel("-")
+        self.p1_utc_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p1_grid.addWidget(self.p1_utc_label, 0, 1)
+        p1_grid.addWidget(QLabel("纬度 (°):"), 1, 0)
+        self.p1_lat_label = QLabel("-")
+        self.p1_lat_label.setStyleSheet("font-weight: bold;")
+        p1_grid.addWidget(self.p1_lat_label, 1, 1)
+        p1_grid.addWidget(QLabel("经度 (°):"), 2, 0)
+        self.p1_lon_label = QLabel("-")
+        self.p1_lon_label.setStyleSheet("font-weight: bold;")
+        p1_grid.addWidget(self.p1_lon_label, 2, 1)
+        p1_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
+        self.p1_alt_label = QLabel("-")
+        self.p1_alt_label.setStyleSheet("font-weight: bold;")
+        p1_grid.addWidget(self.p1_alt_label, 3, 1)
+        p1_grid.addWidget(QLabel("定位状态:"), 4, 0)
+        self.p1_quality_label = QLabel("无数据")
+        self.p1_quality_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        p1_grid.addWidget(self.p1_quality_label, 4, 1)
+        p1_grid.addWidget(QLabel("卫星数:"), 5, 0)
+        self.p1_nsats_label = QLabel("0")
+        self.p1_nsats_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p1_grid.addWidget(self.p1_nsats_label, 5, 1)
+        p1_grid.addWidget(QLabel("UBX TTFF (s):"), 6, 0)
+        self.p1_ttff_label = QLabel("-")
+        self.p1_ttff_label.setStyleSheet("font-weight: bold; color: #8e44ad;")
+        p1_grid.addWidget(self.p1_ttff_label, 6, 1)
+        port_stats_layout.addWidget(port1_stats)
+
+        # 串口2状态卡片 (待测设备 DUT 1 / 干扰测试通道)
+        port2_stats = QGroupBox("串口2 GGA 状态")
+        p2_grid = QGridLayout(port2_stats)
+        p2_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
+        self.p2_utc_label = QLabel("-")
+        self.p2_utc_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p2_grid.addWidget(self.p2_utc_label, 0, 1)
+        p2_grid.addWidget(QLabel("纬度 (°):"), 1, 0)
+        self.p2_lat_label = QLabel("-")
+        self.p2_lat_label.setStyleSheet("font-weight: bold;")
+        p2_grid.addWidget(self.p2_lat_label, 1, 1)
+        p2_grid.addWidget(QLabel("经度 (°):"), 2, 0)
+        self.p2_lon_label = QLabel("-")
+        self.p2_lon_label.setStyleSheet("font-weight: bold;")
+        p2_grid.addWidget(self.p2_lon_label, 2, 1)
+        p2_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
+        self.p2_alt_label = QLabel("-")
+        self.p2_alt_label.setStyleSheet("font-weight: bold;")
+        p2_grid.addWidget(self.p2_alt_label, 3, 1)
+        p2_grid.addWidget(QLabel("定位状态:"), 4, 0)
+        self.p2_quality_label = QLabel("无数据")
+        self.p2_quality_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        p2_grid.addWidget(self.p2_quality_label, 4, 1)
+        p2_grid.addWidget(QLabel("卫星数:"), 5, 0)
+        self.p2_nsats_label = QLabel("0")
+        self.p2_nsats_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p2_grid.addWidget(self.p2_nsats_label, 5, 1)
+        p2_grid.addWidget(QLabel("UBX TTFF (s):"), 6, 0)
+        self.p2_ttff_label = QLabel("-")
+        self.p2_ttff_label.setStyleSheet("font-weight: bold; color: #8e44ad;")
+        p2_grid.addWidget(self.p2_ttff_label, 6, 1)
+        port_stats_layout.addWidget(port2_stats)
+
+        # 串口3状态卡片 (待测设备 DUT 2 / 干扰测试通道 2)
+        port3_stats = QGroupBox("串口3 GGA 状态")
+        p3_grid = QGridLayout(port3_stats)
+        p3_grid.addWidget(QLabel("UTC 时间:"), 0, 0)
+        self.p3_utc_label = QLabel("-")
+        self.p3_utc_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p3_grid.addWidget(self.p3_utc_label, 0, 1)
+        p3_grid.addWidget(QLabel("纬度 (°):"), 1, 0)
+        self.p3_lat_label = QLabel("-")
+        self.p3_lat_label.setStyleSheet("font-weight: bold;")
+        p3_grid.addWidget(self.p3_lat_label, 1, 1)
+        p3_grid.addWidget(QLabel("经度 (°):"), 2, 0)
+        self.p3_lon_label = QLabel("-")
+        self.p3_lon_label.setStyleSheet("font-weight: bold;")
+        p3_grid.addWidget(self.p3_lon_label, 2, 1)
+        p3_grid.addWidget(QLabel("海拔高程 (m):"), 3, 0)
+        self.p3_alt_label = QLabel("-")
+        self.p3_alt_label.setStyleSheet("font-weight: bold;")
+        p3_grid.addWidget(self.p3_alt_label, 3, 1)
+        p3_grid.addWidget(QLabel("定位状态:"), 4, 0)
+        self.p3_quality_label = QLabel("无数据")
+        self.p3_quality_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        p3_grid.addWidget(self.p3_quality_label, 4, 1)
+        p3_grid.addWidget(QLabel("卫星数:"), 5, 0)
+        self.p3_nsats_label = QLabel("0")
+        self.p3_nsats_label.setStyleSheet("font-weight: bold; color: #2980b9;")
+        p3_grid.addWidget(self.p3_nsats_label, 5, 1)
+        p3_grid.addWidget(QLabel("UBX TTFF (s):"), 6, 0)
+        self.p3_ttff_label = QLabel("-")
+        self.p3_ttff_label.setStyleSheet("font-weight: bold; color: #8e44ad;")
+        p3_grid.addWidget(self.p3_ttff_label, 6, 1)
+        port_stats_layout.addWidget(port3_stats)
+
+        control_layout.addLayout(port_stats_layout)
+
+        # -------------------------------------------------------------------------
+        # 3. ENU 基准值配置区域（全局共享基准点选择）
+        # -------------------------------------------------------------------------
+        control_layout.addWidget(self._create_enu_ref_box())
+
+        # -------------------------------------------------------------------------
+        # 4. ENU 空间直角坐标定位误差实时值显示 (东 E / 北 N / 天 U，单位: m)
+        # -------------------------------------------------------------------------
+        enu_val_box = QGroupBox("ENU 误差实时值")
+        enu_val_layout = QVBoxLayout(enu_val_box)
+
+        # ENU1 实时误差行 (参考机相对基准点偏移)
+        enu1_val_row = QHBoxLayout()
+        enu1_val_row.addWidget(QLabel("ENU1 (无干扰):"))
+        self.enu1_east_label = QLabel("东: -- m")
+        self.enu1_east_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        enu1_val_row.addWidget(self.enu1_east_label)
+        self.enu1_north_label = QLabel("北: -- m")
+        self.enu1_north_label.setStyleSheet("color: #2980b9; font-weight: bold;")
+        enu1_val_row.addWidget(self.enu1_north_label)
+        self.enu1_up_label = QLabel("天: -- m")
+        self.enu1_up_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        enu1_val_row.addWidget(self.enu1_up_label)
+        enu1_val_row.addStretch()
+        enu_val_layout.addLayout(enu1_val_row)
+
+        # ENU2 实时误差行 (待测设备1相对基准点偏移)
+        enu2_val_row = QHBoxLayout()
+        enu2_val_row.addWidget(QLabel("ENU2 (干扰测试):"))
+        self.enu2_east_label = QLabel("东: -- m")
+        self.enu2_east_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        enu2_val_row.addWidget(self.enu2_east_label)
+        self.enu2_north_label = QLabel("北: -- m")
+        self.enu2_north_label.setStyleSheet("color: #2980b9; font-weight: bold;")
+        enu2_val_row.addWidget(self.enu2_north_label)
+        self.enu2_up_label = QLabel("天: -- m")
+        self.enu2_up_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        enu2_val_row.addWidget(self.enu2_up_label)
+        enu2_val_row.addStretch()
+        enu_val_layout.addLayout(enu2_val_row)
+
+        # ENU3 实时误差行 (待测设备2相对基准点偏移)
+        enu3_val_row = QHBoxLayout()
+        enu3_val_row.addWidget(QLabel("ENU3 (干扰测试2):"))
+        self.enu3_east_label = QLabel("东: -- m")
+        self.enu3_east_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        enu3_val_row.addWidget(self.enu3_east_label)
+        self.enu3_north_label = QLabel("北: -- m")
+        self.enu3_north_label.setStyleSheet("color: #2980b9; font-weight: bold;")
+        enu3_val_row.addWidget(self.enu3_north_label)
+        self.enu3_up_label = QLabel("天: -- m")
+        self.enu3_up_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        enu3_val_row.addWidget(self.enu3_up_label)
+        enu3_val_row.addStretch()
+        enu_val_layout.addLayout(enu3_val_row)
+        control_layout.addWidget(enu_val_box)
+
+        # -------------------------------------------------------------------------
+        # 5. ENU 滑动窗口标准差统计 (显示当前定位离散度/稳定性 1-sigma，单位: m)
+        # -------------------------------------------------------------------------
+        enu_std_box = QGroupBox("ENU 标准差统计")
+        enu_std_layout = QVBoxLayout(enu_std_box)
+
+        # ENU1 标准差行
+        std_row1 = QHBoxLayout()
+        std_row1.addWidget(QLabel("ENU1 (无干扰):"))
+        self.enu1_std_east = QLabel("E: -- m")
+        self.enu1_std_east.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        std_row1.addWidget(self.enu1_std_east)
+        self.enu1_std_north = QLabel("N: -- m")
+        self.enu1_std_north.setStyleSheet("color: #2980b9; font-weight: bold;")
+        std_row1.addWidget(self.enu1_std_north)
+        self.enu1_std_up = QLabel("U: -- m")
+        self.enu1_std_up.setStyleSheet("color: #27ae60; font-weight: bold;")
+        std_row1.addWidget(self.enu1_std_up)
+        std_row1.addStretch()
+        enu_std_layout.addLayout(std_row1)
+
+        # ENU2 标准差行
+        std_row2 = QHBoxLayout()
+        std_row2.addWidget(QLabel("ENU2 (干扰测试):"))
+        self.enu2_std_east = QLabel("E: -- m")
+        self.enu2_std_east.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        std_row2.addWidget(self.enu2_std_east)
+        self.enu2_std_north = QLabel("N: -- m")
+        self.enu2_std_north.setStyleSheet("color: #2980b9; font-weight: bold;")
+        std_row2.addWidget(self.enu2_std_north)
+        self.enu2_std_up = QLabel("U: -- m")
+        self.enu2_std_up.setStyleSheet("color: #27ae60; font-weight: bold;")
+        std_row2.addWidget(self.enu2_std_up)
+        std_row2.addStretch()
+        enu_std_layout.addLayout(std_row2)
+
+        # ENU3 标准差行
+        std_row3 = QHBoxLayout()
+        std_row3.addWidget(QLabel("ENU3 (干扰测试2):"))
+        self.enu3_std_east = QLabel("E: -- m")
+        self.enu3_std_east.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        std_row3.addWidget(self.enu3_std_east)
+        self.enu3_std_north = QLabel("N: -- m")
+        self.enu3_std_north.setStyleSheet("color: #2980b9; font-weight: bold;")
+        std_row3.addWidget(self.enu3_std_north)
+        self.enu3_std_up = QLabel("U: -- m")
+        self.enu3_std_up.setStyleSheet("color: #27ae60; font-weight: bold;")
+        std_row3.addWidget(self.enu3_std_up)
+        std_row3.addStretch()
+        enu_std_layout.addLayout(std_row3)
+        control_layout.addWidget(enu_std_box)
+
+        # -------------------------------------------------------------------------
+        # 独立系统运行日志标签页 (展示连接、解析、异常与操作历史)
+        # -------------------------------------------------------------------------
+        self.log_tab = QWidget()
+        log_tab_layout = QVBoxLayout(self.log_tab)
+        log_tab_layout.setContentsMargins(8, 8, 8, 8)
+        self.log_box = QGroupBox("系统运行与调试日志")
+        log_box_font = QFont(self.log_box.font())
+        log_box_font.setPointSize(15)
+        log_box_font.setBold(True)
+        self.log_box.setFont(log_box_font)
+        log_layout = QVBoxLayout(self.log_box)
+        log_layout.setContentsMargins(10, 10, 10, 10)
+        self.log_window = QTextEdit()
+        self.log_window.setReadOnly(True)
+        self.log_window.setStyleSheet("font-family: Consolas; font-size: 14px;")
+        self.log_window.setMinimumHeight(400)
+        log_layout.addWidget(self.log_window)
+        log_tab_layout.addWidget(self.log_box)
+
+        # -------------------------------------------------------------------------
+        # 7. 测试基本信息录入区 (用于导出试验报告与 PDF 报表的元数据配置)
+        # -------------------------------------------------------------------------
+        self.test_report_tab = QWidget()
+        test_report_tab_layout = QVBoxLayout(self.test_report_tab)
+        test_report_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.test_report_scroll = QScrollArea()
+        self.test_report_scroll.setWidgetResizable(True)
+        self.test_report_scroll.setFrameShape(QFrame.NoFrame)
+        test_report_content = QWidget()
+        test_report_layout = QVBoxLayout(test_report_content)
+        test_report_layout.setContentsMargins(10, 10, 10, 10)
+        test_report_layout.setSpacing(12)
+
+        self.info_group = QGroupBox("测试基本信息")
+        info_group = self.info_group
+        info_layout = QGridLayout(info_group)
+
+        # 测试地点
+        info_layout.addWidget(QLabel("测试地点:"), 0, 0)
+        self.test_location_input = QLineEdit()
+        self.test_location_input.setPlaceholderText("例如: 长沙")
+        info_layout.addWidget(self.test_location_input, 0, 1)
+
+        # 待测设备 DUT 型号
+        info_layout.addWidget(QLabel("待测设备型号:"), 0, 2)
+        self.dut_model_input = QLineEdit()
+        self.dut_model_input.setPlaceholderText("例如: 双频八通道抗干扰天线")
+        info_layout.addWidget(self.dut_model_input, 0, 3)
+
+        # 天线阵列拓扑形式
+        info_layout.addWidget(QLabel("阵列形式:"), 1, 0)
+        self.array_form_combo = QComboBox()
+        self.array_form_combo.setEditable(True)
+        self.array_form_combo.addItems(["4 阵元", "7 阵元", "线阵", "面阵"])
+        info_layout.addWidget(self.array_form_combo, 1, 1)
+
+        # 干扰信号调制样式
+        info_layout.addWidget(QLabel("干扰类型:"), 1, 2)
+        self.jam_type_combo = QComboBox()
+        self.jam_type_combo.setEditable(True)
+        self.jam_type_combo.addItems(["线性扫频干扰", "宽带干扰", "单音干扰", "脉冲干扰", "窄带干扰", "多音干扰"])
+        info_layout.addWidget(self.jam_type_combo, 1, 3)
+
+        # 空间入射方位角
+        info_layout.addWidget(QLabel("入射方位:"), 2, 0)
+        self.azimuth_input = QLineEdit()
+        self.azimuth_input.setPlaceholderText("例如: 正东 / 正南 / 正西 / 正北")
+        info_layout.addWidget(self.azimuth_input, 2, 1)
+
+        # 干扰发射源与接收天线水平间距
+        info_layout.addWidget(QLabel("收发天线间距:"), 2, 2)
+        self.antenna_spacing_input = QLineEdit()
+        self.antenna_spacing_input.setPlaceholderText("例如: 3 m")
+        info_layout.addWidget(self.antenna_spacing_input, 2, 3)
+
+        # 接收天线架设离地高度
+        info_layout.addWidget(QLabel("天线架设高度:"), 3, 0)
+        self.antenna_height_input = QLineEdit()
+        self.antenna_height_input.setPlaceholderText("例如: 1.5 m")
+        info_layout.addWidget(self.antenna_height_input, 3, 1)
+
+        test_report_layout.addWidget(info_group)
+
+        # 控制面板拉伸比例分配: 仅GGA状态卡片可纵向伸缩，其余保持紧凑自适应
+        control_layout.setStretch(1, 1)
+
+        # -------------------------------------------------------------------------
+        # 8. 全局数据与日志操作中心
+        # -------------------------------------------------------------------------
+        self.action_box = QGroupBox("系统全局操作")
+        action_box = self.action_box
+        action_box_font = QFont(action_box.font())
+        action_box_font.setPointSize(15)
+        action_box_font.setBold(True)
+        action_box.setFont(action_box_font)
+        action_box.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 15px;
+                border: 1px solid #bdc3c7;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 14px;
+                background-color: #fafbfc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 10px;
+                background-color: #ecf0f1;
+                border-radius: 3px;
+                color: #2c3e50;
+                font-weight: bold;
+                font-size: 16px;
+            }
+        """)
+        action_layout = QVBoxLayout(action_box)
+        action_layout.setContentsMargins(10, 8, 10, 8)
+        action_layout.setSpacing(8)
+
+        # 第 1 行: 数据缓存维护与日志管理
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+
+        lbl_sec1 = QLabel("数据与日志:")
+        lbl_sec1.setStyleSheet("font-weight: bold; color: #495057; font-size: 16px;")
+        row1.addWidget(lbl_sec1)
+
+        # 清空数据：重置接收队列与全部统计缓存
+        self.clear_data_btn = QPushButton("清空数据")
+        self.clear_data_btn.setMinimumWidth(95)
+        self.clear_data_btn.setToolTip("清空数据预览区与三个串口的底层接收队列, 并重置全部统计累计值")
+        self.clear_data_btn.setStyleSheet("""
+            QPushButton { background-color: #fdf2f2; border: 1px solid #f8b4b4; color: #9b1c1c; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
+            QPushButton:hover { background-color: #fde8e8; border-color: #f05252; }
+        """)
+
+        # 重置统计：仅清除统计累计量，保留已有数据帧
+        self.reset_stats_btn = QPushButton("重置统计")
+        self.reset_stats_btn.setMinimumWidth(95)
+        self.reset_stats_btn.setToolTip("仅重置统计数据(ENU基准/SNR递推均值/方向统计等), 保留已有串口数据流缓存")
+        self.reset_stats_btn.setStyleSheet("""
+            QPushButton { background-color: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3; font-weight: bold; padding: 8px 14px; border-radius: 4px; font-size: 16px; }
+            QPushButton:hover { background-color: #e0e7ff; border-color: #818cf8; }
+        """)
+
+        # 清除日志：重置界面窗口文本
+        self.clear_log_btn = QPushButton("清除日志")
+        self.clear_log_btn.setMinimumWidth(95)
+        self.clear_log_btn.setToolTip("清空界面日志窗口显示内容(不影响本地自动落盘日志文件)")
+        self.clear_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
+
+        # 保存全部原始日志
+        self.save_all_log_btn = QPushButton("保存全部日志")
+        self.save_all_log_btn.setMinimumWidth(115)
+        self.save_all_log_btn.setToolTip("将三个串口的原始数据缓存合并导出为文本文件")
+        self.save_all_log_btn.setStyleSheet("padding: 8px 14px; font-size: 16px;")
+
+        row1.addWidget(self.clear_data_btn)
+        row1.addWidget(self.reset_stats_btn)
+        row1.addWidget(self.clear_log_btn)
+        row1.addWidget(self.save_all_log_btn)
+
+        row1.addSpacing(16)
+
+        # 自动落盘日志复选框 (默认勾选)
+        self.auto_log_cb = QCheckBox("自动保存原始日志")
+        self.auto_log_cb.setChecked(True)
+        self.auto_log_cb.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 16px;")
+        self.auto_log_cb.setToolTip("勾选后将三个串口收到的原始数据按时间戳实时自动保存到 log/ 目录")
+        row1.addWidget(self.auto_log_cb)
+
+        row1.addStretch()
+        action_layout.addLayout(row1)
+
+        # 独立报告导出与全链路脱机自动化自检区
+        self.report_group = QGroupBox("测试报告导出与系统自检")
+        report_group_font = QFont(self.report_group.font())
+        report_group_font.setPointSize(15)
+        report_group_font.setBold(True)
+        self.report_group.setFont(report_group_font)
+        report_layout = QVBoxLayout(self.report_group)
+        report_layout.setContentsMargins(10, 12, 10, 10)
+        row2 = QGridLayout()
+        row2.setSpacing(8)
+
+        lbl_sec2 = QLabel("报告与自检:")
+        lbl_sec2.setStyleSheet("font-weight: bold; color: #495057; font-size: 14px;")
+        row2.addWidget(lbl_sec2, 0, 0, 2, 1)
+
+        # 串口2独立测试报告导出按钮 (Markdown 与 PDF 格式)
+        self.export_report2_btn = QPushButton("📄 导出串口2报告 (MD)")
+        self.export_report2_btn.setMinimumWidth(155)
+        self.export_report2_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report2_btn.setToolTip("将串口2受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
+
+        self.export_pdf2_btn = QPushButton("📑 导出串口2报告 (PDF)")
+        self.export_pdf2_btn.setMinimumWidth(155)
+        self.export_pdf2_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf2_btn.setToolTip("将串口2受测机数据导出为带高清散点图的专业 PDF 测试报告")
+
+        # 串口3独立测试报告导出按钮 (Markdown 与 PDF 格式)
+        self.export_report3_btn = QPushButton("📄 导出串口3报告 (MD)")
+        self.export_report3_btn.setMinimumWidth(155)
+        self.export_report3_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #2ecc71; }")
+        self.export_report3_btn.setToolTip("将串口3受测机数据导出为 Markdown 测试报告 (含指标与对比表)")
+
+        self.export_pdf3_btn = QPushButton("📑 导出串口3报告 (PDF)")
+        self.export_pdf3_btn.setMinimumWidth(155)
+        self.export_pdf3_btn.setStyleSheet("QPushButton { background-color: #2980b9; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #3498db; }")
+        self.export_pdf3_btn.setToolTip("将串口3受测机数据导出为带高清散点图的专业 PDF 测试报告")
+
+        # 一键自检按钮（脱机闭环仿真测试）
+        self.selftest_btn = QPushButton("🚀 一键自检 (无串口)")
+        self.selftest_btn.setMinimumWidth(165)
+        self.selftest_btn.setStyleSheet("""
+            QPushButton { background-color: #8e44ad; color: white; font-weight: bold; padding: 7px 12px; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background-color: #9b59b6; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
+        """)
+        self.selftest_btn.setToolTip("无需真实串口: 使用随机生成的模拟导航数据(时长/倍率/种子可配)\n对解析/ENU/SNR/TTFF/方向测试/报告导出全链路进行自动化测试并输出验证清单")
+
+        row2.addWidget(self.export_report2_btn, 0, 1)
+        row2.addWidget(self.export_pdf2_btn, 0, 2)
+        row2.addWidget(self.export_report3_btn, 1, 1)
+        row2.addWidget(self.export_pdf3_btn, 1, 2)
+        row2.addWidget(self.selftest_btn, 2, 1, 1, 2)
+        row2.setColumnStretch(3, 1)
+
+        report_layout.addLayout(row2)
+        test_report_layout.addWidget(self.report_group)
+
+        # 统计口径说明：与实时算法保持一致，便于测试人员解释报表指标。
+        self.statistics_method_box = QGroupBox("统计方法说明")
+        method_box_font = QFont(self.statistics_method_box.font())
+        method_box_font.setPointSize(15)
+        method_box_font.setBold(True)
+        self.statistics_method_box.setFont(method_box_font)
+        method_layout = QVBoxLayout(self.statistics_method_box)
+        method_layout.setContentsMargins(10, 12, 10, 10)
+        self.statistics_method_text = QTextEdit()
+        self.statistics_method_text.setReadOnly(True)
+        self.statistics_method_text.setMinimumHeight(260)
+        self.statistics_method_text.setStyleSheet(
+            "QTextEdit { font-size: 14px; line-height: 1.45; "
+            "background: #fbfcfd; border: 1px solid #d5d8dc; padding: 8px; }"
+        )
+        self.statistics_method_text.setHtml("""
+            <ol style="margin-top: 2px;">
+              <li><b>ENU 独立参考点：</b>ENU1、ENU2、ENU3 默认分别使用各自前 100 个有效 GGA
+                  定位点的经度、纬度和高程均值建立参考点，三路参考点互不共用。</li>
+              <li><b>ENU 滑动标准差：</b>每个 E/N/U 分量只保留最近最多 200 个已接纳样本，
+                  使用总体标准差 σ = √[Σ(xᵢ − x̄)² / n]；样本少于 3 个时显示为 0。</li>
+              <li><b>ENU 异常值剔除：</b>累计至少 30 个已接纳样本后，仅当新值相对窗口均值的
+                  绝对偏差同时大于 8 m 且大于 10σ 时才剔除。被剔除值不进入曲线、窗口和后续统计。</li>
+              <li><b>单星 SNR 均值：</b>按真实完整 GSV 历元递推，x̄ₙ = x̄ₙ₋₁ +
+                  (xₙ − x̄ₙ₋₁) / n；按导航系统、卫星号和信号频点分别累计，界面刷新不重复计数。</li>
+              <li><b>串口 SNR 差值均值：</b>同星同频点配对后计算 Δ₂ = SNR₂ − SNR₁、
+                  Δ₃ = SNR₃ − SNR₁，再按真实历元分别递推求均值。</li>
+              <li><b>方向测试：</b>水平误差 H = √(E² + N²)，高程误差 V = |U|；有效定位历元计为成功，
+                  成功率 = 成功历元 / 总历元 × 100%。H/V 均值只统计成功历元，累计时长不包含暂停时段。</li>
+            </ol>
+        """)
+        method_layout.addWidget(self.statistics_method_text)
+        test_report_layout.addWidget(self.statistics_method_box)
+        test_report_layout.addStretch()
+        test_report_content.setMinimumHeight(test_report_layout.sizeHint().height())
+        self.test_report_scroll.setWidget(test_report_content)
+        test_report_tab_layout.addWidget(self.test_report_scroll)
+        self.action_controls = [
+            lbl_sec1, self.clear_data_btn, self.reset_stats_btn,
+            self.clear_log_btn, self.save_all_log_btn, self.auto_log_cb,
+        ]
+        for control in self.action_controls:
+            control_font = QFont(control.font())
+            control_font.setPointSize(16)
+            control.setFont(control_font)
+            control.setMinimumHeight(40)
+        self.report_controls = [
+            lbl_sec2, self.export_report2_btn, self.export_pdf2_btn,
+            self.export_report3_btn, self.export_pdf3_btn, self.selftest_btn,
+        ]
+        for control in self.report_controls:
+            control_font = QFont(control.font())
+            control_font.setPointSize(14)
+            control.setFont(control_font)
+            control.setMinimumHeight(36)
+        control_layout.addWidget(action_box)
+
+        # 组装滚动容器到控制面板页面中
+        self.control_scroll.setWidget(control_content_widget)
+        control_tab_layout.addWidget(self.control_scroll)
+        
+        # 默认展示控制面板(高频操作), 表格视图次之
+        self.tab_widget.addTab(control_tab, "功能与控制面板")
+        self.tab_widget.addTab(table_tab, "表格视图")
+        self.tab_widget.addTab(self.stream_tab, "串口实时数据流")
+        self.tab_widget.addTab(self.log_tab, "系统运行日志")
+        self.tab_widget.addTab(self.test_report_tab, "测试信息与报告")
+        
+        # =========================================================================
+        # 标签页 3：ENU 误差对比 (PyQtGraph 左右分屏对比三轴误差)
+        # =========================================================================
+        enu_comp_tab = QWidget()
+        enu_comp_layout = QVBoxLayout(enu_comp_tab)
+
+        # 顶部标题提示行
+        title_row = QHBoxLayout()
+        title_label12 = QLabel("ENU1 (无干扰) vs ENU2 (干扰测试)")
+        title_label12.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_label13 = QLabel("ENU1 (无干扰) vs ENU3 (干扰测试2)")
+        title_label13.setStyleSheet("font-weight: bold; font-size: 14px; color: #2c3e50;")
+        title_row.addWidget(title_label12)
+        title_row.addSpacing(40)
+        title_row.addWidget(title_label13)
+        title_row.addStretch()
+        enu_comp_layout.addLayout(title_row)
+
+        # 双列对称布局 (左侧 COM1 vs COM2, 右侧 COM1 vs COM3)
+        enu_comp_cols = QHBoxLayout()
+
+        # --- 左列图表: ENU1 (红实线) vs ENU2 (蓝实线) ---
+        left_col = QVBoxLayout()
+        left_col.setSpacing(2)
+
+        # 东向误差图 (East)
+        self.enu_comp12_east_plot = pg.PlotWidget()
+        self.enu_comp12_east_plot.setBackground('w')
+        self.enu_comp12_east_plot.setLabel('left', '东向', units='m')
+        self.enu_comp12_east_plot.showGrid(x=True, y=True)
+        self.enu_comp12_east_plot.addLegend()
+        self.enu1_east_curve = self.enu_comp12_east_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_east_curve = self.enu_comp12_east_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_east_plot)
+
+        # 北向误差图 (North)
+        self.enu_comp12_north_plot = pg.PlotWidget()
+        self.enu_comp12_north_plot.setBackground('w')
+        self.enu_comp12_north_plot.setLabel('left', '北向', units='m')
+        self.enu_comp12_north_plot.showGrid(x=True, y=True)
+        self.enu_comp12_north_plot.addLegend()
+        self.enu1_north_curve = self.enu_comp12_north_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_north_curve = self.enu_comp12_north_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_north_plot)
+
+        # 天向误差图 (Up)
+        self.enu_comp12_up_plot = pg.PlotWidget()
+        self.enu_comp12_up_plot.setBackground('w')
+        self.enu_comp12_up_plot.setLabel('left', '天向', units='m')
+        self.enu_comp12_up_plot.setLabel('bottom', '时间', units='s')
+        self.enu_comp12_up_plot.showGrid(x=True, y=True)
+        self.enu_comp12_up_plot.addLegend()
+        self.enu1_up_curve = self.enu_comp12_up_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu2_up_curve = self.enu_comp12_up_plot.plot([], [], pen='b', name='ENU2 (干扰测试)')
+        left_col.addWidget(self.enu_comp12_up_plot)
+
+        enu_comp_cols.addLayout(left_col)
+
+        # --- 右列图表: ENU1 (红实线) vs ENU3 (橙黄虚线) ---
+        right_col = QVBoxLayout()
+        right_col.setSpacing(2)
+
+        # 东向误差图 (East)
+        self.enu_comp13_east_plot = pg.PlotWidget()
+        self.enu_comp13_east_plot.setBackground('w')
+        self.enu_comp13_east_plot.setLabel('left', '东向', units='m')
+        self.enu_comp13_east_plot.showGrid(x=True, y=True)
+        self.enu_comp13_east_plot.addLegend()
+        self.enu1_13_east_curve = self.enu_comp13_east_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_east_curve = self.enu_comp13_east_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_east_plot)
+
+        # 北向误差图 (North)
+        self.enu_comp13_north_plot = pg.PlotWidget()
+        self.enu_comp13_north_plot.setBackground('w')
+        self.enu_comp13_north_plot.setLabel('left', '北向', units='m')
+        self.enu_comp13_north_plot.showGrid(x=True, y=True)
+        self.enu_comp13_north_plot.addLegend()
+        self.enu1_13_north_curve = self.enu_comp13_north_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_north_curve = self.enu_comp13_north_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_north_plot)
+
+        # 天向误差图 (Up)
+        self.enu_comp13_up_plot = pg.PlotWidget()
+        self.enu_comp13_up_plot.setBackground('w')
+        self.enu_comp13_up_plot.setLabel('left', '天向', units='m')
+        self.enu_comp13_up_plot.setLabel('bottom', '时间', units='s')
+        self.enu_comp13_up_plot.showGrid(x=True, y=True)
+        self.enu_comp13_up_plot.addLegend()
+        self.enu1_13_up_curve = self.enu_comp13_up_plot.plot([], [], pen='r', name='ENU1 (无干扰)')
+        self.enu3_up_curve = self.enu_comp13_up_plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+        right_col.addWidget(self.enu_comp13_up_plot)
+
+        enu_comp_cols.addLayout(right_col)
+
+        enu_comp_layout.addLayout(enu_comp_cols)
+        self.tab_widget.addTab(enu_comp_tab, "ENU 误差对比")
+        
+        # =========================================================================
+        # 标签页 4：方向测试 (转台测试各方向统计汇总与控制面板)
+        # =========================================================================
+        direction_tab = self._create_direction_tab()
+        self.tab_widget.addTab(direction_tab, "方向测试")
+
+        # =========================================================================
+        # 标签页 5：各方向 ENU 误差对比 (四向 ENU 曲线多子图)
+        # =========================================================================
+        dir_enu_tab = self._create_dir_enu_tab()
+        self.tab_widget.addTab(dir_enu_tab, "方向ENU对比")
+        
+        # 将QTabWidget添加到主窗口垂直布局中
+        main_layout.addWidget(self.tab_widget)
+
+        # 构建窗口顶部原生菜单栏与全局快捷键
+        self._create_menu_bar()
+
+        # =========================================================================
+        # 底部系统状态栏 (QStatusBar)：串口连接指示灯、吞吐速率、自检进度
+        # =========================================================================
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+        # 串口1连接状态指示灯与文字
+        self.port1_indicator = QLabel("串口1: ● 未连接")
+        self.port1_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.status_bar.addWidget(self.port1_indicator)
+
+        sep1 = QLabel("|")
+        sep1.setStyleSheet("color: #666;")
+        self.status_bar.addWidget(sep1)
+
+        # 串口2连接状态指示灯与文字
+        self.port2_indicator = QLabel("串口2: ● 未连接")
+        self.port2_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.status_bar.addWidget(self.port2_indicator)
+
+        sep3 = QLabel("|")
+        sep3.setStyleSheet("color: #666;")
+        self.status_bar.addWidget(sep3)
+
+        # 串口3连接状态指示灯与文字
+        self.port3_indicator = QLabel("串口3: ● 未连接")
+        self.port3_indicator.setStyleSheet("color: red; font-weight: bold; font-size: 13px; padding: 0 10px;")
+        self.status_bar.addWidget(self.port3_indicator)
+
+        sep4 = QLabel("|")
+        sep4.setStyleSheet("color: #666;")
+        self.status_bar.addWidget(sep4)
+
+        # 数据接收速率指示器（每2秒统计滑动窗口内接收的 行/s，便于即时发现串口假死或波特率不匹配）
+        self.rate_label = QLabel("速率: 1:-- | 2:-- | 3:-- 行/s")
+        self.rate_label.setStyleSheet("font-size: 12px; color: #666; padding: 0 6px;")
+        self.status_bar.addPermanentWidget(self.rate_label)
+
+        # 全链路脱机自检进度条与取消控制按钮（自检模式激活时动态显示）
+        self.selftest_progress = QProgressBar()
+        self.selftest_progress.setRange(0, 100)
+        self.selftest_progress.setMaximumWidth(160)
+        self.selftest_progress.setToolTip("自检回放进度（取三路模拟数据最小进度）")
+        self.selftest_progress.setVisible(False)
+        self.status_bar.addPermanentWidget(self.selftest_progress)
+
+        self.selftest_cancel_btn = QPushButton("取消自检")
+        self.selftest_cancel_btn.setToolTip("提前终止自检并按已回放数据生成验证报告")
+        self.selftest_cancel_btn.setVisible(False)
+        self.status_bar.addPermanentWidget(self.selftest_cancel_btn)
+
+        # 累计处理的 NMEA/UBX 数据行数统计
+        self.data_count_label = QLabel("已读取: 0 行")
+        self.data_count_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.status_bar.addPermanentWidget(self.data_count_label)
+    
+    def setup_connections(self):
+        # 串口1
+        self.port1_refresh_btn.clicked.connect(lambda: self.refresh_serial_ports(1))
+        self.port1_connect_btn.clicked.connect(lambda: self.connect_serial(1))
+        self.port1_disconnect_btn.clicked.connect(lambda: self.disconnect_serial(1))
+
+        # 串口2
+        self.port2_refresh_btn.clicked.connect(lambda: self.refresh_serial_ports(2))
+        self.port2_connect_btn.clicked.connect(lambda: self.connect_serial(2))
+        self.port2_disconnect_btn.clicked.connect(lambda: self.disconnect_serial(2))
+
+        # [新增] 串口3按钮连接
+        self.port3_refresh_btn.clicked.connect(lambda: self.refresh_serial_ports(3))
+        self.port3_connect_btn.clicked.connect(lambda: self.connect_serial(3))
+        self.port3_disconnect_btn.clicked.connect(lambda: self.disconnect_serial(3))
+
+        self.clear_log_btn.clicked.connect(self.clear_log)
+        self.save_all_log_btn.clicked.connect(self._save_all_serial_logs)
+
+        self.export_report2_btn.clicked.connect(self.export_test_report2)
+        self.export_pdf2_btn.clicked.connect(self.export_pdf_report2)
+        self.export_report3_btn.clicked.connect(self.export_test_report3)
+        self.export_pdf3_btn.clicked.connect(self.export_pdf_report3)
+        self.selftest_btn.clicked.connect(self._open_selftest_dialog)
+
+        self.auto_log_cb.stateChanged.connect(self._on_auto_log_toggled)
+
+        # 自检取消按钮
+        self.selftest_cancel_btn.clicked.connect(self._cancel_selftest)
+
+        # SNR表导出与交互式筛选检索信号连接
+        self.export_snr_btn.clicked.connect(self._export_snr_csv)
+        self.snr_filter_group.buttonClicked.connect(lambda: self._apply_snr_filters())
+        self.snr_filter_warn_cb.stateChanged.connect(lambda: self._apply_snr_filters())
+        self.snr_search_edit.textChanged.connect(lambda: self._apply_snr_filters())
+
+        # ENU基准模式切换（共享控制）
+        self._enu_btn_group = QButtonGroup()
+        self._enu_btn_group.addButton(self.enu_auto_radio)
+        self._enu_btn_group.addButton(self.enu_instant_radio)
+        self._enu_btn_group.addButton(self.enu_manual_radio)
+        self._enu_btn_group.buttonClicked.connect(lambda btn: self._enu_mode_changed())
+        self.enu_apply_btn.clicked.connect(self._apply_enu_manual_ref)
+
+        # 统计操作
+        self.reset_stats_btn.clicked.connect(self.reset_all_stats)
+        self.clear_data_btn.clicked.connect(self.clear_all_data)
+
+        # 模块信号
+        self.serial_port1.data_received.connect(self.handle_data)
+        self.serial_port1.connection_status.connect(self.update_connection_status)
+        self.serial_port1.error_occurred.connect(self.handle_serial_error)
+
+        self.serial_port2.data_received.connect(self.handle_data)
+        self.serial_port2.connection_status.connect(self.update_connection_status)
+        self.serial_port2.error_occurred.connect(self.handle_serial_error)
+
+        self.serial_port1.ubx_received.connect(self.handle_ubx)
+        self.serial_port2.ubx_received.connect(self.handle_ubx)
+
+        # [新增] 串口3模块信号
+        self.serial_port3.data_received.connect(self.handle_data)
+        self.serial_port3.connection_status.connect(self.update_connection_status)
+        self.serial_port3.error_occurred.connect(self.handle_serial_error)
+        self.serial_port3.ubx_received.connect(self.handle_ubx)
+
+        # 串口重连状态消息（指数退避重试过程对用户可见）
+        self.serial_port1.status_message.connect(self.handle_serial_status)
+        self.serial_port2.status_message.connect(self.handle_serial_status)
+        self.serial_port3.status_message.connect(self.handle_serial_status)
+
+
+    
+    def refresh_serial_ports(self, port_id=1):
+        if port_id == 1:
+            combo = self.port1_combo
+            manager = self.serial_port1
+        elif port_id == 2:
+            combo = self.port2_combo
+            manager = self.serial_port2
+        else:  # [新增] port_id == 3
+            combo = self.port3_combo
+            manager = self.serial_port3
+        combo.clear()
+        ports = manager.get_available_ports()
+        if ports:
+            combo.addItems(ports)
+        else:
+            self.log_info(f"串口{port_id}: 未检测到可用串口")
+    
+    def connect_serial(self, port_id=1):
+        if port_id == 1:
+            manager = self.serial_port1
+            combo = self.port1_combo
+            baud_widget = self.port1_baud
+        elif port_id == 2:
+            manager = self.serial_port2
+            combo = self.port2_combo
+            baud_widget = self.port2_baud
+        else:  # [新增] port_id == 3
+            manager = self.serial_port3
+            combo = self.port3_combo
+            baud_widget = self.port3_baud
+
+        port = combo.currentText()
+        baud = int(baud_widget.currentText())
+
+        if not port:
+            QMessageBox.warning(self, "警告", f"请选择串口{port_id}的串口号")
+            return
+
+        if not manager.connect(port, baud):
+            return
+
+        if port_id == 1:
+            self.clear_data_preview()
+            self.current_data_source = 'serial'
+            self.current_parser = self.nmea_parser
+
+        self.update_timer.start()
+
+    def disconnect_serial(self, port_id=1):
+        if port_id == 1:
+            manager = self.serial_port1
+        elif port_id == 2:
+            manager = self.serial_port2
+        else:  # [新增] port_id == 3
+            manager = self.serial_port3
+        manager.disconnect()
+        # [新增] 三个串口均断开时停止定时器
+        if not self.serial_port1.serial_port and not self.serial_port2.serial_port and not self.serial_port3.serial_port:
+            self.update_timer.stop()
+
+    def update_connection_status(self, connected, port_id):
+        if port_id == 1:
+            indicator = self.port1_indicator
+            status_label = self.port1_status_label
+            connect_btn = self.port1_connect_btn
+            disconnect_btn = self.port1_disconnect_btn
+            prefix = "串口1"
+        elif port_id == 2:
+            indicator = self.port2_indicator
+            status_label = self.port2_status_label
+            connect_btn = self.port2_connect_btn
+            disconnect_btn = self.port2_disconnect_btn
+            prefix = "串口2"
+        else:  # [新增] port_id == 3
+            indicator = self.port3_indicator
+            status_label = self.port3_status_label
+            connect_btn = self.port3_connect_btn
+            disconnect_btn = self.port3_disconnect_btn
+            prefix = "串口3"
+
+        if connected:
+            indicator.setText(f"{prefix}: ● 已连接")
+            indicator.setStyleSheet("color: green; font-weight: bold; font-size: 12px; padding: 0 10px;")
+            status_label.setText("已连接")
+            status_label.setStyleSheet("color: green; font-weight: bold;")
+            connect_btn.setEnabled(False)
+            disconnect_btn.setEnabled(True)
+            self.log_info(f"{prefix} 连接成功")
+        else:
+            indicator.setText(f"{prefix}: ● 未连接")
+            indicator.setStyleSheet("color: red; font-weight: bold; font-size: 12px; padding: 0 10px;")
+            status_label.setText("未连接")
+            status_label.setStyleSheet("color: red; font-weight: bold;")
+            connect_btn.setEnabled(True)
+            disconnect_btn.setEnabled(False)
+            self.log_info(f"{prefix} 已断开")
+
+    def handle_serial_error(self, error_message, port_id):
+        self.log_error(error_message)
+
+    def handle_serial_status(self, message, port_id):
+        self.log_info(f"[串口{port_id}] {message}")
+
+    def handle_ubx(self, frame, port_id):
+        msg_type, data = parse_ubx_frame(frame)
+        if msg_type != 'NAV_STATUS' or data is None:
+            return
+
+        ttff_s = data['ttff_s']
+
+        if port_id == 1:
+            self.p1_ttff_s = ttff_s
+            if ttff_s > 0:
+                self.p1_ttff_label.setText(f"{ttff_s:.1f}")
+            else:
+                self.p1_ttff_label.setText("0.0 (冷启动中)")
+        elif port_id == 2:
+            self.p2_ttff_s = ttff_s
+            if ttff_s > 0:
+                self.p2_ttff_label.setText(f"{ttff_s:.1f}")
+            else:
+                self.p2_ttff_label.setText("0.0 (冷启动中)")
+        else:  # [新增] port_id == 3
+            self.p3_ttff_s = ttff_s
+            if ttff_s > 0:
+                self.p3_ttff_label.setText(f"{ttff_s:.1f}")
+            else:
+                self.p3_ttff_label.setText("0.0 (冷启动中)")
+    
+    @staticmethod
+    def _dmm_to_dd(dmm, direction):
+        degrees = int(dmm // 100)
+        minutes = dmm % 100
+        value = degrees + minutes / 60.0
+        if direction in ('S', 'W'):
+            value = -value
+        return value
+
+    @staticmethod
+    def _snr_sort_key(key):
+        talker, signal_id, prn = key
+        return talker, prn, signal_id
+
+    @staticmethod
+    def _snr_key_parts(key):
+        return key[0], key[1], key[2]
+
+    def _sync_gsv_snapshot(self, port_id, parser):
+        """在完整 GSV 历元提交后原子更新当前快照并按真实历元采样均值。"""
+        if parser.gsv_sequence == self._last_gsv_sequence.get(port_id, 0):
+            return
+        self._last_gsv_sequence[port_id] = parser.gsv_sequence
+
+        snapshot = parser.get_satellite_snapshot()
+        satellites = {}
+        signals = {}
+        for key, sat in snapshot.items():
+            talker, signal_id, prn = key
+            snr = sat.get('snr', 0)
+            if prn and 0 < snr <= 99:
+                satellites[key] = snr
+                system_key = TALKER_TO_SYSTEM.get(talker, 'G')
+                system_signals = SIGNAL_NAMES.get(system_key, SIGNAL_NAMES['G'])
+                signals[key] = system_signals.get(signal_id, f'S{signal_id}')
+
+        avg = {1: self._port1_snr_avg, 2: self._port2_snr_avg, 3: self._port3_snr_avg}[port_id]
+        for key in parser.last_gsv_commit_keys:
+            if key in satellites:
+                avg.add(key, satellites[key])
+
+        if port_id == 1:
+            self.port1_satellites = satellites
+            self._port1_snr_signals = signals
+        elif port_id == 2:
+            self.port2_satellites = satellites
+            self._port2_snr_signals = signals
+            for key in parser.last_gsv_commit_keys:
+                if key in satellites and key in self.port1_satellites:
+                    self._snr_diff_avg.add(key, satellites[key] - self.port1_satellites[key])
+        else:
+            self.port3_satellites = satellites
+            self._port3_snr_signals = signals
+            for key in parser.last_gsv_commit_keys:
+                if key in satellites and key in self.port1_satellites:
+                    self._snr_diff2_avg.add(key, satellites[key] - self.port1_satellites[key])
+
+    def handle_data(self, data, port_id=1):
+        self._rate_counters[port_id] = self._rate_counters.get(port_id, 0) + 1
+        if port_id == 2:
+            self.serial2_save_buffer.append(data)
+            self._write_auto_log(2, data)
+
+            self._data_count_update += 1
+            if self._data_count_update >= self._DATA_COUNT_INTERVAL:
+                total = len(self.serial2_save_buffer) + len(self.serial_save_buffer) + len(self.serial3_save_buffer)
+                self.data_count_label.setText(f"已读取: {total} 行")
+                self._data_count_update = 0
+
+            decoded = self.nmea_parser2.decode_line(data) if self.nmea_parser2 else None
+            if decoded:
+                self._append_data_preview(f"[串口2] {decoded.strip()}", port_id=2)
+
+                if any(decoded.startswith(p) for p in
+                       ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
+                    self.nmea_parser2.parse(decoded)
+                    self._sync_gsv_snapshot(2, self.nmea_parser2)
+
+            # 解析GGA获取定位状态
+            if decoded.startswith('$GNGGA') or decoded.startswith('$GPGGA') or \
+               decoded.startswith('$BDGGA') or decoded.startswith('$GLGGA') or \
+               decoded.startswith('$GAGGA') or decoded.startswith('$GBGGA'):
+                self.nmea_parser2.parse(decoded)
+                if self.nmea_parser2.gpgga_data:
+                    gga = self.nmea_parser2.gpgga_data[-1]
+                    lat_str = gga.get('latitude', '')
+                    lon_str = gga.get('longitude', '')
+                    lat_dir = gga.get('lat_dir', 'N')
+                    lon_dir = gga.get('lon_dir', 'E')
+                    p2_lat = self._dmm_to_dd(float(lat_str) if lat_str else 0.0, lat_dir) or 0.0
+                    p2_lon = self._dmm_to_dd(float(lon_str) if lon_str else 0.0, lon_dir) or 0.0
+
+                    self.p2_lat_label.setText(f"{p2_lat:.8f}")
+                    self.p2_lon_label.setText(f"{p2_lon:.8f}")
+                    alt = float(gga.get('altitude', 0))
+                    self.p2_alt_label.setText(f"{alt:.3f}")
+                    q = int(gga.get('fix_quality', 0))
+                    quality_text = {0: "无效", 1: "单点定位", 2: "单点定位", 3: "无效PPS", 4: "RTK固定", 5: "RTK浮点", 6: "正在估算"}
+                    self.p2_quality_label.setText(quality_text.get(q, f"未知({q})"))
+                    self.p2_quality_label.setStyleSheet(
+                        "font-weight: bold; color: #e74c3c;" if q == 0 else
+                        "font-weight: bold; color: #f39c12;" if q == 1 else
+                        "font-weight: bold; color: #2980b9;" if q == 2 else
+                        "font-weight: bold; color: #27ae60;"
+                    )
+                    ts = gga.get('timestamp', '')
+                    if ts:
+                        self.p2_utc_label.setText(ts)
+                        self.p2_utc_ts = ts
+                    gga_sats = int(gga.get('satellites_used', 0))
+                    self.p2_nsats_label.setText(str(gga_sats))
+                    self.p2_gga_nsat = gga_sats
+
+                    self._latest_p2_quality = q
+                    self._p2_gga_new_epoch = True
+
+                    if q > 0:
+                        self._feed_enu2_buffer(p2_lat, p2_lon, alt)
+                        self._calc_and_update_enu2(p2_lat, p2_lon, alt,
+                            self.enu2_ref_point, self.enu2_ref_ready,
+                            self.enu2_east_label, self.enu2_north_label, self.enu2_up_label,
+                            self.enu2_times, self.enu2_east_data, self.enu2_north_data, self.enu2_up_data,
+                            self._std_enu2_east, self._std_enu2_north, self._std_enu2_up, "ENU2")
+                        self._update_enu_std()
+                    else:
+                        self._latest_enu2_east = None
+                        self._latest_enu2_north = None
+                        self._latest_enu2_up = None
+
+            if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
+                self.nmea_parser2.parse(decoded)
+            if decoded.startswith('#OBSV'):
+                self.nmea_parser2.parse(decoded)
+            return
+
+        # [新增] 串口3数据：完整处理（与串口2完全对称）
+        if port_id == 3:
+            self.serial3_save_buffer.append(data)
+            self._write_auto_log(3, data)
+
+            self._data_count_update += 1
+            if self._data_count_update >= self._DATA_COUNT_INTERVAL:
+                total = len(self.serial3_save_buffer) + len(self.serial2_save_buffer) + len(self.serial_save_buffer)
+                self.data_count_label.setText(f"已读取: {total} 行")
+                self._data_count_update = 0
+
+            decoded = self.nmea_parser3.decode_line(data) if self.nmea_parser3 else None
+            if decoded:
+                self._append_data_preview(f"[串口3] {decoded.strip()}", port_id=3)
+
+                if any(decoded.startswith(p) for p in
+                       ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
+                    self.nmea_parser3.parse(decoded)
+                    self._sync_gsv_snapshot(3, self.nmea_parser3)
+
+            # 解析GGA获取定位状态
+            if decoded.startswith('$GNGGA') or decoded.startswith('$GPGGA') or \
+               decoded.startswith('$BDGGA') or decoded.startswith('$GLGGA') or \
+               decoded.startswith('$GAGGA') or decoded.startswith('$GBGGA'):
+                self.nmea_parser3.parse(decoded)
+                if self.nmea_parser3.gpgga_data:
+                    gga = self.nmea_parser3.gpgga_data[-1]
+                    lat_str = gga.get('latitude', '')
+                    lon_str = gga.get('longitude', '')
+                    lat_dir = gga.get('lat_dir', 'N')
+                    lon_dir = gga.get('lon_dir', 'E')
+                    p3_lat = self._dmm_to_dd(float(lat_str) if lat_str else 0.0, lat_dir) or 0.0
+                    p3_lon = self._dmm_to_dd(float(lon_str) if lon_str else 0.0, lon_dir) or 0.0
+
+                    self.p3_lat_label.setText(f"{p3_lat:.8f}")
+                    self.p3_lon_label.setText(f"{p3_lon:.8f}")
+                    alt = float(gga.get('altitude', 0))
+                    self.p3_alt_label.setText(f"{alt:.3f}")
+                    q = int(gga.get('fix_quality', 0))
+                    quality_text = {0: "无效", 1: "单点定位", 2: "单点定位", 3: "无效PPS", 4: "RTK固定", 5: "RTK浮点", 6: "正在估算"}
+                    self.p3_quality_label.setText(quality_text.get(q, f"未知({q})"))
+                    self.p3_quality_label.setStyleSheet(
+                        "font-weight: bold; color: #e74c3c;" if q == 0 else
+                        "font-weight: bold; color: #f39c12;" if q == 1 else
+                        "font-weight: bold; color: #2980b9;" if q == 2 else
+                        "font-weight: bold; color: #27ae60;"
+                    )
+                    ts = gga.get('timestamp', '')
+                    if ts:
+                        self.p3_utc_label.setText(ts)
+                        self.p3_utc_ts = ts
+                    gga_sats = int(gga.get('satellites_used', 0))
+                    self.p3_nsats_label.setText(str(gga_sats))
+                    self.p3_gga_nsat = gga_sats
+
+                    self._latest_p3_quality = q
+                    self._p3_gga_new_epoch = True
+
+                    if q > 0:
+                        self._feed_enu3_buffer(p3_lat, p3_lon, alt)
+                        self._calc_and_update_enu2(p3_lat, p3_lon, alt,
+                            self.enu3_ref_point, self.enu3_ref_ready,
+                            self.enu3_east_label, self.enu3_north_label, self.enu3_up_label,
+                            self.enu3_times, self.enu3_east_data, self.enu3_north_data, self.enu3_up_data,
+                            self._std_enu3_east, self._std_enu3_north, self._std_enu3_up, "ENU3")
+                        self._update_enu_std()
+                    else:
+                        self._latest_enu3_east = None
+                        self._latest_enu3_north = None
+                        self._latest_enu3_up = None
+
+            if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
+                self.nmea_parser3.parse(decoded)
+            if decoded.startswith('#OBSV'):
+                self.nmea_parser3.parse(decoded)
+            return
+
+        # 串口1数据：完整处理
+
+        # 串口数据缓存
+        if self.current_data_source == 'serial':
+            self.serial_save_buffer.append(data)
+            self._write_auto_log(1, data)
+            self._data_count_update += 1
+            if self._data_count_update >= self._DATA_COUNT_INTERVAL:
+                self.data_count_label.setText(f"已读取: {len(self.serial_save_buffer) + len(self.serial2_save_buffer) + len(self.serial3_save_buffer)} 行")
+                self._data_count_update = 0
+
+        if self.current_parser:
+            decoded = self.current_parser.decode_line(data)
+            if decoded:
+                self._append_data_preview(f"[串口1] {decoded.strip()}", port_id=1)
+
+                # 解析标准NMEA语句（提取GPS时间）
+                if any(decoded.startswith(p) for p in ('$BDRMC', '$GPRMC', '$GNRMC', '$GLRMC', '$GARMC', '$GBRMC')):
+                    self.nmea_parser.parse(decoded)
+                    if self.nmea_parser.last_gps_time_valid:
+                        self.gps_sow = self.nmea_parser.last_gps_tow
+                        self._append_data_preview(f"【GPS时间】TOW: {self.gps_sow:.2f}秒", port_id=1)
+
+                # 解析OBSVMA/OBSVHA数据（包含伪距和卫星信息）
+                if decoded.startswith('#OBSV'):
+                    self.nmea_parser.parse(decoded)
+                    # 从OBSV数据更新GPS时间
+                    if self.nmea_parser.obsvha_data:
+                        obsv_data = self.nmea_parser.obsvha_data[-1]
+                        self.gps_sow = obsv_data.get('rcv_tow', self.gps_sow) / 1000.0
+                        self.gps_week = obsv_data.get('rcv_wkn', self.gps_week)
+                    elif self.nmea_parser.obsvma_data:
+                        obsv_data = self.nmea_parser.obsvma_data[-1]
+                        self.gps_sow = obsv_data.get('rcv_tow', self.gps_sow) / 1000.0
+                        self.gps_week = obsv_data.get('rcv_wkn', self.gps_week)
+
+                # 解析GSV获取卫星信噪比
+                if any(decoded.startswith(p) for p in ('$GPGSV', '$BDGSV', '$GLGSV', '$GAGSV', '$GBGSV', '$GNGSV')):
+                    self.nmea_parser.parse(decoded)
+                    self._sync_gsv_snapshot(1, self.nmea_parser)
+
+                # GGA 解析
+                gga_data = None
+                if self.gga_parser.parse(decoded):
+                    gga_data = self.gga_parser.get_data()
+
+                    # 直接使用GGA原始数据
+                    smoothed_lat = gga_data['lat']
+                    smoothed_lon = gga_data['lon']
+                    smoothed_alt = gga_data['alt']
+
+                    # 没有真值，误差显示为0
+                    errors = {'horizontal_error': 0.0, 'vertical_error': 0.0}
+                    raw_errors = {'horizontal_error': 0.0, 'vertical_error': 0.0}
+
+                    # 聚合数据预览显示
+                    self._append_data_preview(
+                        f"GGA → 纬度:{gga_data['lat']:.8f} 经度:{gga_data['lon']:.8f} "
+                        f"海拔:{gga_data['alt']:.4f}m "
+                        f"质量:{gga_data['quality']} 卫星:{gga_data['num_sat']}",
+                        port_id=1
+                    )
+
+                    # 更新统计
+                    self.statistics.add_errors(errors['horizontal_error'], errors['vertical_error'])
+
+                    # 保存最新GGA数据（用于改正数计算）
+                    self.last_gga_data = {
+                        'lat': gga_data['lat'],
+                        'lon': gga_data['lon'],
+                        'alt': gga_data['alt'],
+                        'quality': gga_data['quality'],
+                        'num_sat': gga_data['num_sat'],
+                        'smoothed_lat': smoothed_lat,
+                        'smoothed_lon': smoothed_lon,
+                        'smoothed_alt': smoothed_alt
+                    }
+
+                    # 获取当前统计值
+                    stats = self.statistics.get_combined_stats()
+
+                    # 更新显示
+                    self.update_stats_display(
+                        gga_data,
+                        {'lat': smoothed_lat, 'lon': smoothed_lon, 'alt': smoothed_alt},
+                        raw_errors,
+                        errors,
+                        stats
+                    )
+
+                if gga_data and gga_data.get('quality', 0) > 0:
+                    self._feed_real_enu1(
+                        gga_data['lat'], gga_data['lon'], gga_data['alt'])
+                    self._update_enu_std()
+    
+    def update_stats_display(self, gga_data, smoothed_coords, raw_errors, errors, stats):
+        """更新串口1 GGA状态显示"""
+        self.p1_lat_label.setText(f"{gga_data['lat']:.8f}")
+        self.p1_lon_label.setText(f"{gga_data['lon']:.8f}")
+        self.p1_alt_label.setText(f"{gga_data['alt']:.4f}")
+        q = gga_data.get('quality', 0)
+        quality_text = {0: "无效", 1: "单点定位", 2: "单点定位", 3: "无效PPS", 4: "RTK固定", 5: "RTK浮点", 6: "正在估算"}
+        self.p1_quality_label.setText(quality_text.get(q, f"未知({q})"))
+        self.p1_quality_label.setStyleSheet(
+            "font-weight: bold; color: #e74c3c;" if q == 0 else
+            "font-weight: bold; color: #f39c12;" if q == 1 else
+            "font-weight: bold; color: #2980b9;" if q == 2 else
+            "font-weight: bold; color: #27ae60;"
+        )
+        ts = gga_data.get('timestamp', '')
+        if ts:
+            self.p1_utc_label.setText(ts)
+            self.p1_utc_ts = ts
+        self.p1_nsats_label.setText(str(gga_data.get('num_sat', 0)))
+        self.p1_gga_nsat = gga_data.get('num_sat', 0)
+
+    def update_plots(self):
+        self._update_frame_count += 1
+
+        current_snr = (tuple(sorted(self.port1_satellites.items())),
+                       tuple(sorted(self.port2_satellites.items())),
+                       tuple(sorted(self.port3_satellites.items())))  # [新增] port3
+        if current_snr != self._last_snr_data:
+            self._refresh_snr_table()
+            self._last_snr_data = current_snr
+
+        self._update_enu_display()
+        self._update_direction_stats_display()
+
+    # SNR表各星座徽章配色（Nord深色主题）
+    _SYS_BADGES = {
+        'GP': ('GPS', '#81a1c1'), 'GL': ('GLO', '#b48ead'), 'GA': ('GAL', '#a3be8c'),
+        'BD': ('BDS', '#8fbcbb'), 'GB': ('BDS', '#8fbcbb'), 'GN': ('GNSS', '#ebcb8b'),
+    }
+
+    def _show_snr_table_context_menu(self, pos):
+        """信噪比表格右键快捷菜单 (支持单格复制、整行TSV导出与CSV导出)"""
+        menu = QMenu(self)
+        copy_cell_act = menu.addAction("📋 复制选定单元格内容")
+        copy_row_act = menu.addAction("📑 复制选定整行数据 (TSV/Excel格式)")
+        menu.addSeparator()
+        export_csv_act = menu.addAction("📊 导出全部数据为 CSV...")
+        
+        action = menu.exec_(self.snr_table.viewport().mapToGlobal(pos))
+        if action == copy_cell_act:
+            items = self.snr_table.selectedItems()
+            if items:
+                text = "\t".join(it.text() for it in items)
+                QApplication.clipboard().setText(text)
+        elif action == copy_row_act:
+            selected_rows = sorted(set(index.row() for index in self.snr_table.selectedIndexes()))
+            if selected_rows:
+                lines = []
+                header = [self.snr_table.horizontalHeaderItem(c).text() for c in range(self.snr_table.columnCount())]
+                lines.append("\t".join(header))
+                for r in selected_rows:
+                    row_data = [self.snr_table.item(r, c).text() if self.snr_table.item(r, c) else "" for c in range(self.snr_table.columnCount())]
+                    lines.append("\t".join(row_data))
+                QApplication.clipboard().setText("\n".join(lines))
+        elif action == export_csv_act:
+            self._export_snr_csv()
+
+    def _apply_snr_filters(self):
+        """实时执行星座筛选、恶化星过滤与PRN模糊搜索"""
+        selected_sys = "ALL"
+        if getattr(self, 'snr_filter_bds', None) and self.snr_filter_bds.isChecked():
+            selected_sys = "BD"
+        elif getattr(self, 'snr_filter_gps', None) and self.snr_filter_gps.isChecked():
+            selected_sys = "GP"
+        elif getattr(self, 'snr_filter_gal', None) and self.snr_filter_gal.isChecked():
+            selected_sys = "GA"
+        elif getattr(self, 'snr_filter_glo', None) and self.snr_filter_glo.isChecked():
+            selected_sys = "GL"
+
+        warn_only = self.snr_filter_warn_cb.isChecked() if getattr(self, 'snr_filter_warn_cb', None) else False
+        search_txt = self.snr_search_edit.text().strip().upper() if getattr(self, 'snr_search_edit', None) else ""
+
+        for row in range(self.snr_table.rowCount()):
+            # 1. 检查星座
+            item_sys = self.snr_table.item(row, 0)
+            sys_code = item_sys.data(Qt.UserRole + 1) if item_sys else ""
+            if selected_sys != "ALL":
+                if selected_sys == "BD" and sys_code not in ("BD", "GB"):
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+                elif selected_sys != "BD" and sys_code != selected_sys:
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+
+            # 2. 检查 PRN 关键词搜索
+            item_prn = self.snr_table.item(row, 1)
+            prn_str = item_prn.text() if item_prn else ""
+            full_prn = f"{sys_code}{prn_str}".upper()
+            if search_txt and (search_txt not in prn_str and search_txt not in full_prn):
+                self.snr_table.setRowHidden(row, True)
+                continue
+
+            # 3. 检查恶化告警过滤 (|Δ| >= 10 dB)
+            if warn_only:
+                d1_item = self.snr_table.item(row, 7)
+                d2_item = self.snr_table.item(row, 11)
+                v1 = d1_item.data(Qt.UserRole) if d1_item else None
+                v2 = d2_item.data(Qt.UserRole) if d2_item else None
+                has_warn = (v1 is not None and abs(v1) >= 10) or (v2 is not None and abs(v2) >= 10)
+                if not has_warn:
+                    self.snr_table.setRowHidden(row, True)
+                    continue
+
+            self.snr_table.setRowHidden(row, False)
+
+    def _append_data_preview(self, text, port_id=1):
+        """向数据流预览窗口追加数据（支持暂停冻结与语句协议快速过滤）"""
+        if getattr(self, 'pause_preview_cb', None) and self.pause_preview_cb.isChecked():
+            return
+        
+        filt = getattr(self, 'preview_filter_combo', None)
+        if filt:
+            mode = filt.currentText()
+            if mode == "仅 GGA" and "GGA" not in text:
+                return
+            elif mode == "仅 GSV" and "GSV" not in text:
+                return
+            elif mode == "仅 RMC" and "RMC" not in text:
+                return
+            elif mode == "仅 UBX" and "UBX" not in text:
+                return
+
+        self._preview_pending.append(text)
+
+    def _flush_data_preview(self):
+        """按批次写入预览窗口，降低高数据率下的富文本重排次数。"""
+        if not self._preview_pending:
+            return
+        batch = []
+        while self._preview_pending and len(batch) < 200:
+            batch.append(self._preview_pending.popleft())
+        self.data_preview.append("\n".join(batch))
+        self._trim_text_edit(self.data_preview)
+
+    def _refresh_snr_table(self):
+        """
+        刷新原生 QTableWidget 卫星信噪比看板与顶部态势 KPI 卡片。
+        
+        具备以下企业级交互特性:
+        1. 增量单元格就地更新，彻底消除 HTML 重刷带来的界面闪烁与垂直滚动条跳动；
+        2. 基于 NumericTableWidgetItem 存储真数值，支持点击任意表头实现真数值升降序排序；
+        3. 联动计算并更新 4 项顶部 KPI 卡片 (跟踪星数、全网平均SNR、恶化星占比、最大受扰深度)；
+        4. 实时响应星座筛选 (北斗/GPS/Galileo/GLONASS)、恶化星过滤 (|Δ|>=10dB) 与 PRN 检索。
+        """
+        all_keys = sorted(
+            set(self.port1_satellites) | set(self.port2_satellites) | set(self.port3_satellites),
+            key=self._snr_sort_key)
+
+        # 2. 刷新顶部 KPI 态势卡片
+        n1 = len(self.port1_satellites)
+        n2 = len(self.port2_satellites)
+        n3 = len(self.port3_satellites)
+        if getattr(self, 'kpi_tracked_label', None):
+            self.kpi_tracked_label.setText(f"{n1} / {n2} / {n3} 颗")
+
+            avg1 = (sum(self.port1_satellites.values()) / n1) if n1 > 0 else 0.0
+            avg2 = (sum(self.port2_satellites.values()) / n2) if n2 > 0 else 0.0
+            avg3 = (sum(self.port3_satellites.values()) / n3) if n3 > 0 else 0.0
+            self.kpi_avgsnr_label.setText(f"{avg1:.1f} / {avg2:.1f} / {avg3:.1f} dB")
+
+            warn_sats = set()
+            max_drop_val = 0.0
+            max_drop_info = "无数据" if not all_keys else "无明显衰减"
+
+            for key in all_keys:
+                s1 = self.port1_satellites.get(key)
+                s2 = self.port2_satellites.get(key)
+                s3 = self.port3_satellites.get(key)
+                d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+                d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+                
+                if (d1 is not None and abs(d1) >= 10) or (d2 is not None and abs(d2) >= 10):
+                    warn_sats.add(key)
+                    
+                for port_idx, diff_val in [(2, d1), (3, d2)]:
+                    if diff_val is not None and diff_val < max_drop_val:
+                        max_drop_val = diff_val
+                        talker, signal_id, prn = self._snr_key_parts(key)
+                        sys_name, _ = self._SYS_BADGES.get(talker, (talker, ""))
+                        max_drop_info = f"{sys_name}{prn:02d}/{signal_id} ({diff_val:+.1f}dB, P{port_idx})"
+
+            total_tracked = len(all_keys)
+            warn_pct = (len(warn_sats) / total_tracked * 100) if total_tracked > 0 else 0.0
+            self.kpi_warn_label.setText(f"{len(warn_sats)} 颗 (占比 {warn_pct:.1f}%)")
+            self.kpi_maxdrop_label.setText(max_drop_info)
+
+        # 3. 填充或就地更新 QTableWidget
+        if not hasattr(self, 'snr_table'):
+            return
+
+        self.snr_table.setSortingEnabled(False)
+        
+        if self.snr_table.rowCount() != len(all_keys):
+            self.snr_table.setRowCount(len(all_keys))
+
+        for row, key in enumerate(all_keys):
+            sys_prefix, signal_id, prn = self._snr_key_parts(key)
+            badge_name, badge_color = self._SYS_BADGES.get(sys_prefix, (sys_prefix, "#89b4fa"))
+            
+            s1 = self.port1_satellites.get(key)
+            s2 = self.port2_satellites.get(key)
+            s3 = self.port3_satellites.get(key)
+            a1 = self._port1_snr_avg.get(key)
+            a2 = self._port2_snr_avg.get(key)
+            a3 = self._port3_snr_avg.get(key)
+            ad = self._snr_diff_avg.get(key)
+            ad2 = self._snr_diff2_avg.get(key)
+            d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+            d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+            signal = (self._port1_snr_signals.get(key)
+                      or self._port2_snr_signals.get(key)
+                      or self._port3_snr_signals.get(key) or "---")
+                      
+            is_warn = (d1 is not None and abs(d1) >= 10) or (d2 is not None and abs(d2) >= 10)
+
+            # Col 0: 星座 Badge
+            item_sys = NumericTableWidgetItem(badge_name)
+            item_sys.setData(Qt.BackgroundRole, QColor(badge_color))
+            item_sys.setData(Qt.UserRole + 1, sys_prefix)  # 存原始 talker 便于快速过滤
+            item_sys.setTextAlignment(Qt.AlignCenter)
+            self.snr_table.setItem(row, 0, item_sys)
+
+            # Col 1: PRN
+            item_prn = NumericTableWidgetItem(f"{prn:02d}", prn)
+            item_prn.setTextAlignment(Qt.AlignCenter)
+            if is_warn:
+                item_prn.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                item_prn.setFont(QFont("Consolas", 11, QFont.Bold))
+            self.snr_table.setItem(row, 1, item_prn)
+
+            # Col 2: 信号
+            item_sig = NumericTableWidgetItem(signal)
+            item_sig.setTextAlignment(Qt.AlignCenter)
+            item_sig.setData(Qt.ForegroundRole, QColor("#89ddff"))
+            self.snr_table.setItem(row, 2, item_sig)
+
+            # Col 3: COM1 瞬时
+            txt_s1 = f"{s1:.1f}" if s1 is not None else "--"
+            self.snr_table.setItem(row, 3, NumericTableWidgetItem(txt_s1, s1))
+
+            # Col 4: COM1 均值
+            txt_a1 = f"{a1:.1f}" if a1 is not None else "--"
+            item_a1 = NumericTableWidgetItem(txt_a1, a1)
+            item_a1.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 4, item_a1)
+
+            # Col 5: COM2 瞬时
+            txt_s2 = f"{s2:.1f}" if s2 is not None else "--"
+            self.snr_table.setItem(row, 5, NumericTableWidgetItem(txt_s2, s2))
+
+            # Col 6: COM2 均值
+            txt_a2 = f"{a2:.1f}" if a2 is not None else "--"
+            item_a2 = NumericTableWidgetItem(txt_a2, a2)
+            item_a2.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 6, item_a2)
+
+            # Col 7: Δ(2-1)
+            txt_d1 = f"{d1:+.1f}" if d1 is not None else "--"
+            item_d1 = NumericTableWidgetItem(txt_d1, d1)
+            item_d1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if d1 is not None:
+                if abs(d1) >= 15:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5e3737"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d1) >= 10:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5e4531"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#fab387"))
+                    item_d1.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d1) >= 3:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#5d5436"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#eceff4"))
+                else:
+                    item_d1.setData(Qt.BackgroundRole, QColor("#2a3a4a"))
+                    item_d1.setData(Qt.ForegroundRole, QColor("#a5b6cc"))
+            self.snr_table.setItem(row, 7, item_d1)
+
+            # Col 8: Δ2 均值
+            txt_ad1 = f"{ad:+.1f}" if ad is not None else "--"
+            item_ad1 = NumericTableWidgetItem(txt_ad1, ad)
+            item_ad1.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_ad1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 8, item_ad1)
+
+            # Col 9: COM3 瞬时
+            txt_s3 = f"{s3:.1f}" if s3 is not None else "--"
+            self.snr_table.setItem(row, 9, NumericTableWidgetItem(txt_s3, s3))
+
+            # Col 10: COM3 均值
+            txt_a3 = f"{a3:.1f}" if a3 is not None else "--"
+            item_a3 = NumericTableWidgetItem(txt_a3, a3)
+            item_a3.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_a3.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 10, item_a3)
+
+            # Col 11: Δ(3-1)
+            txt_d2 = f"{d2:+.1f}" if d2 is not None else "--"
+            item_d2 = NumericTableWidgetItem(txt_d2, d2)
+            item_d2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if d2 is not None:
+                if abs(d2) >= 15:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5e3737"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#f38ba8"))
+                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d2) >= 10:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5e4531"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#fab387"))
+                    item_d2.setFont(QFont("Consolas", 11, QFont.Bold))
+                elif abs(d2) >= 3:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#5d5436"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#eceff4"))
+                else:
+                    item_d2.setData(Qt.BackgroundRole, QColor("#2a3a4a"))
+                    item_d2.setData(Qt.ForegroundRole, QColor("#a5b6cc"))
+            self.snr_table.setItem(row, 11, item_d2)
+
+            # Col 12: Δ3 均值
+            txt_ad2 = f"{ad2:+.1f}" if ad2 is not None else "--"
+            item_ad2 = NumericTableWidgetItem(txt_ad2, ad2)
+            item_ad2.setData(Qt.ForegroundRole, QColor("#a6adc8"))
+            item_ad2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.snr_table.setItem(row, 12, item_ad2)
+
+        self.snr_table.setSortingEnabled(True)
+
+        # 4. 重新应用当前活动筛选规则
+        self._apply_snr_filters()
+
+    def _refresh_snr_text(self):
+        """向后兼容别名，调用新版 _refresh_snr_table"""
+        self._refresh_snr_table()
+
+    def _feed_enu1_buffer(self, lat, lon, alt):
+        if self.enu_instant_mode:
+            if not self.enu1_ref_ready:
+                self.enu1_ref_point = (lat, lon, alt)
+                self.enu1_ref_ready = True
+                self.enu1_ref_label.setText(f"ENU1 基准(瞬时): {lat:.8f}, {lon:.8f}, {alt:.3f}m")
+                self.enu1_points_label.setText("(瞬时GGA)")
+            return
+        if not self.enu_auto_mode or self.enu1_ref_ready:
+            return
+        self.enu1_buffer.append((lat, lon, alt))
+        self.enu1_points_label.setText(f"({len(self.enu1_buffer)}/{self.enu1_buffer_size})")
+        if len(self.enu1_buffer) >= self.enu1_buffer_size:
+            lats = [p[0] for p in self.enu1_buffer]
+            lons = [p[1] for p in self.enu1_buffer]
+            alts = [p[2] for p in self.enu1_buffer]
+            self.enu1_ref_point = (sum(lats)/len(lats), sum(lons)/len(lons), sum(alts)/len(alts))
+            self.enu1_ref_ready = True
+            self.enu1_ref_label.setText(f"ENU1 基准: {self.enu1_ref_point[0]:.8f}, {self.enu1_ref_point[1]:.8f}, {self.enu1_ref_point[2]:.3f}m")
+            self.enu1_points_label.setText("(已锁定)")
+            self.log_info(f"ENU1基准点已锁定 (前{self.enu1_buffer_size}点均值)")
+
+    def _feed_fixed_enu1(self):
+        """注入固定 ENU1 值 (0, 0, 0)，跳过 GGA→ENU 转换"""
+        east, north, up = 0.0, 0.0, 0.0
+
+        # 更新界面 Label
+        self.enu1_east_label.setText(f"东: {east:+.3f} m")
+        self.enu1_north_label.setText(f"北: {north:+.3f} m")
+        self.enu1_up_label.setText(f"天: {up:+.3f} m")
+
+        # 馈入滑动窗口标准差（固定值无需异常值剔除）
+        self._std_enu1_east.add(east)
+        self._std_enu1_north.add(north)
+        self._std_enu1_up.add(up)
+        self._std_enu1_3_east.add(east)
+        self._std_enu1_3_north.add(north)
+        self._std_enu1_3_up.add(up)
+
+        # 时间戳递增，写入 ENU1 数据数组
+        t = self.enu1_times[-1] + 1.0 if self.enu1_times else 0.0
+        self.enu1_times.append(t)
+        self.enu1_east_data.append(east)
+        self.enu1_north_data.append(north)
+        self.enu1_up_data.append(up)
+
+        # 同步馈入 ENU1_3（COM3对比用）
+        t3 = self.enu1_3_times[-1] + 1.0 if self.enu1_3_times else 0.0
+        self.enu1_3_times.append(t3)
+        self.enu1_3_east_data.append(east)
+        self.enu1_3_north_data.append(north)
+        self.enu1_3_up_data.append(up)
+
+        # 限制数组不超过 ENU_MAX_POINTS
+        if len(self.enu1_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_times) - self.ENU_MAX_POINTS
+            del self.enu1_times[:excess]
+            del self.enu1_east_data[:excess]
+            del self.enu1_north_data[:excess]
+            del self.enu1_up_data[:excess]
+        if len(self.enu1_3_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_3_times) - self.ENU_MAX_POINTS
+            del self.enu1_3_times[:excess]
+            del self.enu1_3_east_data[:excess]
+            del self.enu1_3_north_data[:excess]
+            del self.enu1_3_up_data[:excess]
+
+    def _feed_real_enu1(self, lat, lon, alt):
+        """按串口1自己的独立参考点计算真实 ENU1，并同步到两组对比曲线。"""
+        self._feed_enu1_buffer(lat, lon, alt)
+        before = len(self.enu1_times)
+        self._calc_and_update_enu2(
+            lat, lon, alt, self.enu1_ref_point, self.enu1_ref_ready,
+            self.enu1_east_label, self.enu1_north_label, self.enu1_up_label,
+            self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data,
+            self._std_enu1_east, self._std_enu1_north, self._std_enu1_up, "ENU1")
+        if len(self.enu1_times) == before:
+            return
+        t = self.enu1_3_times[-1] + 1.0 if self.enu1_3_times else 0.0
+        east, north, up = (self.enu1_east_data[-1], self.enu1_north_data[-1],
+                           self.enu1_up_data[-1])
+        self.enu1_3_times.append(t)
+        self.enu1_3_east_data.append(east)
+        self.enu1_3_north_data.append(north)
+        self.enu1_3_up_data.append(up)
+        self._std_enu1_3_east.add(east)
+        self._std_enu1_3_north.add(north)
+        self._std_enu1_3_up.add(up)
+        if len(self.enu1_3_times) > self.ENU_MAX_POINTS:
+            excess = len(self.enu1_3_times) - self.ENU_MAX_POINTS
+            del self.enu1_3_times[:excess]
+            del self.enu1_3_east_data[:excess]
+            del self.enu1_3_north_data[:excess]
+            del self.enu1_3_up_data[:excess]
+
+    def _feed_enu2_buffer(self, lat, lon, alt):
+        if self.enu_instant_mode:
+            if not self.enu2_ref_ready:
+                self.enu2_ref_point = (lat, lon, alt)
+                self.enu2_ref_ready = True
+                self.enu2_ref_label.setText(f"ENU2 基准(瞬时): {lat:.8f}, {lon:.8f}, {alt:.3f}m")
+                self.enu2_points_label.setText("(瞬时GGA)")
+            return
+        if not self.enu_auto_mode or self.enu2_ref_ready:
+            return
+        self.enu2_buffer.append((lat, lon, alt))
+        self.enu2_points_label.setText(f"({len(self.enu2_buffer)}/{self.enu2_buffer_size})")
+        if len(self.enu2_buffer) >= self.enu2_buffer_size:
+            lats = [p[0] for p in self.enu2_buffer]
+            lons = [p[1] for p in self.enu2_buffer]
+            alts = [p[2] for p in self.enu2_buffer]
+            self.enu2_ref_point = (sum(lats)/len(lats), sum(lons)/len(lons), sum(alts)/len(alts))
+            self.enu2_ref_ready = True
+            self.enu2_ref_label.setText(f"ENU2 基准: {self.enu2_ref_point[0]:.8f}, {self.enu2_ref_point[1]:.8f}, {self.enu2_ref_point[2]:.3f}m")
+            self.enu2_points_label.setText("(已锁定)")
+            self.log_info(f"ENU2基准点已锁定 (前{self.enu2_buffer_size}点均值)")
+
+    # [新增] ENU3基准点采集
+    def _feed_enu3_buffer(self, lat, lon, alt):
+        if self.enu_instant_mode:
+            if not self.enu3_ref_ready:
+                self.enu3_ref_point = (lat, lon, alt)
+                self.enu3_ref_ready = True
+                self.enu3_ref_label.setText(f"ENU3 基准(瞬时): {lat:.8f}, {lon:.8f}, {alt:.3f}m")
+                self.enu3_points_label.setText("(瞬时GGA)")
+            return
+        if not self.enu_auto_mode or self.enu3_ref_ready:
+            return
+        self.enu3_buffer.append((lat, lon, alt))
+        self.enu3_points_label.setText(f"({len(self.enu3_buffer)}/{self.enu3_buffer_size})")
+        if len(self.enu3_buffer) >= self.enu3_buffer_size:
+            lats = [p[0] for p in self.enu3_buffer]
+            lons = [p[1] for p in self.enu3_buffer]
+            alts = [p[2] for p in self.enu3_buffer]
+            self.enu3_ref_point = (sum(lats)/len(lats), sum(lons)/len(lons), sum(alts)/len(alts))
+            self.enu3_ref_ready = True
+            self.enu3_ref_label.setText(f"ENU3 基准: {self.enu3_ref_point[0]:.8f}, {self.enu3_ref_point[1]:.8f}, {self.enu3_ref_point[2]:.3f}m")
+            self.enu3_points_label.setText("(已锁定)")
+            self.log_info(f"ENU3基准点已锁定 (前{self.enu3_buffer_size}点均值)")
+
+    def _enu_mode_changed(self):
+        is_manual = self.enu_manual_radio.isChecked()
+        is_instant = self.enu_instant_radio.isChecked()
+        self.enu_auto_mode = self.enu_auto_radio.isChecked()
+        self.enu_instant_mode = is_instant
+        self.enu_manual_lat.setEnabled(is_manual)
+        self.enu_manual_lon.setEnabled(is_manual)
+        self.enu_manual_alt.setEnabled(is_manual)
+        self.enu_apply_btn.setEnabled(is_manual)
+        self.enu1_points_label.setVisible(not is_manual)
+        self.enu2_points_label.setVisible(not is_manual)
+        # 重置两个端口的基准状态
+        self.enu1_ref_point = None
+        self.enu1_ref_ready = False
+        self.enu1_buffer = []
+        self.enu1_times = []
+        self.enu1_east_data = []
+        self.enu1_north_data = []
+        self.enu1_up_data = []
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
+        self._std_enu1_east.reset()
+        self._std_enu1_north.reset()
+        self._std_enu1_up.reset()
+        self._std_enu1_3_east.reset()
+        self._std_enu1_3_north.reset()
+        self._std_enu1_3_up.reset()
+        self.enu1_east_curve.setData([], [])
+        self.enu1_north_curve.setData([], [])
+        self.enu1_up_curve.setData([], [])
+        self.enu1_13_east_curve.setData([], [])
+        self.enu1_13_north_curve.setData([], [])
+        self.enu1_13_up_curve.setData([], [])
+        self.enu2_ref_point = None
+        self.enu2_ref_ready = False
+        self.enu2_buffer = []
+        self.enu2_times = []
+        self.enu2_east_data = []
+        self.enu2_north_data = []
+        self.enu2_up_data = []
+        self._std_enu2_east.reset()
+        self._std_enu2_north.reset()
+        self._std_enu2_up.reset()
+        self.enu2_east_curve.setData([], [])
+        self.enu2_north_curve.setData([], [])
+        self.enu2_up_curve.setData([], [])
+        self.enu3_ref_point = None  # [新增]
+        self.enu3_ref_ready = False  # [新增]
+        self.enu3_buffer = []  # [新增]
+        self.enu3_times = []  # [新增]
+        self.enu3_east_data = []  # [新增]
+        self.enu3_north_data = []  # [新增]
+        self.enu3_up_data = []  # [新增]
+        self._std_enu3_east.reset()  # [新增]
+        self._std_enu3_north.reset()  # [新增]
+        self._std_enu3_up.reset()  # [新增]
+        self.enu3_east_curve.setData([], [])  # [新增]
+        self.enu3_north_curve.setData([], [])  # [新增]
+        self.enu3_up_curve.setData([], [])  # [新增]
+        label_text = "等待手动输入" if is_manual else "等待瞬时GGA..." if is_instant else "自动采集中..."
+        pts_text = "(手动)" if is_manual else "(瞬时)" if is_instant else "(0/100)"
+        self.enu1_ref_label.setText(f"ENU1 基准: {label_text}")
+        self.enu2_ref_label.setText(f"ENU2 基准: {label_text}")
+        self.enu3_ref_label.setText(f"ENU3 基准: {label_text}")  # [新增]
+        self.enu1_points_label.setText(pts_text)
+        self.enu2_points_label.setText(pts_text)
+        self.enu3_points_label.setText(pts_text)  # [新增]
+        self.enu1_east_label.setText("东: -- m")
+        self.enu1_north_label.setText("北: -- m")
+        self.enu1_up_label.setText("天: -- m")
+        self.enu2_east_label.setText("东: -- m")
+        self.enu2_north_label.setText("北: -- m")
+        self.enu2_up_label.setText("天: -- m")
+        self.enu3_east_label.setText("东: -- m")  # [新增]
+        self.enu3_north_label.setText("北: -- m")  # [新增]
+        self.enu3_up_label.setText("天: -- m")  # [新增]
+        self.log_info(f"ENU基准模式切换: {'手动输入' if is_manual else '瞬时GGA' if is_instant else '自动均值'}")
+
+    def _apply_enu_manual_ref(self):
+        lat = self.enu_manual_lat.value()
+        lon = self.enu_manual_lon.value()
+        alt = self.enu_manual_alt.value()
+        if lat == 0 and lon == 0:
+            QMessageBox.warning(self, "警告", "请输入有效的经纬度坐标")
+            return
+        self.enu1_ref_point = (lat, lon, alt)
+        self.enu1_ref_ready = True
+        self.enu2_ref_point = (lat, lon, alt)
+        self.enu2_ref_ready = True
+        self.enu3_ref_point = (lat, lon, alt)  # [新增]
+        self.enu3_ref_ready = True  # [新增]
+        self.enu1_ref_label.setText(f"ENU1 基准: {lat:.8f}, {lon:.8f}, {alt:.3f}m")
+        self.enu1_points_label.setText("(手动)")
+        self.enu2_ref_label.setText(f"ENU2 基准: {lat:.8f}, {lon:.8f}, {alt:.3f}m")
+        self.enu2_points_label.setText("(手动)")
+        self.enu3_ref_label.setText(f"ENU3 基准: {lat:.8f}, {lon:.8f}, {alt:.3f}m")  # [新增]
+        self.enu3_points_label.setText("(手动)")  # [新增]
+        self.log_info(f"ENU手动基准已设置: {lat:.8f}°, {lon:.8f}°, {alt:.3f}m")
+
+    def _update_enu_display(self):
+        self._refresh_enu_charts()
+        self._feed_direction_stats()
+        self._feed_direction_stats3()
+        self._update_enu_std()
+
+    def _refresh_enu_charts(self):
+        # 左列: ENU1 vs ENU2 (COM2)
+        if self.enu1_times:
+            self.enu1_east_curve.setData(self.enu1_times, self.enu1_east_data)
+            self.enu1_north_curve.setData(self.enu1_times, self.enu1_north_data)
+            self.enu1_up_curve.setData(self.enu1_times, self.enu1_up_data)
+        if self.enu2_times:
+            self.enu2_east_curve.setData(self.enu2_times, self.enu2_east_data)
+            self.enu2_north_curve.setData(self.enu2_times, self.enu2_north_data)
+            self.enu2_up_curve.setData(self.enu2_times, self.enu2_up_data)
+        # ENU3曲线刷新
+        if self.enu3_times:
+            self.enu3_east_curve.setData(self.enu3_times, self.enu3_east_data)
+            self.enu3_north_curve.setData(self.enu3_times, self.enu3_north_data)
+            self.enu3_up_curve.setData(self.enu3_times, self.enu3_up_data)
+        # 右列: ENU1 vs ENU3 (COM3，使用独立的 ENU1_3 副本)
+        if self.enu1_3_times:
+            self.enu1_13_east_curve.setData(self.enu1_3_times, self.enu1_3_east_data)
+            self.enu1_13_north_curve.setData(self.enu1_3_times, self.enu1_3_north_data)
+            self.enu1_13_up_curve.setData(self.enu1_3_times, self.enu1_3_up_data)
+
+    def _update_enu_std(self):
+        e1_std = self._std_enu1_east.std
+        n1_std = self._std_enu1_north.std
+        u1_std = self._std_enu1_up.std
+        e2_std = self._std_enu2_east.std
+        n2_std = self._std_enu2_north.std
+        u2_std = self._std_enu2_up.std
+
+        self.enu1_std_east.setText(f"E: {e1_std:.4f}m")
+        self.enu1_std_north.setText(f"N: {n1_std:.4f}m")
+        self.enu1_std_up.setText(f"U: {u1_std:.4f}m")
+        self.enu2_std_east.setText(f"E: {e2_std:.4f}m")
+        self.enu2_std_north.setText(f"N: {n2_std:.4f}m")
+        self.enu2_std_up.setText(f"U: {u2_std:.4f}m")
+
+        # [新增] ENU3标准差
+        e3_std = self._std_enu3_east.std
+        n3_std = self._std_enu3_north.std
+        u3_std = self._std_enu3_up.std
+        self.enu3_std_east.setText(f"E: {e3_std:.4f}m")
+        self.enu3_std_north.setText(f"N: {n3_std:.4f}m")
+        self.enu3_std_up.setText(f"U: {u3_std:.4f}m")
+
+    def _is_enu_outlier(self, std_calc, value):
+        if len(std_calc) < self.ENU_OUTLIER_MIN_SAMPLES:
+            return False
+        mean = std_calc.mean
+        std = std_calc.std
+        delta = abs(value - mean)
+        if delta <= self.ENU_OUTLIER_MIN_DELTA:
+            return False
+        return std > 0 and delta > self.ENU_OUTLIER_SIGMA * std
+
+    def _calc_and_update_enu2(self, lat, lon, alt, ref_point, ref_ready,
+            east_label, north_label, up_label,
+            times, east_data, north_data, up_data,
+            std_east, std_north, std_up, name):
+        if not ref_ready:
+            return
+        if lat == 0 and lon == 0:
+            return
+        r_lat, r_lon, r_alt = ref_point
+
+        a = WGS84_A
+        f = WGS84_F
+        e2 = WGS84_E2
+        sin_lat = math.sin(math.radians(r_lat))
+        cos_lat = math.cos(math.radians(r_lat))
+        sin_lon = math.sin(math.radians(r_lon))
+        cos_lon = math.cos(math.radians(r_lon))
+        N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
+        x0 = (N + r_alt) * cos_lat * cos_lon
+        y0 = (N + r_alt) * cos_lat * sin_lon
+        z0 = (N * (1 - e2) + r_alt) * sin_lat
+
+        sin_lat2 = math.sin(math.radians(lat))
+        cos_lat2 = math.cos(math.radians(lat))
+        sin_lon2 = math.sin(math.radians(lon))
+        cos_lon2 = math.cos(math.radians(lon))
+        N2 = a / math.sqrt(1 - e2 * sin_lat2 * sin_lat2)
+        x = (N2 + alt) * cos_lat2 * cos_lon2
+        y = (N2 + alt) * cos_lat2 * sin_lon2
+        z = (N2 * (1 - e2) + alt) * sin_lat2
+
+        dx, dy, dz = x - x0, y - y0, z - z0
+        east  = -sin_lon * dx + cos_lon * dy
+        north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
+        up    =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
+
+        if name == "ENU2":
+            self._latest_enu2_east = east
+            self._latest_enu2_north = north
+            self._latest_enu2_up = up
+        # [新增] ENU3最新值跟踪
+        elif name == "ENU3":
+            self._latest_enu3_east = east
+            self._latest_enu3_north = north
+            self._latest_enu3_up = up
+
+        east_label.setText(f"东: {east:+.3f} m")
+        north_label.setText(f"北: {north:+.3f} m")
+        up_label.setText(f"天: {up:+.3f} m")
+
+        east_bad = self._is_enu_outlier(std_east, east)
+        north_bad = self._is_enu_outlier(std_north, north)
+        up_bad = self._is_enu_outlier(std_up, up)
+
+        # [新增] ENU3异常值计数（同时避免双重计入_enu2_outlier_count）
+        if name == "ENU3":
+            if east_bad:
+                self._enu3_outlier_count += 1
+            if north_bad:
+                self._enu3_outlier_count += 1
+            if up_bad:
+                self._enu3_outlier_count += 1
+        elif name == "ENU2":
+            if east_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 东向异常值已剔除: {east:+.3f}m (σ: {std_east.std:.3f}m)")
+            if north_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 北向异常值已剔除: {north:+.3f}m (σ: {std_north.std:.3f}m)")
+            if up_bad:
+                self._enu2_outlier_count += 1
+                self.log_info(f"{name} 天向异常值已剔除: {up:+.3f}m (σ: {std_up.std:.3f}m)")
+
+        if east_bad or north_bad or up_bad:
+            return
+
+        std_east.add(east)
+        std_north.add(north)
+        std_up.add(up)
+
+        t = times[-1] + 1.0 if times else 0.0
+        times.append(t)
+        east_data.append(east)
+        north_data.append(north)
+        up_data.append(up)
+
+        if len(times) > self.ENU_MAX_POINTS:
+            del times[:len(times) - self.ENU_MAX_POINTS]
+            del east_data[:len(east_data) - self.ENU_MAX_POINTS]
+            del north_data[:len(north_data) - self.ENU_MAX_POINTS]
+            del up_data[:len(up_data) - self.ENU_MAX_POINTS]
+
+    def _create_enu_ref_box(self):
+        """ENU基准值设置（全局控制, 影响所有串口的ENU误差计算）"""
+        enu_ref_box = QGroupBox("ENU 基准值设置（全局，影响所有 ENU 误差计算）")
+        enu_ref_layout = QVBoxLayout(enu_ref_box)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("基准模式:"))
+        self.enu_auto_radio = QRadioButton("自动基准(前100点)")
+        self.enu_auto_radio.setChecked(True)
+        self.enu_auto_radio.setToolTip("以各串口开始接收后前100个有效GGA定位的平均坐标作为ENU误差基准点\n(推荐: 自动吸收初始定位噪声)")
+        self.enu_instant_radio = QRadioButton("瞬时GGA定位值")
+        self.enu_instant_radio.setToolTip("以各串口第一个有效GGA定位值作为基准点\n(适合初始位置已稳定收敛的场景)")
+        self.enu_manual_radio = QRadioButton("手动输入")
+        self.enu_manual_radio.setToolTip("手动输入已知精确坐标作为基准点\n(适合经过精密测量的测试场地)")
+        mode_row.addWidget(self.enu_auto_radio)
+        mode_row.addWidget(self.enu_instant_radio)
+        mode_row.addWidget(self.enu_manual_radio)
+        mode_row.addStretch()
+        enu_ref_layout.addLayout(mode_row)
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(QLabel("纬度:"))
+        self.enu_manual_lat = QDoubleSpinBox()
+        self.enu_manual_lat.setRange(-90, 90)
+        self.enu_manual_lat.setDecimals(8)
+        self.enu_manual_lat.setEnabled(False)
+        manual_row.addWidget(self.enu_manual_lat)
+        manual_row.addWidget(QLabel("经度:"))
+        self.enu_manual_lon = QDoubleSpinBox()
+        self.enu_manual_lon.setRange(-180, 180)
+        self.enu_manual_lon.setDecimals(8)
+        self.enu_manual_lon.setEnabled(False)
+        manual_row.addWidget(self.enu_manual_lon)
+        manual_row.addWidget(QLabel("高程:"))
+        self.enu_manual_alt = QDoubleSpinBox()
+        self.enu_manual_alt.setRange(-1000, 10000)
+        self.enu_manual_alt.setDecimals(3)
+        self.enu_manual_alt.setEnabled(False)
+        manual_row.addWidget(self.enu_manual_alt)
+        self.enu_apply_btn = QPushButton("应用基准")
+        self.enu_apply_btn.setEnabled(False)
+        self.enu_apply_btn.setToolTip("将输入坐标同时应用为三个串口的ENU基准点")
+        manual_row.addWidget(self.enu_apply_btn)
+        manual_row.addStretch()
+        enu_ref_layout.addLayout(manual_row)
+        enu_ref_labels = QHBoxLayout()
+        self.enu1_ref_label = QLabel("ENU1 基准: 未设置")
+        self.enu1_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu1_ref_label)
+        self.enu1_points_label = QLabel("")
+        self.enu1_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu1_points_label)
+        enu_ref_labels.addStretch()
+        self.enu2_ref_label = QLabel("ENU2 基准: 未设置")
+        self.enu2_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu2_ref_label)
+        self.enu2_points_label = QLabel("")
+        self.enu2_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu2_points_label)
+        enu_ref_labels.addStretch()
+        # [新增] ENU3基准点状态标签
+        self.enu3_ref_label = QLabel("ENU3 基准: 未设置")
+        self.enu3_ref_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu3_ref_label)
+        self.enu3_points_label = QLabel("")
+        self.enu3_points_label.setStyleSheet("color: #888; font-size: 14px;")
+        enu_ref_labels.addWidget(self.enu3_points_label)
+        enu_ref_labels.addStretch()
+        enu_ref_layout.addLayout(enu_ref_labels)
+        return enu_ref_box
+
+    def _create_direction_tab(self):
+        main_tab = QWidget()
+        layout = QVBoxLayout(main_tab)
+
+        # 方向测试子标签：串口2和串口3分开
+        dir_sub_tabs = QTabWidget()
+        self._create_dir_port_widget(dir_sub_tabs, port_id=2)
+        self._create_dir_port_widget(dir_sub_tabs, port_id=3)
+        layout.addWidget(dir_sub_tabs)
+
+        return main_tab
+
+    def _create_dir_port_widget(self, parent_tab, port_id):
+        """为指定串口创建方向测试UI"""
+        tab = QWidget()
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        direction_scroll = QScrollArea()
+        direction_scroll.setWidgetResizable(True)
+        direction_scroll.setFrameShape(QFrame.NoFrame)
+        direction_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        direction_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        content_widget = QWidget()
+        tab_layout = QVBoxLayout(content_widget)
+
+        is_com3 = (port_id == 3)
+
+        # 设备序号输入行
+        sn_row = QHBoxLayout()
+        sn_row.addWidget(QLabel("设备序号:"))
+        sn_input = QLineEdit()
+        sn_input.setPlaceholderText("请输入设备序号")
+        sn_input.setMinimumWidth(150)
+        sn_row.addWidget(sn_input)
+        sn_apply_btn = QPushButton("应用")
+        sn_apply_btn.setMinimumWidth(60)
+        sn_apply_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; } QPushButton:hover { background-color: #2ecc71; }")
+        if is_com3:
+            self.device_sn3_input = sn_input
+            sn_apply_btn.clicked.connect(lambda: self._apply_device_sn(3))
+        else:
+            self.device_sn2_input = sn_input
+            sn_apply_btn.clicked.connect(lambda: self._apply_device_sn(2))
+        sn_row.addWidget(sn_apply_btn)
+        sn_row.addStretch()
+        tab_layout.addLayout(sn_row)
+
+        stats_grid = QGridLayout()
+        stat_boxes = []
+
+        for i in range(4):
+            box = QGroupBox(f"方向{i + 1}")
+            box.setMinimumHeight(230)
+            box_font = QFont(box.font())
+            box_font.setPointSize(16)
+            box_font.setBold(True)
+            box.setFont(box_font)
+            box.setStyleSheet("QGroupBox { font-size: 16px; font-weight: bold; border: 2px solid #bdc3c7; border-radius: 6px; margin-top: 10px; padding-top: 16px; } QGroupBox::title { background-color: #ecf0f1; padding: 3px 10px; border-radius: 3px; font-size: 16px; }")
+            box_layout = QVBoxLayout(box)
+
+            duration_label = QLabel("测试时长: 00:00:00")
+            duration_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2980b9;")
+            box_layout.addWidget(duration_label)
+
+            epoch_label = QLabel("总历元: 0 | 成功: 0 | 成功率: 0.0%")
+            epoch_label.setStyleSheet("font-size: 14px; color: #555;")
+            box_layout.addWidget(epoch_label)
+
+            h_label = QLabel("水平误差 均值: -- m | 最大: -- m")
+            h_label.setStyleSheet("font-size: 14px; color: #e74c3c;")
+            box_layout.addWidget(h_label)
+
+            v_label = QLabel("垂直误差 均值: -- m | 最大: -- m")
+            v_label.setStyleSheet("font-size: 14px; color: #27ae60;")
+            box_layout.addWidget(v_label)
+
+            state_label = QLabel("状态: 未开始")
+            state_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #7f8c8d;")
+            box_layout.addWidget(state_label)
+
+            controls_layout = QGridLayout()
+            controls_layout.setSpacing(6)
+            start_btn = QPushButton("启动测试")
+            pause_btn = QPushButton("暂停测试")
+            resume_btn = QPushButton("继续测试")
+            terminate_btn = QPushButton("终止测试")
+            button_styles = {
+                start_btn: "#27ae60",
+                pause_btn: "#f39c12",
+                resume_btn: "#2980b9",
+                terminate_btn: "#c0392b",
+            }
+            for button, color in button_styles.items():
+                button.setMinimumWidth(88)
+                button.setMinimumHeight(32)
+                button.setStyleSheet(
+                    f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
+                    "padding: 6px 10px; border-radius: 4px; font-size: 14px; } "
+                    "QPushButton:disabled { background-color: #bdc3c7; color: #ecf0f1; }"
+                )
+            pause_btn.setEnabled(False)
+            resume_btn.setEnabled(False)
+            terminate_btn.setEnabled(False)
+            idx = i
+            start_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._start_direction_test(p, d))
+            pause_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._pause_direction_test(p, d))
+            resume_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._resume_direction_test(p, d))
+            terminate_btn.clicked.connect(
+                lambda checked=False, p=port_id, d=idx: self._terminate_direction_test(p, d))
+            controls_layout.addWidget(start_btn, 0, 0)
+            controls_layout.addWidget(pause_btn, 0, 1)
+            controls_layout.addWidget(resume_btn, 1, 0)
+            controls_layout.addWidget(terminate_btn, 1, 1)
+            box_layout.addLayout(controls_layout)
+
+            stat_boxes.append({
+                'box': box,
+                'duration': duration_label,
+                'epoch': epoch_label,
+                'h': h_label,
+                'v': v_label,
+                'state': state_label,
+                'start_btn': start_btn,
+                'pause_btn': pause_btn,
+                'resume_btn': resume_btn,
+                'terminate_btn': terminate_btn,
+            })
+            stats_grid.addWidget(box, i // 2, i % 2)
+
+        tab_layout.addLayout(stats_grid)
+
+        # 自动停止控制
+        auto_stop_row = QHBoxLayout()
+        if is_com3:
+            stop_cb = QCheckBox("启用自动停止")
+            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
+            stop_cb.stateChanged.connect(lambda state: setattr(self, '_dir3_auto_stop_enabled', state == Qt.Checked))
+            auto_stop_row.addWidget(stop_cb)
+            auto_stop_row.addWidget(QLabel("最大时长(秒):"))
+            sec_spin = QSpinBox()
+            sec_spin.setRange(0, 7200)
+            sec_spin.setValue(self._dir3_auto_stop_sec)
+            sec_spin.setSuffix(" s")
+            sec_spin.valueChanged.connect(lambda v: setattr(self, '_dir3_auto_stop_sec', v))
+            auto_stop_row.addWidget(sec_spin)
+            auto_stop_row.addWidget(QLabel("最大历元数:"))
+            epoch_spin = QSpinBox()
+            epoch_spin.setRange(0, 100000)
+            epoch_spin.setValue(self._dir3_auto_stop_epochs)
+            epoch_spin.valueChanged.connect(lambda v: setattr(self, '_dir3_auto_stop_epochs', v))
+            auto_stop_row.addWidget(epoch_spin)
+        else:
+            stop_cb = QCheckBox("启用自动停止")
+            stop_cb.setStyleSheet("font-size: 13px; font-weight: bold;")
+            stop_cb.setToolTip("达到设定时长或历元数上限后自动停止该方向测试并保存ENU快照")
+            stop_cb.stateChanged.connect(self._on_auto_stop_toggled)
+            auto_stop_row.addWidget(stop_cb)
+            auto_stop_row.addWidget(QLabel("最大时长(秒):"))
+            sec_spin = QSpinBox()
+            sec_spin.setRange(0, 7200)
+            sec_spin.setValue(self._dir_auto_stop_sec)
+            sec_spin.setSuffix(" s")
+            sec_spin.valueChanged.connect(self._on_auto_stop_sec_changed)
+            auto_stop_row.addWidget(sec_spin)
+            auto_stop_row.addWidget(QLabel("最大历元数:"))
+            epoch_spin = QSpinBox()
+            epoch_spin.setRange(0, 100000)
+            epoch_spin.setValue(self._dir_auto_stop_epochs)
+            epoch_spin.valueChanged.connect(self._on_auto_stop_epoch_changed)
+            auto_stop_row.addWidget(epoch_spin)
+        auto_stop_row.addStretch()
+        tab_layout.addLayout(auto_stop_row)
+
+        # 统计柱状图
+        charts_layout = QVBoxLayout()
+        h_chart = pg.PlotWidget()
+        h_chart.setBackground('w')
+        h_chart.setLabel('left', '水平误差', units='m')
+        h_chart.setLabel('bottom', '方向')
+        h_chart.showGrid(y=True)
+        h_chart.setMaximumHeight(220)
+        charts_layout.addWidget(h_chart)
+
+        v_chart = pg.PlotWidget()
+        v_chart.setBackground('w')
+        v_chart.setLabel('left', '垂直误差', units='m')
+        v_chart.setLabel('bottom', '方向')
+        v_chart.showGrid(y=True)
+        v_chart.setMaximumHeight(220)
+        charts_layout.addWidget(v_chart)
+        tab_layout.addLayout(charts_layout)
+
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("重新测试（清空统计）")
+        reset_btn.setMinimumWidth(120)
+        if is_com3:
+            reset_btn.clicked.connect(self._reset_direction_stats3)
+        else:
+            reset_btn.clicked.connect(self._reset_direction_stats)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        tab_layout.addLayout(btn_row)
+
+        # 保存引用
+        if is_com3:
+            self.dir_stat_boxes3 = stat_boxes
+            self.dir_h_chart3 = h_chart
+            self.dir_v_chart3 = v_chart
+        else:
+            self.dir_stat_boxes = stat_boxes
+            self.dir_h_chart = h_chart
+            self.dir_v_chart = v_chart
+
+        content_widget.setMinimumHeight(tab_layout.sizeHint().height())
+        direction_scroll.setWidget(content_widget)
+        outer_layout.addWidget(direction_scroll)
+        title = f"串口3 (干扰测试2)" if is_com3 else f"串口2 (干扰测试)"
+        parent_tab.addTab(tab, title)
+
+    def _create_dir_enu_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        sub_tabs = QTabWidget()
+        self._dir_enu_curves = []
+        self._dir_enu_curves3 = []
+        self._dir_enu_plots = []
+
+        comp_names = ['东向', '北向', '天向']
+        comp_units = ['m', 'm', 'm']
+
+        for di in range(4):
+            dir_tab = QWidget()
+            dir_layout = QVBoxLayout(dir_tab)
+
+            # 每个方向有两个子标签：ENU1vsENU2 和 ENU1vsENU3
+            dir_comp_tabs = QTabWidget()
+
+            # --- 子标签1: ENU1 vs ENU2 ---
+            tab12 = QWidget()
+            lay12 = QVBoxLayout(tab12)
+            curves_for_dir = {}
+            plots_for_dir = []
+            for ci, (cname, cunit) in enumerate(zip(comp_names, comp_units)):
+                plot = pg.PlotWidget()
+                plot.setBackground('w')
+                plot.setLabel('left', cname, units=cunit)
+                if ci == 2:
+                    plot.setLabel('bottom', '时间', units='历元')
+                plot.showGrid(x=True, y=True)
+                plot.addLegend()
+                c1 = plot.plot([], [], pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
+                c2 = plot.plot([], [], pen={'color': '#2980b9', 'width': 2}, name='ENU2 (干扰测试)')
+                curves_for_dir[f'{["east","north","up"][ci]}1'] = c1
+                curves_for_dir[f'{["east","north","up"][ci]}2'] = c2
+                plots_for_dir.append(plot)
+                lay12.addWidget(plot)
+            dir_comp_tabs.addTab(tab12, "ENU1 vs ENU2")
+            self._dir_enu_curves.append(curves_for_dir)
+            self._dir_enu_plots.append(plots_for_dir)
+
+            # --- 子标签2: ENU1 vs ENU3 ---
+            tab13 = QWidget()
+            lay13 = QVBoxLayout(tab13)
+            curves_for_dir3 = {}
+            for ci, (cname, cunit) in enumerate(zip(comp_names, comp_units)):
+                plot = pg.PlotWidget()
+                plot.setBackground('w')
+                plot.setLabel('left', cname, units=cunit)
+                if ci == 2:
+                    plot.setLabel('bottom', '时间', units='历元')
+                plot.showGrid(x=True, y=True)
+                plot.addLegend()
+                c1 = plot.plot([], [], pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
+                c3 = plot.plot([], [], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name='ENU3 (干扰测试2)')
+                curves_for_dir3[f'{["east","north","up"][ci]}1'] = c1
+                curves_for_dir3[f'{["east","north","up"][ci]}3'] = c3
+                lay13.addWidget(plot)
+            dir_comp_tabs.addTab(tab13, "ENU1 vs ENU3")
+            self._dir_enu_curves3.append(curves_for_dir3)
+
+            dir_layout.addWidget(dir_comp_tabs)
+            sub_tabs.addTab(dir_tab, f"方向{di + 1}")
+
+        layout.addWidget(sub_tabs)
+        return tab
+
+    def _direction_context(self, port_id):
+        """返回指定测试串口的统计对象、界面卡片和活动索引属性名。"""
+        if port_id == 3:
+            return self.direction_stats3, self.dir_stat_boxes3, '_dir3_enu_active_index'
+        return self.direction_stats, self.dir_stat_boxes, '_dir_enu_active_index'
+
+    def _refresh_direction_controls(self, port_id, direction_index):
+        stats, boxes, _ = self._direction_context(port_id)
+        ds = stats[direction_index]
+        controls = boxes[direction_index]
+        states = {
+            'idle': ("状态: 未开始", "#7f8c8d"),
+            'running': ("状态: 测试中", "#27ae60"),
+            'paused': ("状态: 已暂停", "#f39c12"),
+            'terminated': ("状态: 已终止", "#c0392b"),
+        }
+        text, color = states[ds.state]
+        controls['state'].setText(text)
+        controls['state'].setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {color};")
+        controls['start_btn'].setEnabled(ds.state == 'idle')
+        controls['pause_btn'].setEnabled(ds.state == 'running')
+        controls['resume_btn'].setEnabled(ds.state == 'paused')
+        controls['terminate_btn'].setEnabled(ds.state in ('running', 'paused'))
+
+    def _pause_active_direction(self, port_id, except_index=None):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        for index, ds in enumerate(stats):
+            if ds.is_active and index != except_index:
+                self._save_enu_for_direction(index, stats, boxes)
+                ds.pause()
+                self._refresh_direction_controls(port_id, index)
+                self.log_info(f"方向{index + 1} 测试已自动暂停 (串口{port_id})")
+        active = next((i for i, ds in enumerate(stats) if ds.is_active), -1)
+        setattr(self, active_attr, active)
+
+    def _start_direction_test(self, port_id, direction_index):
+        stats, _, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state != 'idle':
+            return False
+        self._pause_active_direction(port_id, except_index=direction_index)
+        self._reset_enu_chart_data(port_id)
+        ds.clear_enu()
+        if not ds.start():
+            return False
+        setattr(self, active_attr, direction_index)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已启动 (串口{port_id})")
+        return True
+
+    def _pause_direction_test(self, port_id, direction_index):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if not ds.is_active:
+            return False
+        self._save_enu_for_direction(direction_index, stats, boxes)
+        ds.pause()
+        setattr(self, active_attr, -1)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已暂停 (串口{port_id})")
+        return True
+
+    def _resume_direction_test(self, port_id, direction_index):
+        stats, _, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state != 'paused':
+            return False
+        self._pause_active_direction(port_id, except_index=direction_index)
+        self._reset_enu_chart_data(port_id)
+        if not ds.start():
+            return False
+        setattr(self, active_attr, direction_index)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已继续 (串口{port_id})")
+        return True
+
+    def _terminate_direction_test(self, port_id, direction_index):
+        stats, boxes, active_attr = self._direction_context(port_id)
+        ds = stats[direction_index]
+        if ds.state not in ('running', 'paused'):
+            return False
+        if ds.is_active:
+            self._save_enu_for_direction(direction_index, stats, boxes)
+        ds.terminate()
+        if getattr(self, active_attr) == direction_index:
+            setattr(self, active_attr, -1)
+        self._refresh_direction_controls(port_id, direction_index)
+        self.log_info(f"方向{direction_index + 1} 测试已终止 (串口{port_id})")
+        return True
+
+    def _on_auto_stop_toggled(self, state):
+        self._dir_auto_stop_enabled = (state == Qt.Checked)
+        self.log_info(f"方向自动停止: {'启用' if self._dir_auto_stop_enabled else '禁用'}")
+
+    def _on_auto_stop_sec_changed(self, val):
+        self._dir_auto_stop_sec = val
+
+    def _on_auto_stop_epoch_changed(self, val):
+        self._dir_auto_stop_epochs = val
+
+    def _save_enu_for_active_direction(self):
+        self._pause_active_direction(2)
+
+    def _save_enu_for_active_direction3(self):
+        self._pause_active_direction(3)
+
+    def _save_enu_for_direction(self, direction_index, direction_stats=None, dir_stat_boxes=None):
+        if direction_stats is None:
+            direction_stats = self.direction_stats
+        if dir_stat_boxes is None:
+            dir_stat_boxes = self.dir_stat_boxes
+        ds = direction_stats[direction_index]
+        is_com3 = (direction_stats is self.direction_stats3)
+        if is_com3:
+            n_raw = len(self.enu3_times)
+            n1_total = len(self.enu1_3_times)
+            enu1_src = (self.enu1_3_times, self.enu1_3_east_data, self.enu1_3_north_data, self.enu1_3_up_data)
+        else:
+            n_raw = len(self.enu2_times)
+            n1_total = len(self.enu1_times)
+            enu1_src = (self.enu1_times, self.enu1_east_data, self.enu1_north_data, self.enu1_up_data)
+        if n_raw > 0:
+            n = min(n_raw, n1_total)
+            enu1_t = enu1_src[0][-n:] if n1_total >= n else list(enu1_src[0])
+            enu1_e = enu1_src[1][-n:] if n1_total >= n else list(enu1_src[1])
+            enu1_n = enu1_src[2][-n:] if n1_total >= n else list(enu1_src[2])
+            enu1_u = enu1_src[3][-n:] if n1_total >= n else list(enu1_src[3])
+            if is_com3:
+                enu3_t = self.enu3_times[-n:] if len(self.enu3_times) >= n else list(self.enu3_times)
+                enu3_e = self.enu3_east_data[-n:] if len(self.enu3_east_data) >= n else list(self.enu3_east_data)
+                enu3_n = self.enu3_north_data[-n:] if len(self.enu3_north_data) >= n else list(self.enu3_north_data)
+                enu3_u = self.enu3_up_data[-n:] if len(self.enu3_up_data) >= n else list(self.enu3_up_data)
+                ds.append_enu_snapshot(
+                    enu1_t, enu1_e, enu1_n, enu1_u,
+                    [], [], [], [],
+                    enu3_t, enu3_e, enu3_n, enu3_u)
+                self.log_info(f"方向{direction_index + 1} ENU3数据已保存 (ENU1: {len(enu1_e)}点, ENU3: {len(enu3_e)}点)")
+            else:
+                enu2_t = self.enu2_times[-n:] if len(self.enu2_times) >= n else list(self.enu2_times)
+                enu2_e = self.enu2_east_data[-n:] if len(self.enu2_east_data) >= n else list(self.enu2_east_data)
+                enu2_n = self.enu2_north_data[-n:] if len(self.enu2_north_data) >= n else list(self.enu2_north_data)
+                enu2_u = self.enu2_up_data[-n:] if len(self.enu2_up_data) >= n else list(self.enu2_up_data)
+                ds.append_enu_snapshot(
+                    enu1_t, enu1_e, enu1_n, enu1_u,
+                    enu2_t, enu2_e, enu2_n, enu2_u)
+                self.log_info(f"方向{direction_index + 1} ENU数据已保存 (ENU1: {len(enu1_e)}点, ENU2: {len(enu2_e)}点)")
+
+    def _reset_enu_chart_data(self, port=0):
+        """重置ENU图表数据。port: 1=ENU1参考, 2=ENU2(串口2), 3=ENU3(串口3), 0=全部"""
+        # ENU1 串口2侧（左列图表）
+        if port in (0, 2):
+            self.enu1_times = []
+            self.enu1_east_data = []
+            self.enu1_north_data = []
+            self.enu1_up_data = []
+            self._std_enu1_east.reset()
+            self._std_enu1_north.reset()
+            self._std_enu1_up.reset()
+            self.enu1_east_curve.setData([], [])
+            self.enu1_north_curve.setData([], [])
+            self.enu1_up_curve.setData([], [])
+
+        # ENU1 串口3侧（右列图表，独立副本）
+        if port in (0, 3):
+            self.enu1_3_times = []
+            self.enu1_3_east_data = []
+            self.enu1_3_north_data = []
+            self.enu1_3_up_data = []
+            self._std_enu1_3_east.reset()
+            self._std_enu1_3_north.reset()
+            self._std_enu1_3_up.reset()
+            self.enu1_13_east_curve.setData([], [])
+            self.enu1_13_north_curve.setData([], [])
+            self.enu1_13_up_curve.setData([], [])
+
+        if port in (0, 2):
+            self.enu2_times = []
+            self.enu2_east_data = []
+            self.enu2_north_data = []
+            self.enu2_up_data = []
+            self._std_enu2_east.reset()
+            self._std_enu2_north.reset()
+            self._std_enu2_up.reset()
+            self.enu2_east_curve.setData([], [])
+            self.enu2_north_curve.setData([], [])
+            self.enu2_up_curve.setData([], [])
+
+        if port in (0, 3):
+            self.enu3_times = []
+            self.enu3_east_data = []
+            self.enu3_north_data = []
+            self.enu3_up_data = []
+            self._std_enu3_east.reset()
+            self._std_enu3_north.reset()
+            self._std_enu3_up.reset()
+            self.enu3_east_curve.setData([], [])
+            self.enu3_north_curve.setData([], [])
+            self.enu3_up_curve.setData([], [])
+
+    def _feed_direction_stats(self):
+        # 串口2方向测试数据馈入
+        if self._p2_gga_new_epoch:
+            if self.enu2_ref_ready:
+                self._p2_gga_new_epoch = False
+                self._do_feed_direction_stats(self._latest_enu2_east, self._latest_enu2_north, self._latest_enu2_up, self._latest_p2_quality,
+                    self.direction_stats, self.dir_stat_boxes, self._dir_auto_stop_enabled, self._dir_auto_stop_sec, self._dir_auto_stop_epochs)
+
+    def _feed_direction_stats3(self):
+        # 串口3方向测试数据馈入
+        if self._p3_gga_new_epoch:
+            if self.enu3_ref_ready:
+                self._p3_gga_new_epoch = False
+                self._do_feed_direction_stats(self._latest_enu3_east, self._latest_enu3_north, self._latest_enu3_up, self._latest_p3_quality,
+                    self.direction_stats3, self.dir_stat_boxes3, self._dir3_auto_stop_enabled, self._dir3_auto_stop_sec, self._dir3_auto_stop_epochs)
+
+    def _do_feed_direction_stats(self, east, north, up, quality, direction_stats, dir_stat_boxes, auto_stop_enabled, auto_stop_sec, auto_stop_epochs):
+        for i in range(4):
+            ds = direction_stats[i]
+            if ds._active:
+                ds.add_epoch(east, north, up, quality)
+                if auto_stop_enabled:
+                    stopped = False
+                    if auto_stop_sec > 0 and ds.duration >= auto_stop_sec:
+                        stopped = True
+                        reason = f"达到设定时长 {auto_stop_sec} 秒"
+                    if not stopped and auto_stop_epochs > 0 and ds.total_epochs >= auto_stop_epochs:
+                        stopped = True
+                        reason = f"达到设定历元数 {auto_stop_epochs}"
+                    if stopped:
+                        self._save_enu_for_direction(i, direction_stats, dir_stat_boxes)
+                        ds.terminate()
+                        port_id = 3 if direction_stats is self.direction_stats3 else 2
+                        active_attr = '_dir3_enu_active_index' if port_id == 3 else '_dir_enu_active_index'
+                        if getattr(self, active_attr) == i:
+                            setattr(self, active_attr, -1)
+                        self._refresh_direction_controls(port_id, i)
+                        self.log_info(f"方向{i + 1} 自动停止 ({reason})")
+
+    def _update_direction_stats_display(self):
+        # 串口2方向测试显示
+        for i in range(4):
+            ds = self.direction_stats[i]
+            if ds._active:
+                ds.update_duration()
+            stats = ds.get_stats()
+            labels = self.dir_stat_boxes[i]
+            labels['duration'].setText(f"测试时长: {stats['duration']}")
+            labels['epoch'].setText(
+                f"总历元: {stats['total_epochs']} | 成功: {stats['successful_epochs']} | 成功率: {stats['success_rate']:.1f}%")
+            labels['h'].setText(
+                f"水平误差 均值: {stats['h_mean']:.3f} m | 最大: {stats['h_max']:.3f} m")
+            labels['v'].setText(
+                f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
+        self._update_direction_charts()
+        # 串口3方向测试显示
+        for i in range(4):
+            ds = self.direction_stats3[i]
+            if ds._active:
+                ds.update_duration()
+            stats = ds.get_stats()
+            labels = self.dir_stat_boxes3[i]
+            labels['duration'].setText(f"测试时长: {stats['duration']}")
+            labels['epoch'].setText(
+                f"总历元: {stats['total_epochs']} | 成功: {stats['successful_epochs']} | 成功率: {stats['success_rate']:.1f}%")
+            labels['h'].setText(
+                f"水平误差 均值: {stats['h_mean']:.3f} m | 最大: {stats['h_max']:.3f} m")
+            labels['v'].setText(
+                f"垂直误差 均值: {stats['v_mean']:.3f} m | 最大: {stats['v_max']:.3f} m")
+        self._update_direction_charts3()
+        self._update_direction_enu_charts()
+
+    def _update_direction_charts(self):
+        x = [1, 2, 3, 4]
+        h_means = [self.direction_stats[i].h_mean for i in range(4)]
+        h_maxs = [self.direction_stats[i].h_max for i in range(4)]
+        v_means = [self.direction_stats[i].v_mean for i in range(4)]
+        v_maxs = [self.direction_stats[i].v_max for i in range(4)]
+
+        if not hasattr(self, '_dir_h_bar_mean'):
+            self._dir_h_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
+            self._dir_h_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
+            self.dir_h_chart.addLegend()
+            self.dir_h_chart.addItem(self._dir_h_bar_mean)
+            self.dir_h_chart.addItem(self._dir_h_bar_max)
+        else:
+            self._dir_h_bar_mean.setOpts(height=h_means)
+            self._dir_h_bar_max.setOpts(height=h_maxs)
+        ax_h = self.dir_h_chart.getAxis('bottom')
+        ax_h.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
+        if not hasattr(self, '_dir_v_bar_mean'):
+            self._dir_v_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
+            self._dir_v_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
+            self.dir_v_chart.addLegend()
+            self.dir_v_chart.addItem(self._dir_v_bar_mean)
+            self.dir_v_chart.addItem(self._dir_v_bar_max)
+        else:
+            self._dir_v_bar_mean.setOpts(height=v_means)
+            self._dir_v_bar_max.setOpts(height=v_maxs)
+        ax_v = self.dir_v_chart.getAxis('bottom')
+        ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
+    def _update_direction_charts3(self):
+        x = [1, 2, 3, 4]
+        h_means = [self.direction_stats3[i].h_mean for i in range(4)]
+        h_maxs = [self.direction_stats3[i].h_max for i in range(4)]
+        v_means = [self.direction_stats3[i].v_mean for i in range(4)]
+        v_maxs = [self.direction_stats3[i].v_max for i in range(4)]
+
+        if not hasattr(self, '_dir3_h_bar_mean'):
+            self._dir3_h_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=h_means, width=0.3, brush='#e74c3c', name='均值')
+            self._dir3_h_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=h_maxs, width=0.3, brush='#c0392b', name='最大值')
+            self.dir_h_chart3.addLegend()
+            self.dir_h_chart3.addItem(self._dir3_h_bar_mean)
+            self.dir_h_chart3.addItem(self._dir3_h_bar_max)
+        else:
+            self._dir3_h_bar_mean.setOpts(height=h_means)
+            self._dir3_h_bar_max.setOpts(height=h_maxs)
+        ax_h = self.dir_h_chart3.getAxis('bottom')
+        ax_h.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
+        if not hasattr(self, '_dir3_v_bar_mean'):
+            self._dir3_v_bar_mean = pg.BarGraphItem(x=[v - 0.15 for v in x], height=v_means, width=0.3, brush='#27ae60', name='均值')
+            self._dir3_v_bar_max = pg.BarGraphItem(x=[v + 0.15 for v in x], height=v_maxs, width=0.3, brush='#1e8449', name='最大值')
+            self.dir_v_chart3.addLegend()
+            self.dir_v_chart3.addItem(self._dir3_v_bar_mean)
+            self.dir_v_chart3.addItem(self._dir3_v_bar_max)
+        else:
+            self._dir3_v_bar_mean.setOpts(height=v_means)
+            self._dir3_v_bar_max.setOpts(height=v_maxs)
+        ax_v = self.dir_v_chart3.getAxis('bottom')
+        ax_v.setTicks([[(1, '方向1'), (2, '方向2'), (3, '方向3'), (4, '方向4')]])
+
+    def _update_direction_enu_charts(self):
+        # 串口2方向ENU对比 (ENU1 vs ENU2)
+        for i in range(4):
+            ds = self.direction_stats[i]
+            curves = self._dir_enu_curves[i]
+            if ds.has_enu_data():
+                t1, e1, n1, u1 = ds.get_enu1_snapshot()
+                t2, e2, n2, u2 = ds.get_enu2_snapshot()
+                curves['east1'].setData(t1, e1)
+                curves['east2'].setData(t2, e2)
+                curves['north1'].setData(t1, n1)
+                curves['north2'].setData(t2, n2)
+                curves['up1'].setData(t1, u1)
+                curves['up2'].setData(t2, u2)
+            else:
+                for k in ('east1','east2','north1','north2','up1','up2'):
+                    if k in curves:
+                        curves[k].setData([], [])
+
+        # 串口3方向ENU对比 (ENU1 vs ENU3)
+        for i in range(4):
+            ds = self.direction_stats3[i]
+            curves = self._dir_enu_curves3[i]
+            if ds.has_enu_data():
+                t1, e1, n1, u1 = ds.get_enu1_snapshot()
+                t3, e3, n3, u3 = ds.get_enu3_snapshot()
+                curves['east1'].setData(t1, e1)
+                curves['east3'].setData(t3, e3)
+                curves['north1'].setData(t1, n1)
+                curves['north3'].setData(t3, n3)
+                curves['up1'].setData(t1, u1)
+                curves['up3'].setData(t3, u3)
+            else:
+                for k in ('east1','east3','north1','north3','up1','up3'):
+                    if k in curves:
+                        curves[k].setData([], [])
+
+    def _render_dir_enu_charts_for_report(self, report_dir, ts_str="", direction_stats=None, label2="ENU2 (干扰测试)", label3=None):
+        """为报告渲染方向ENU对比图
+        Args:
+            direction_stats: 方向统计列表(COM2用self.direction_stats, COM3用self.direction_stats3)
+            label2: 第二条曲线的标签(COM2用"ENU2 (干扰测试)", COM3用"ENU3 (干扰测试2)")
+            label3: 第三条曲线标签(为None则只画两条曲线)
+        """
+        if direction_stats is None:
+            direction_stats = self.direction_stats
+        QApplication.processEvents()
+        png_paths = []
+        for i in range(4):
+            ds = direction_stats[i]
+            if not ds.has_enu_data():
+                continue
+            t1, e1, n1, u1 = ds.get_enu1_snapshot()
+            if label3 is None:
+                # 双曲线模式: ENU1 vs ENU2 或 ENU1 vs ENU3
+                if direction_stats is self.direction_stats:
+                    _, d2e, d2n, d2u = ds.get_enu2_snapshot()
+                else:
+                    _, d2e, d2n, d2u = ds.get_enu3_snapshot()
+                components = [('东向 E', e1, d2e), ('北向 N', n1, d2n), ('天向 U', u1, d2u)]
+            else:
+                # 三曲线模式(保留兼容)
+                t2, e2, n2, u2 = ds.get_enu2_snapshot()
+                t3, e3, n3, u3 = ds.get_enu3_snapshot()
+                components = [('东向 E', e1, e2), ('北向 N', n1, n2), ('天向 U', u1, u2)]
+                components3 = [e3, n3, u3]
+
+            grid = pg.GraphicsLayoutWidget()
+            grid.resize(1000, 650)
+            grid.setBackground('w')
+            for r, (title, d1, d2) in enumerate(components):
+                p = grid.addPlot(row=r, col=0)
+                p.setLabel('left', title, units='m')
+                if r == 2:
+                    p.setLabel('bottom', '历元')
+                p.showGrid(x=True, y=True)
+                p.addLegend()
+                p.plot(t1, d1, pen={'color': '#e74c3c', 'width': 2}, name='ENU1 (无干扰)')
+                p.plot(t1, d2, pen={'color': '#2980b9', 'width': 2}, name=label2)
+                if label3 is not None:
+                    p.plot(t3, components3[r], pen={'color': '#f39c12', 'width': 2, 'style': Qt.DashLine}, name=label3)
+            grid.show()
+            # 多次 processEvents 确保 pyqtgraph GraphicsLayout 完成布局
+            for _ in range(5):
+                QApplication.processEvents()
+
+            prefix = 'com2' if direction_stats is self.direction_stats else 'com3'
+            png_name = f'dir{i + 1}_{prefix}_enu_{ts_str}.png' if ts_str else f'dir{i + 1}_{prefix}_enu.png'
+            png_path = os.path.join(report_dir, png_name)
+            grid.scene().setSceneRect(0, 0, 1000, 650)
+            exporter = ImageExporter(grid.scene())
+            exporter.parameters()['width'] = 1000
+            exporter.parameters()['height'] = 650
+            exporter.export(png_path)
+            grid.hide()
+            grid.deleteLater()
+            QApplication.processEvents()
+            png_paths.append((i + 1, png_name))
+
+        return png_paths
+
+    def _reset_direction_stats(self):
+        self._reset_enu_chart_data(2)
+        for i in range(4):
+            self.direction_stats[i].reset()
+            self._refresh_direction_controls(2, i)
+        self._dir_enu_active_index = -1
+        self._update_direction_charts()
+        self._update_direction_stats_display()
+        self.log_info("串口2方向测试已重新开始准备：全部统计和时长已清空")
+
+    def _reset_direction_stats3(self):
+        self._reset_enu_chart_data(3)
+        for i in range(4):
+            self.direction_stats3[i].reset()
+            self._refresh_direction_controls(3, i)
+        self._dir3_enu_active_index = -1
+        self._update_direction_charts3()
+        self._update_direction_stats_display()
+        self.log_info("串口3方向测试已重新开始准备：全部统计和时长已清空")
+
+    def reset_all_stats(self):
+        """重置所有统计"""
+        self.nmea_parser.clear()
+        self.nmea_parser2.clear()
+        self.nmea_parser3.clear()
+        self.gga_parser.clear()
+        self._last_gsv_sequence = {1: 0, 2: 0, 3: 0}
+        self.statistics.reset()
+        self.port1_satellites = {}
+        self.port2_satellites = {}
+        self.port3_satellites = {}  # [新增]
+        self._port1_snr_signals = {}
+        self._port2_snr_signals = {}
+        self._port3_snr_signals = {}  # [新增]
+        self._port1_snr_avg.reset()
+        self._port2_snr_avg.reset()
+        self._port3_snr_avg.reset()  # [新增]
+        self._snr_diff_avg.reset()
+        self._snr_diff2_avg.reset()  # [新增]
+        self._last_port1_snr.clear()
+        self._last_port2_snr.clear()
+        self._last_port3_snr.clear()  # [新增]
+        self._last_snr_diff.clear()
+        self._last_snr_diff2.clear()  # [新增]
+        self._last_snr_data = None
+        self.enu1_ref_point = None
+        self.enu1_ref_ready = False
+        self.enu1_buffer = []
+        self.enu1_times = []
+        self.enu1_east_data = []
+        self.enu1_north_data = []
+        self.enu1_up_data = []
+        self.enu1_3_times = []
+        self.enu1_3_east_data = []
+        self.enu1_3_north_data = []
+        self.enu1_3_up_data = []
+        self.enu1_east_curve.setData([], [])
+        self.enu1_north_curve.setData([], [])
+        self.enu1_up_curve.setData([], [])
+        self.enu1_13_east_curve.setData([], [])
+        self.enu1_13_north_curve.setData([], [])
+        self.enu1_13_up_curve.setData([], [])
+        self.enu1_east_label.setText("东: -- m")
+        self.enu1_north_label.setText("北: -- m")
+        self.enu1_up_label.setText("天: -- m")
+        if self.enu_auto_mode:
+            self.enu1_ref_label.setText("ENU1 基准: 自动采集中...")
+            self.enu2_ref_label.setText("ENU2 基准: 自动采集中...")
+            self.enu3_ref_label.setText("ENU3 基准: 自动采集中...")  # [新增]
+            self.enu1_points_label.setText("(0/100)")
+            self.enu2_points_label.setText("(0/100)")
+            self.enu3_points_label.setText("(0/100)")  # [新增]
+        elif self.enu_instant_mode:
+            self.enu1_ref_label.setText("ENU1 基准: 等待瞬时GGA...")
+            self.enu2_ref_label.setText("ENU2 基准: 等待瞬时GGA...")
+            self.enu3_ref_label.setText("ENU3 基准: 等待瞬时GGA...")  # [新增]
+            self.enu1_points_label.setText("(瞬时)")
+            self.enu2_points_label.setText("(瞬时)")
+            self.enu3_points_label.setText("(瞬时)")  # [新增]
+        else:
+            self.enu1_ref_label.setText("ENU1 基准: 等待手动输入")
+            self.enu2_ref_label.setText("ENU2 基准: 等待手动输入")
+            self.enu3_ref_label.setText("ENU3 基准: 等待手动输入")  # [新增]
+            self.enu1_points_label.setText("(手动)")
+            self.enu2_points_label.setText("(手动)")
+            self.enu3_points_label.setText("(手动)")  # [新增]
+
+        self.enu2_ref_point = None
+        self.enu2_ref_ready = False
+        self.enu2_buffer = []
+        self.enu2_times = []
+        self.enu2_east_data = []
+        self.enu2_north_data = []
+        self.enu2_up_data = []
+        self.enu2_east_curve.setData([], [])
+        self.enu2_north_curve.setData([], [])
+        self.enu2_up_curve.setData([], [])
+        self.enu2_east_label.setText("东: -- m")
+        self.enu2_north_label.setText("北: -- m")
+        self.enu2_up_label.setText("天: -- m")
+
+        # [新增] 重置串口3 ENU
+        self.enu3_ref_point = None
+        self.enu3_ref_ready = False
+        self.enu3_buffer = []
+        self.enu3_times = []
+        self.enu3_east_data = []
+        self.enu3_north_data = []
+        self.enu3_up_data = []
+        self.enu3_east_curve.setData([], [])
+        self.enu3_north_curve.setData([], [])
+        self.enu3_up_curve.setData([], [])
+        self.enu3_east_label.setText("东: -- m")
+        self.enu3_north_label.setText("北: -- m")
+        self.enu3_up_label.setText("天: -- m")
+
+        self.enu1_std_east.setText("E: -- m")
+        self.enu1_std_north.setText("N: -- m")
+        self.enu1_std_up.setText("U: -- m")
+        self.enu2_std_east.setText("E: -- m")
+        self.enu2_std_north.setText("N: -- m")
+        self.enu2_std_up.setText("U: -- m")
+        self.enu3_std_east.setText("E: -- m")  # [新增]
+        self.enu3_std_north.setText("N: -- m")  # [新增]
+        self.enu3_std_up.setText("U: -- m")  # [新增]
+
+        self._std_enu1_east.reset()
+        self._std_enu1_north.reset()
+        self._std_enu1_up.reset()
+        self._std_enu2_east.reset()
+        self._std_enu2_north.reset()
+        self._std_enu2_up.reset()
+        self._std_enu3_east.reset()  # [新增]
+        self._std_enu3_north.reset()  # [新增]
+        self._std_enu3_up.reset()  # [新增]
+        self._std_enu1_3_east.reset()
+        self._std_enu1_3_north.reset()
+        self._std_enu1_3_up.reset()
+        self._enu2_outlier_count = 0
+        self._enu3_outlier_count = 0
+
+        # 重置串口1 GGA显示
+        self.p1_utc_label.setText("-")
+        self.p1_lat_label.setText("-")
+        self.p1_lon_label.setText("-")
+        self.p1_alt_label.setText("-")
+        self.p1_quality_label.setText("无数据")
+        self.p1_nsats_label.setText("0")
+
+        # 重置串口2 GGA显示
+        self.p2_utc_label.setText("-")
+        self.p2_lat_label.setText("-")
+        self.p2_lon_label.setText("-")
+        self.p2_alt_label.setText("-")
+        self.p2_quality_label.setText("无数据")
+        self.p2_nsats_label.setText("0")
+
+        # [新增] 重置串口3 GGA显示
+        self.p3_utc_label.setText("-")
+        self.p3_lat_label.setText("-")
+        self.p3_lon_label.setText("-")
+        self.p3_alt_label.setText("-")
+        self.p3_quality_label.setText("无数据")
+        self.p3_nsats_label.setText("0")
+
+        self.p1_gga_nsat = 0
+        self.p2_gga_nsat = 0
+        self.p3_gga_nsat = 0  # [新增]
+
+        # 重置方向统计
+        self._reset_direction_stats()
+        self._reset_direction_stats3()
+        self._latest_enu2_east = None
+        self._latest_enu2_north = None
+        self._latest_enu2_up = None
+        self._latest_enu3_east = None
+        self._latest_enu3_north = None
+        self._latest_enu3_up = None
+        self._p2_gga_new_epoch = False
+        self._p3_gga_new_epoch = False  # [新增]
+        self._latest_p2_quality = 0
+        self._latest_p3_quality = 0  # [新增]
+        self.gps_week = 0
+        self.gps_sow = 0.0
+        self.p1_ttff_s = self.p2_ttff_s = self.p3_ttff_s = 0.0
+        self.p1_ttff_label.setText("-")
+        self.p2_ttff_label.setText("-")
+        self.p3_ttff_label.setText("-")
+
+        self.update_plots()
+        self.log_info("统计已重置")
+    
+    def clear_all_data(self):
+        """清空所有数据"""
+        self.data_preview.clear()
+        self.log_window.clear()
+        self.serial_save_buffer = deque(maxlen=40000)
+        self.serial2_save_buffer = deque(maxlen=40000)
+        self.serial3_save_buffer = deque(maxlen=40000)  # [新增]
+        self.data_count_label.setText("已读取: 0 行")
+        self.reset_all_stats()
+        if self.auto_log_enabled:
+            self._open_auto_log_files()
+
+    def clear_data_preview(self):
+        """清空数据预览"""
+        self._preview_pending.clear()
+        self.data_preview.clear()
+
+    def clear_log(self):
+        """清除日志窗口"""
+        self.log_window.clear()
+        self.log_info("日志已清除")
+
+    def save_serial_log(self, port_id):
+        from PyQt5.QtWidgets import QFileDialog
+        if port_id == 1:
+            buf = self.serial_save_buffer
+        elif port_id == 2:
+            buf = self.serial2_save_buffer
+        else:  # [新增] port_id == 3
+            buf = self.serial3_save_buffer
+        if not buf:
+            QMessageBox.warning(self, "警告", f"串口{port_id}没有可保存的日志数据")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, f"保存串口{port_id}日志", 
+            f"serial_port{port_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+            "日志文件 (*.log);;文本文件 (*.txt);;所有文件 (*.*)")
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    for data in buf:
+                        f.write(data.decode('utf-8', errors='replace') if isinstance(data, bytes) else str(data))
+                self.log_info(f"串口{port_id}日志已保存到: {file_path}")
+                QMessageBox.information(self, "成功", f"串口{port_id}日志已保存到:\n{file_path}")
+            except Exception as e:
+                self.log_error(f"保存串口{port_id}日志失败: {str(e)}")
+                QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
+
+    def _save_all_serial_logs(self):
+        """保存所有串口的日志"""
+        from PyQt5.QtWidgets import QFileDialog
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存全部日志",
+            f"all_serial_logs_{ts}.txt",
+            "文本文件 (*.txt);;所有文件 (*.*)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                for port_id, buf in [(1, self.serial_save_buffer), (2, self.serial2_save_buffer), (3, self.serial3_save_buffer)]:
+                    if buf:
+                        f.write(f"=== 串口{port_id} 日志 ({len(buf)} 条) ===\n")
+                        for data in buf:
+                            f.write(data.decode('utf-8', errors='replace') if isinstance(data, bytes) else str(data))
+                        f.write("\n")
+                    else:
+                        f.write(f"=== 串口{port_id} 日志: 无数据 ===\n\n")
+            self.log_info(f"全部日志已保存到: {file_path}")
+            QMessageBox.information(self, "成功", f"全部日志已保存到:\n{file_path}")
+        except Exception as e:
+            self.log_error(f"保存全部日志失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"无法保存文件:\n{str(e)}")
+
+    def _apply_device_sn(self, port_id):
+        """应用设备序号并写入日志"""
+        sn_input = self.device_sn3_input if port_id == 3 else self.device_sn2_input
+        sn = sn_input.text().strip()
+        if not sn:
+            QMessageBox.warning(self, "警告", "请输入设备序号")
+            return
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"{sn} 设备序号开始测试"
+        self.log_info(f"[串口{port_id}] {log_msg}")
+        # 写入所有已开启的日志文件
+        for f in (self._log_file1, self._log_file2, self._log_file3):
+            if f and not f.closed:
+                try:
+                    f.write(f"[{ts}] {log_msg}\n")
+                    f.flush()
+                except Exception:
+                    pass
+
+    def _get_device_sn(self, direction_stats=None):
+        """根据方向统计列表获取对应端口的设备序号"""
+        if direction_stats is self.direction_stats3:
+            if hasattr(self, 'device_sn3_input'):
+                return self.device_sn3_input.text().strip() or "test"
+        else:
+            if hasattr(self, 'device_sn2_input'):
+                return self.device_sn2_input.text().strip() or "test"
+        return "test"
+
+    def _build_report_lines(self, png_map=None, direction_stats=None, port_label="串口2", enu_label="ENU2"):
+        """生成报告文本行
+        Args:
+            direction_stats: 方向统计列表(None=默认COM2, self.direction_stats3=COM3)
+            port_label: 串口标签
+            enu_label: ENU标签
+        """
+        if direction_stats is None:
+            direction_stats = self.direction_stats
+        is_com3_report = (direction_stats is self.direction_stats3)
+        lines = []
+
+        def w(line=""):
+            lines.append(line)
+
+        now = datetime.now()
+        now_date = now.strftime('%Y-%m-%d')
+
+        w(f"# 抗干扰天线测试报告")
+        w()
+        w(f"**生成时间:** {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        w()
+
+        port1_connected = self.serial_port1.serial_port is not None and self.serial_port1.serial_port.is_open
+        port2_connected = self.serial_port2.serial_port is not None and self.serial_port2.serial_port.is_open
+        port3_connected = self.serial_port3.serial_port is not None and self.serial_port3.serial_port.is_open  # [新增]
+        p1_port_name = self.port1_combo.currentText() if port1_connected else "-"
+        p2_port_name = self.port2_combo.currentText() if port2_connected else "-"
+        p3_port_name = self.port3_combo.currentText() if port3_connected else "-"  # [新增]
+        p1_baud = self.port1_baud.currentText() if port1_connected else "-"
+        p2_baud = self.port2_baud.currentText() if port2_connected else "-"
+        p3_baud = self.port3_baud.currentText() if port3_connected else "-"  # [新增]
+        if is_com3_report:
+            w(f"**串口1 (无干扰):** {p1_port_name} @ {p1_baud} bps | **串口3 (干扰测试2):** {p3_port_name} @ {p3_baud} bps")
+        else:
+            w(f"**串口1 (无干扰):** {p1_port_name} @ {p1_baud} bps | **串口2 (干扰测试):** {p2_port_name} @ {p2_baud} bps")
+        w()
+
+        w("## 一、实验配置")
+        w()
+        w("### 1.1 基本信息")
+        w()
+        w("| 项目 | 内容 |")
+        w("|------|------|")
+        test_location = self.test_location_input.text().strip() or "长沙"
+        dut_model = self.dut_model_input.text().strip() or "4 阵元 GNSS 抗干扰天线"
+        array_form = self.array_form_combo.currentText().strip() or "4 阵元 GNSS 抗干扰天线"
+        jam_type = self.jam_type_combo.currentText().strip() or "线性扫频干扰"
+        azimuth = self.azimuth_input.text().strip() or "正东 / 正南 / 正西 / 正北"
+        antenna_spacing = self.antenna_spacing_input.text().strip() or "3 m"
+        antenna_height = self.antenna_height_input.text().strip() or "1.5 m"
+
+        w(f"| 测试日期 | {now_date} |")
+        w(f"| 测试地点 | {test_location} |")
+        w(f"| 待测设备型号 | {dut_model} |")
+        w(f"| 阵列形式 | {array_form} |")
+        w(f"| 干扰类型 | {jam_type} |")
+        w(f"| 入射方位 | {azimuth} |")
+        w(f"| 收发天线间距 | {antenna_spacing} |")
+        w(f"| 天线架设高度 | {antenna_height} |")
+        w()
+
+        w("### 1.2 UBX 首次定位时间")
+        w()
+        w("| 端口 | 首次定位时间 (s) |")
+        w("|------|------------------|")
+        p1_ttff_str = f"{self.p1_ttff_s:.1f}" if self.p1_ttff_s > 0 else "尚未定位"
+        p2_ttff_str = f"{self.p2_ttff_s:.1f}" if self.p2_ttff_s > 0 else "尚未定位"
+        p3_ttff_str = f"{self.p3_ttff_s:.1f}" if self.p3_ttff_s > 0 else "尚未定位"  # [新增]
+        w(f"| 串口1 (无干扰) | {p1_ttff_str} |")
+        w(f"| 串口2 (干扰测试) | {p2_ttff_str} |")
+        w(f"| 串口3 (干扰测试2) | {p3_ttff_str} |")  # [新增]
+        w()
+
+        def calc_std(arr):
+            if len(arr) <= 1:
+                return 0.0
+            m = sum(arr) / len(arr)
+            variance = sum(v * v for v in arr) / len(arr) - m * m
+            return math.sqrt(variance) if variance > 0 else 0.0
+
+        all_snr_keys = sorted(
+            set(self.port1_satellites.keys()) | set(self.port2_satellites.keys()) | set(self.port3_satellites.keys()),
+            key=self._snr_sort_key)
+        system_names = {"GP": "GPS", "BD": "BDS", "GL": "GLONASS", "GA": "Galileo", "GB": "BDS-3", "GN": "GNSS"}
+
+        section_names = ["二", "三", "四", "五"]
+        tested = [(i, direction_stats[i]) for i in range(4) if direction_stats[i].total_epochs > 0]
+        for idx, (i, ds) in enumerate(tested):
+            sec_name = section_names[idx]
+            sec_num = idx + 2
+            ds.update_duration()
+            s = ds.get_stats()
+
+            w(f"## {sec_name}、方向{i + 1} 测试数据")
+            w()
+
+            w(f"### {sec_num}.1 GGA 数据分析")
+            w()
+            w("| 项目 | 数值 |")
+            w("|------|------|")
+            w(f"| 方向 | 方向{i + 1} |")
+            w(f"| 测试时长 | {s['duration']} |")
+            w(f"| 成功定位/总历元数 | {s['successful_epochs']}/{s['total_epochs']} |")
+
+            if ds.has_enu_data():
+                _, e1, n1, u1 = ds.get_enu1_snapshot()
+                if is_com3_report:
+                    _, e2, n2, u2 = ds.get_enu3_snapshot()
+                else:
+                    _, e2, n2, u2 = ds.get_enu2_snapshot()
+                es = calc_std(e2); ns = calc_std(n2); us = calc_std(u2)
+                e_max = max(abs(v) for v in e2) if e2 else 0.0
+                n_max = max(abs(v) for v in n2) if n2 else 0.0
+                u_max = max(abs(v) for v in u2) if u2 else 0.0
+            else:
+                es = ns = us = 0.0
+                e_max = n_max = u_max = 0.0
+
+            w(f"| 东向标准差 | {es:.4f} m |")
+            w(f"| 东向最大值 | {e_max:.4f} m |")
+            w(f"| 北向标准差 | {ns:.4f} m |")
+            w(f"| 北向最大值 | {n_max:.4f} m |")
+            w(f"| 天向标准差 | {us:.4f} m |")
+            w(f"| 天向最大值 | {u_max:.4f} m |")
+            w()
+
+            w(f"### {sec_num}.2 GSV 卫星信噪比分析")
+            w()
+            w("| 星座 | PRN | 信号 | 串口1载噪比均值 | 串口2载噪比均值 | 恶化值1-2 | 串口3载噪比均值 | 恶化值1-3 |")
+            w("|------|-----|------|---------------|---------------|-----------|---------------|-----------|")
+            for key in all_snr_keys:
+                sys, signal_id, prn = self._snr_key_parts(key)
+                sys_name = system_names.get(sys, sys)
+                signal = self._port1_snr_signals.get(key) or self._port2_snr_signals.get(key) or self._port3_snr_signals.get(key) or '---'
+                a1 = self._port1_snr_avg.get(key)
+                a2 = self._port2_snr_avg.get(key)
+                a3 = self._port3_snr_avg.get(key)  # [新增]
+                ad = self._snr_diff_avg.get(key)
+                ad2 = self._snr_diff2_avg.get(key)  # [新增]
+                a1_str = f"{a1:.1f}" if a1 is not None else "--"
+                a2_str = f"{a2:.1f}" if a2 is not None else "--"
+                a3_str = f"{a3:.1f}" if a3 is not None else "--"  # [新增]
+                ad_str = f"{ad:+.1f}" if ad is not None else "--"
+                ad2_str = f"{ad2:+.1f}" if ad2 is not None else "--"  # [新增]
+                w(f"| {sys_name} | {prn:02d} | {signal} | {a1_str} | {a2_str} | {ad_str} | {a3_str} | {ad2_str} |")
+            w()
+
+            if png_map and (i + 1) in png_map:
+                w(f"### {sec_num}.3 ENU 误差对比图")
+                w()
+                w(f"![方向{i + 1} ENU误差对比]({png_map[i + 1]})")
+                w()
+
+        cnums = ["", "一", "二", "三", "四", "五", "六", "七"]
+        next_sec = cnums[len(tested) + 2]
+        w(f"## {next_sec}、抗干扰设备信息")
+        w()
+        w("| 项目 | 说明 |")
+        w("|------|------|")
+        sn = self._get_device_sn(direction_stats)
+        w(f"| 设备序号 | {sn if sn else ''} |")
+        w("| 备注 | |")
+        w()
+
+        w("---")
+        w()
+        w(f"*报告由 NMEA 数据实时分析系统自动生成 | {now.strftime('%Y-%m-%d %H:%M:%S')}*")
+
+        return lines, now.strftime('%Y%m%d_%H%M%S')
+
+    @staticmethod
+    def _md_lines_to_html(lines, report_dir):
+        html = ['<!DOCTYPE html><html><head><meta charset="utf-8"><style>',
+                'body{font-family:SimSun,sans-serif;font-size:12pt;margin:20px;}',
+                'h1{font-size:18pt;text-align:center;margin:10px 0;}',
+                'h2{font-size:14pt;border-bottom:1px solid #000;padding-bottom:2px;margin:16px 0 8px 0;}',
+                'h3{font-size:12pt;margin:12px 0 6px 0;}',
+                'table{border-collapse:collapse;margin:8px 0;}',
+                'th,td{border:1px solid #000;padding:3px 6px;font-size:10pt;}',
+                'th{background-color:#ddd;font-weight:bold;}',
+                'img{width:620px;}',
+                'hr{border:none;border-top:1px solid #ccc;margin:15px 0;}',
+                'ul{margin:5px 0;padding-left:20px;}',
+                'li{font-size:11pt;margin:2px 0;}',
+                'p{font-size:11pt;margin:4px 0;}',
+                '</style></head><body>']
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if line.startswith('|'):
+                tbl_lines = []
+                while i < len(lines) and lines[i].startswith('|'):
+                    tbl_lines.append(lines[i])
+                    i += 1
+
+                ti = 0
+                while ti < len(tbl_lines):
+                    header_cells = [c.strip() for c in tbl_lines[ti].split('|')[1:-1]]
+                    ti += 1
+                    if ti < len(tbl_lines):
+                        sep_cells = [c.strip() for c in tbl_lines[ti].split('|')[1:-1]]
+                        if all(re.match(r'^[-:]+$', c) for c in sep_cells):
+                            ti += 1
+
+                    html.append('<table width="100%">')
+                    html.append('<tr>')
+                    for cell in header_cells:
+                        cell = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', cell)
+                        html.append(f'<th>{cell}</th>')
+                    html.append('</tr>')
+
+                    while ti < len(tbl_lines):
+                        nc = [c.strip() for c in tbl_lines[ti].split('|')[1:-1]]
+                        if all(re.match(r'^[-:]+$', c) for c in nc):
+                            break
+                        html.append('<tr>')
+                        for cell in nc:
+                            cell = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', cell)
+                            html.append(f'<td>{cell}</td>')
+                        html.append('</tr>')
+                        ti += 1
+                    html.append('</table>')
+                continue
+
+            m = re.match(r'^(#{1,3})\s+(.+)$', line)
+            if m:
+                level = len(m.group(1))
+                text = m.group(2)
+                text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+                text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+                html.append(f'<h{level}>{text}</h{level}>')
+                i += 1
+                continue
+
+            m = re.match(r'^!\[(.+?)\]\((.+?)\)$', line)
+            if m:
+                alt = m.group(1)
+                img_name = m.group(2)
+                abs_path = os.path.join(report_dir, img_name).replace('\\', '/')
+                html.append(f'<p><img src="file:///{abs_path}" width="620" alt="{alt}"></p>')
+                i += 1
+                continue
+
+            if line.strip() == '---':
+                html.append('<hr>')
+                i += 1
+                continue
+
+            if re.match(r'^-\s+', line):
+                html.append('<ul>')
+                while i < len(lines) and re.match(r'^-\s+', lines[i]):
+                    text = lines[i][2:]
+                    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+                    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+                    html.append(f'<li>{text}</li>')
+                    i += 1
+                html.append('</ul>')
+                continue
+
+            if not line.strip():
+                i += 1
+                continue
+
+            text = line
+            text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+            text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+            html.append(f'<p>{text}</p>')
+            i += 1
+
+        html.append('</body></html>')
+        return '\n'.join(html)
+
+    # ========== 统一报告导出（合并原12个重复函数） ==========
+    def _do_export_report(self, ext="md", direction_stats=None, port_label="串口2", enu_label="ENU2",
+                          chart_label2="ENU2 (干扰测试)", file_prefix="抗干扰天线测试报告",
+                          dialog_title="导出测试报告"):
+        """统一报告导出核心实现"""
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        sn = self._get_device_sn(direction_stats)
+        default_name = f"{file_prefix}_{sn}_{ts_str}.{ext}"
+        reports_dir = os.path.join(APP_DIR, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        default_path = os.path.join(reports_dir, default_name)
+
+        from PyQt5.QtWidgets import QFileDialog
+        filt = "Markdown 文件 (*.md);;所有文件 (*.*)" if ext == "md" else "PDF 文件 (*.pdf);;所有文件 (*.*)"
+        file_path, _ = QFileDialog.getSaveFileName(self, dialog_title, default_path, filt)
+        if not file_path:
+            return
+
+        report_dir = os.path.dirname(file_path)
+        if not report_dir:
+            report_dir = APP_DIR
+
+        png_paths = self._render_dir_enu_charts_for_report(report_dir, ts_str, direction_stats, chart_label2)
+        png_map = {di: name for di, name in png_paths} if png_paths else None
+
+        lines, _ = self._build_report_lines(png_map, direction_stats, port_label, enu_label)
+
+        if ext == "md":
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+        else:
+            html_text = self._md_lines_to_html(lines, report_dir)
+            doc = QTextDocument()
+            doc.setHtml(html_text)
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(file_path)
+            printer.setPageSize(QPrinter.A4)
+            printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+            doc.print_(printer)
+
+        self.log_info(f"{dialog_title}已导出: {file_path}")
+        if png_paths:
+            self.log_info(f"共生成 {len(png_paths)} 张 ENU 对比图表")
+        QMessageBox.information(self, "导出成功", f"{dialog_title}已保存到:\n{file_path}")
+
+    # ========== 串口2独立报告导出 ==========
+    def export_test_report2(self):
+        try:
+            self._do_export_report(direction_stats=self.direction_stats, file_prefix="串口2测试报告",
+                                   dialog_title="导出串口2测试报告")
+        except Exception as e:
+            self.log_error(f"导出串口2报告失败: {str(e)}"); import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口2报告:\n{str(e)}")
+
+    def export_pdf_report2(self):
+        try:
+            self._do_export_report(ext="pdf", direction_stats=self.direction_stats, file_prefix="串口2测试报告",
+                                   dialog_title="导出串口2PDF报告")
+        except Exception as e:
+            self.log_error(f"导出串口2PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口2PDF报告:\n{str(e)}")
+
+    # ========== 串口3独立报告导出 ==========
+    def export_test_report3(self):
+        try:
+            self._do_export_report(ext="md", direction_stats=self.direction_stats3, port_label="串口3",
+                                   enu_label="ENU3", chart_label2="ENU3 (干扰测试2)",
+                                   file_prefix="串口3测试报告", dialog_title="导出串口3测试报告")
+        except Exception as e:
+            self.log_error(f"导出串口3报告失败: {str(e)}"); import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口3报告:\n{str(e)}")
+
+    def export_pdf_report3(self):
+        try:
+            self._do_export_report(ext="pdf", direction_stats=self.direction_stats3, port_label="串口3",
+                                   enu_label="ENU3", chart_label2="ENU3 (干扰测试2)",
+                                   file_prefix="串口3测试报告", dialog_title="导出串口3PDF报告")
+        except Exception as e:
+            self.log_error(f"导出串口3PDF报告失败: {str(e)}"); import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"无法生成串口3PDF报告:\n{str(e)}")
+
+    def _create_menu_bar(self):
+        """菜单栏与全局快捷键"""
+        mb = self.menuBar()
+
+        file_menu = mb.addMenu("文件(&F)")
+        act_save = file_menu.addAction("保存全部日志")
+        act_save.setShortcut("Ctrl+S")
+        act_save.triggered.connect(self._save_all_serial_logs)
+        act_snr = file_menu.addAction("导出SNR表(CSV)")
+        act_snr.triggered.connect(self._export_snr_csv)
+        file_menu.addSeparator()
+        act_exit = file_menu.addAction("退出")
+        act_exit.triggered.connect(self.close)
+
+        op_menu = mb.addMenu("操作(&O)")
+        act_refresh = op_menu.addAction("刷新串口列表")
+        act_refresh.setShortcut("F5")
+        act_refresh.triggered.connect(self._refresh_all_ports)
+        act_reset = op_menu.addAction("重置统计")
+        act_reset.setShortcut("Ctrl+R")
+        act_reset.triggered.connect(self.reset_all_stats)
+        act_clear = op_menu.addAction("清空数据")
+        act_clear.triggered.connect(self.clear_all_data)
+        op_menu.addSeparator()
+        act_selftest = op_menu.addAction("一键自检(无串口)...")
+        act_selftest.triggered.connect(self._open_selftest_dialog)
+
+    def _refresh_all_ports(self):
+        for pid in (1, 2, 3):
+            self.refresh_serial_ports(pid)
+
+    def _export_snr_csv(self):
+        """将当前卫星SNR对比表导出为CSV(UTF-8 BOM, Excel友好)"""
+        from PyQt5.QtWidgets import QFileDialog
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_dir = os.path.join(APP_DIR, 'reports')
+        os.makedirs(default_dir, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出SNR表", os.path.join(default_dir, f"snr_table_{ts}.csv"),
+            "CSV 文件 (*.csv);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            all_keys = sorted(
+                set(self.port1_satellites) | set(self.port2_satellites) | set(self.port3_satellites),
+                key=self._snr_sort_key)
+            header = ["星座", "PRN", "信号", "Port1", "Avg1", "Port2", "Avg2",
+                      "Delta", "AvgD", "Port3", "Avg3", "Delta2", "AvgD2"]
+
+            def fmt(v, plus=False):
+                if v is None:
+                    return "--"
+                return f"{v:+.1f}" if plus else f"{v:.1f}"
+
+            with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                f.write(",".join(header) + "\n")
+                for key in all_keys:
+                    s1 = self.port1_satellites.get(key)
+                    s2 = self.port2_satellites.get(key)
+                    s3 = self.port3_satellites.get(key)
+                    a1 = self._port1_snr_avg.get(key)
+                    a2 = self._port2_snr_avg.get(key)
+                    a3 = self._port3_snr_avg.get(key)
+                    ad = self._snr_diff_avg.get(key)
+                    ad2 = self._snr_diff2_avg.get(key)
+                    d1 = (s2 - s1) if (s1 is not None and s2 is not None) else None
+                    d2 = (s3 - s1) if (s1 is not None and s3 is not None) else None
+                    signal = (self._port1_snr_signals.get(key)
+                              or self._port2_snr_signals.get(key)
+                              or self._port3_snr_signals.get(key) or '---')
+                    talker, signal_id, prn = self._snr_key_parts(key)
+                    row = [talker, f"{prn:02d}", signal,
+                           fmt(s1), fmt(a1), fmt(s2), fmt(a2),
+                           fmt(d1, plus=True), fmt(ad, plus=True),
+                           fmt(s3), fmt(a3), fmt(d2, plus=True), fmt(ad2, plus=True)]
+                    f.write(",".join(row) + "\n")
+            self.log_info(f"SNR表已导出: {path}")
+            QMessageBox.information(self, "成功", f"SNR表已导出到:\n{path}")
+        except Exception as e:
+            self.log_error(f"导出SNR表失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"无法导出SNR表:\n{str(e)}")
+
+    def _open_selftest_dialog(self):
+        """一键自检参数对话框（无真实串口, 模拟数据全链路测试）"""
+        from src.simulation.selftest import SelfTestRunner
+
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is not None and runner.is_running():
+            QMessageBox.warning(self, "提示", "自检正在进行中，请等待完成")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("一键自检（无串口模拟测试）")
+        layout = QFormLayout(dlg)
+
+        minutes_spin = QSpinBox()
+        minutes_spin.setRange(5, 180)
+        minutes_spin.setValue(60)
+        minutes_spin.setSuffix(" 分钟")
+        layout.addRow("模拟时长:", minutes_spin)
+
+        speed_combo = QComboBox()
+        speed_combo.addItems(["2", "5", "10", "20", "50", "100"])
+        speed_combo.setCurrentText("10")
+        layout.addRow("加速倍率:", speed_combo)
+
+        seed_spin = QSpinBox()
+        seed_spin.setRange(0, 999999)
+        seed_spin.setValue(42)
+        layout.addRow("随机种子:", seed_spin)
+
+        direction_cb = QCheckBox("自动启停一轮方向测试（方向1）")
+        direction_cb.setChecked(True)
+        layout.addRow("", direction_cb)
+
+        est_label = QLabel()
+        est_label.setStyleSheet("color: #666;")
+        layout.addRow(est_label)
+
+        def update_est():
+            est = minutes_spin.value() * 60 / int(speed_combo.currentText())
+            est_label.setText(f"预计耗时约 {est:.0f} 秒（模拟 {minutes_spin.value()} 分钟 @ {speed_combo.currentText()}x）")
+
+        minutes_spin.valueChanged.connect(update_est)
+        speed_combo.currentTextChanged.connect(update_est)
+        update_est()
+
+        btn_row = QHBoxLayout()
+        start_btn = QPushButton("开始自检")
+        start_btn.setMinimumWidth(100)
+        start_btn.setStyleSheet("QPushButton { background-color: #8e44ad; color: white; font-weight: bold; } QPushButton:hover { background-color: #9b59b6; }")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(start_btn)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        layout.addRow(btn_row)
+
+        start_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        runner = SelfTestRunner(self)
+        self._selftest_runner = runner
+        runner.finished.connect(self._on_selftest_finished)
+        if runner.start(minutes_spin.value(), int(speed_combo.currentText()),
+                        seed_spin.value(), direction_cb.isChecked()):
+            self.selftest_btn.setEnabled(False)
+            self.selftest_progress.setValue(0)
+            self.selftest_progress.setVisible(True)
+            self.selftest_cancel_btn.setEnabled(True)
+            self.selftest_cancel_btn.setVisible(True)
+            self._selftest_ui_timer.start()
+        else:
+            self._selftest_runner = None
+
+    def _on_selftest_ui_tick(self):
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is not None and runner.is_running():
+            self.selftest_progress.setValue(int(runner.progress() * 100))
+
+    def _cancel_selftest(self):
+        runner = getattr(self, '_selftest_runner', None)
+        if runner is None or not runner.is_running():
+            return
+        self.selftest_cancel_btn.setEnabled(False)
+        runner.cancel()
+
+    def _update_rate_label(self):
+        now = time.monotonic()
+        dt = now - self._rate_t0
+        if dt <= 0:
+            return
+        parts = []
+        for pid in (1, 2, 3):
+            cnt = self._rate_counters.get(pid, 0)
+            rate = (cnt - self._rate_last.get(pid, 0)) / dt
+            self._rate_last[pid] = cnt
+            parts.append(f"{pid}:{rate:.1f}")
+        self._rate_t0 = now
+        self.rate_label.setText(f"速率: {' | '.join(parts)} 行/s")
+
+    def _on_selftest_finished(self, ok, results):
+        self.selftest_btn.setEnabled(True)
+        self._selftest_ui_timer.stop()
+        self.selftest_progress.setVisible(False)
+        self.selftest_cancel_btn.setVisible(False)
+        runner = getattr(self, '_selftest_runner', None)
+        report_dir = runner.report_dir if runner is not None else ''
+        npass = sum(1 for r in results if r[1])
+        body = '\n'.join(f"[{'通过' if r[1] else '失败'}] {r[0]} — {r[2]}" for r in results)
+        msg = f"自检完成: {npass}/{len(results)} 项通过\n\n{body}\n\n报告目录: {report_dir}"
+        self.log_info(f"自检结果: {npass}/{len(results)} 项通过, 报告目录: {report_dir}")
+        if ok:
+            QMessageBox.information(self, "自检结果", msg)
+        else:
+            QMessageBox.critical(self, "自检结果（存在失败项）", msg)
+
+    def _open_auto_log_files(self):
+        self._close_auto_log_files()
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path1 = os.path.join(self.auto_log_dir, f"serial1_{ts}.log")
+        path2 = os.path.join(self.auto_log_dir, f"serial2_{ts}.log")
+        path3 = os.path.join(self.auto_log_dir, f"serial3_{ts}.log")  # [新增]
+        f1 = f2 = f3 = None
+        try:
+            f1 = open(path1, 'w', encoding='utf-8')
+            f2 = open(path2, 'w', encoding='utf-8')
+            f3 = open(path3, 'w', encoding='utf-8')
+            self._log_file1, self._log_file2, self._log_file3 = f1, f2, f3
+            self._log_flush_count = {1: 0, 2: 0, 3: 0}
+            self.log_info(f"自动日志已开启: {path1}, {path2}, {path3}")  # [修改]
+        except Exception as e:
+            for opened in (f1, f2, f3):
+                if opened is not None:
+                    try:
+                        opened.close()
+                    except Exception:
+                        pass
+            self.log_error(f"无法创建日志文件: {str(e)}")
+            self._log_file1 = None
+            self._log_file2 = None
+            self._log_file3 = None  # [新增]
+
+    def _close_auto_log_files(self):
+        for f in (self._log_file1, self._log_file2, self._log_file3):  # [修改] 添加_log_file3
+            if f and not f.closed:
+                try:
+                    f.flush()
+                    f.close()
+                except:
+                    pass
+        self._log_file1 = None
+        self._log_file2 = None
+        self._log_file3 = None  # [新增]
+
+    def _write_auto_log(self, port_id, data):
+        if not self.auto_log_enabled:
+            return
+        if port_id == 1:
+            f = self._log_file1
+        elif port_id == 2:
+            f = self._log_file2
+        else:  # [新增] port_id == 3
+            f = self._log_file3
+        if f and not f.closed:
+            try:
+                line = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else str(data)
+                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                line = f"[{ts}] {line.strip()}\n"
+                f.write(line)
+                self._log_flush_count[port_id] += 1
+                if self._log_flush_count[port_id] >= self._LOG_FLUSH_INTERVAL:
+                    f.flush()
+                    self._log_flush_count[port_id] = 0
+            except Exception as exc:
+                # 避免调用 log_error 形成日志写入递归，仅在控制台保留诊断。
+                print(f"auto log write failed for port {port_id}: {exc}", file=sys.stderr)
+
+    def _on_auto_log_toggled(self):
+        self.auto_log_enabled = self.auto_log_cb.isChecked()
+        if self.auto_log_enabled:
+            self._open_auto_log_files()
+            self.log_info("自动日志保存已开启")
+        else:
+            self._close_auto_log_files()
+            self.log_info("自动日志保存已关闭")
+
+    def _write_info_to_logs(self, prefix, message):
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{ts}] {prefix}: {message}\n"
+        for f in (self._log_file1, self._log_file2, self._log_file3):  # [修改] 添加_log_file3
+            if f and not f.closed:
+                try:
+                    f.write(line)
+                    f.flush()
+                except:
+                    pass
+
+    def _trim_text_edit(self, edit, max_blocks=500, remove_blocks=200):
+        """限制QTextEdit块数，防止长期运行无限增长"""
+        if edit.document().blockCount() > max_blocks:
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, remove_blocks)
+            cursor.removeSelectedText()
+            cursor.movePosition(QTextCursor.End)
+
+    def log_info(self, message):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log_window.append(f"[{timestamp}] INFO: {message}")
+        self._trim_text_edit(self.log_window)
+        self.log_window.moveCursor(QTextCursor.End)
+        self._write_info_to_logs("INFO", message)
+
+    def log_error(self, message):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log_window.append(f"[{timestamp}] ERROR: {message}")
+        self._trim_text_edit(self.log_window)
+        self.log_window.moveCursor(QTextCursor.End)
+        self._write_info_to_logs("ERROR", message)
+        
+    def closeEvent(self, event):
+        self.serial_port1.disconnect()
+        self.serial_port2.disconnect()
+        self.serial_port3.disconnect()  # [新增]
+        self.update_timer.stop()
+        self._preview_timer.stop()
+        self._close_auto_log_files()
+        event.accept()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda *args: QApplication.quit())
+    app = QApplication(sys.argv)
+    
+    # 设置应用级任务栏与窗口图标
+    icon_path = os.path.join(RESOURCE_DIR, 'resources', 'app_icon.png')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        
+    window = NMEADataAnalyzer()
+    window.show()
+    sys.exit(app.exec_())
